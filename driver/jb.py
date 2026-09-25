@@ -8,11 +8,15 @@ Setup:
   jb.py bootstrap      # one-shot: lock the relay to your passphrase
   jb.py pair           # mint a 10-minute pairing code for the browser
   jb.py ping           # check relay + device count
+  jb.py devices        # list paired browsers (id, name, connected, pending)
+  jb.py revoke <device-id>
+                       # unpair a browser (lost laptop, stale pairing)
   jb.py send <action> [params-json] [device]
                        # e.g. jb.py send navigate '{"url":"https://example.com"}'
                        # waits up to 60s for the result and prints it
 
-Actions: ping, tabs, navigate, screenshot, snapshot, click, type, key, eval
+Actions: ping, tabs, navigate, screenshot, snapshot, text, click, type, key,
+         scroll, close, eval
 
 Security notes:
   - The passphrase is a bearer secret. It travels only in an
@@ -70,8 +74,9 @@ def admin_psk():
     die(f"no admin passphrase — set {PSK_ENV} or write it to {PSK_FILE} (chmod 600)")
 
 
-def relay_request(method, path, data=None, timeout=30):
-    """Relay call via curl.
+def relay_request(method, path, data=None, timeout=30, tolerate=()):
+    """Relay call via curl. HTTP statuses in `tolerate` are returned (with the
+    status under "_status") instead of aborting.
 
     curl is used instead of Python's urllib because some Cloudflare-fronted
     hosts block urllib's TLS fingerprint (HTTP 403, error 1010) before the
@@ -136,6 +141,10 @@ def relay_request(method, path, data=None, timeout=30):
         payload = json.loads(out) if out.strip() else {}
     except json.JSONDecodeError:
         payload = {"_raw": out.strip()[-300:]}
+    if status in tolerate:
+        payload = payload if isinstance(payload, dict) else {"_raw": payload}
+        payload["_status"] = status
+        return payload
     if status is not None and not (200 <= status < 300):
         detail = payload if isinstance(payload, dict) else {"_raw": payload}
         die(f"HTTP {status}: {json.dumps(detail)[:300]}")
@@ -165,6 +174,16 @@ def cmd_ping(_args):
     print(json.dumps(relay_request("GET", "/admin/ping"), indent=2))
 
 
+def cmd_devices(_args):
+    print(json.dumps(relay_request("GET", "/admin/devices"), indent=2))
+
+
+def cmd_revoke(args):
+    if not args:
+        die("usage: jb.py revoke <device-id>   (ids from: jb.py devices)", 2)
+    print(json.dumps(relay_request("POST", "/admin/revoke", {"device": args[0]}), indent=2))
+
+
 def cmd_send(args):
     if not args:
         die("usage: jb.py send <action> [params-json] [device]", 2)
@@ -174,16 +193,29 @@ def cmd_send(args):
     except json.JSONDecodeError as e:
         die(f"bad params JSON: {e}", 2)
     device = args[2] if len(args) > 2 else "default"
-    res = relay_request("POST", "/admin/cmd",
-                        {"device": device, "action": action, "params": params})
-    cmd_id = res["id"]
+    cmd = {"device": device, "action": action, "params": params}
     deadline = time.time() + 60
+
+    # Fast path: enqueue and wait for the result in one request. The relay
+    # answers the moment the browser reports back.
+    res = relay_request("POST", "/admin/run", dict(cmd, wait=25), timeout=40, tolerate=(404,))
+    if res.get("_status") == 404:
+        # Relay predates /admin/run: enqueue, then poll for the result.
+        res = relay_request("POST", "/admin/cmd", cmd)
+    elif not res.get("pending"):
+        print(json.dumps(res["result"], indent=2))
+        return
+
+    cmd_id = res["id"]
     while time.time() < deadline:
-        time.sleep(2.0)
-        r = relay_request("GET", f"/admin/result?id={cmd_id}")
+        started = time.time()
+        # Current relays hold this request until the result lands (up to 20s).
+        r = relay_request("GET", f"/admin/result?id={cmd_id}&wait=20", timeout=35)
         if not r.get("pending"):
             print(json.dumps(r["result"], indent=2))
             return
+        if time.time() - started < 1:
+            time.sleep(2.0)  # older relay answered at once: don't hammer it
     die(f"timeout waiting for device (id {cmd_id})")
 
 
@@ -192,7 +224,8 @@ def main(argv):
         print(__doc__)
         return 2
     cmds = {"init": cmd_init, "bootstrap": cmd_bootstrap, "pair": cmd_pair,
-            "ping": cmd_ping, "send": cmd_send}
+            "ping": cmd_ping, "devices": cmd_devices, "revoke": cmd_revoke,
+            "send": cmd_send}
     fn = cmds.get(argv[1])
     if not fn:
         die(f"unknown command: {argv[1]}", 2)

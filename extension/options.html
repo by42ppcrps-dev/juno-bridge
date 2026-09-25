@@ -40,9 +40,10 @@
   <button id="unregisterBtn" class="danger" hidden>Unregister this browser</button>
 
   <h2>2 · Site allowlist</h2>
-  <p class="hint">Juno can only act on these sites — one domain per line. Empty means
-  nowhere: add at least one site before Juno can do anything. <code>*</code> means
-  everywhere (not recommended).</p>
+  <p class="hint">Juno can only act on these sites — one domain per line. A domain also
+  covers its subdomains (<code>github.com</code> includes <code>gist.github.com</code>), and
+  pasted URLs are trimmed to their domain. Empty means nowhere: add at least one site
+  before Juno can do anything. <code>*</code> means everywhere (not recommended).</p>
   <textarea id="allowlist" spellcheck="false"></textarea>
 
   <h2>3 · Advanced</h2>
@@ -53,6 +54,7 @@
   <div id="status"></div>
 
   <script src="config.js"></script>
+  <script src="allowlist.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

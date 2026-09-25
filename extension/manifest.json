@@ -1,1 +1,27 @@
-{"action":{"default_title":"Juno Bridge"},"background":{"service_worker":"background.js"},"description":"Lets your Juno operator drive this browser when you ask. Local-first: you hold the kill switch, a per-site allowlist, and a full activity log.","host_permissions":["https://YOUR-RELAY.workers.dev/*"],"manifest_version":3,"name":"Juno Bridge","options_page":"options.html","permissions":["debugger","tabs","storage","sidePanel","alarms"],"side_panel":{"default_path":"panel.html"},"version":"1.0.2"}
+{
+  "manifest_version": 3,
+  "name": "Juno Bridge",
+  "version": "1.2.0",
+  "description": "Lets your Juno operator drive this browser through your own relay. You hold the kill switch, a per-site allowlist, and a full activity log.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "storage",
+    "sidePanel",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://YOUR-RELAY.workers.dev/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Juno Bridge"
+  },
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "options_page": "options.html"
+}

@@ -1,2 +1,8 @@
 # Local operator config — never commit credentials
 driver/config.json
+
+# Wrangler build/cache output
+.wrangler/
+relay/.wrangler/
+node_modules/
+__pycache__/

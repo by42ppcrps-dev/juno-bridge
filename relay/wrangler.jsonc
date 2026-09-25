@@ -1,0 +1,26 @@
+// Deploy from this folder: npx wrangler deploy
+{
+  "name": "juno-bridge",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "preview_urls": false,
+
+  // All relay state lives in one SQLite-backed Durable Object (works on the free plan).
+  "durable_objects": {
+    "bindings": [{ "name": "HUB", "class_name": "BridgeHub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BridgeHub"] }]
+
+  // Upgrading from the KV-based relay (v1.0.x)? Bind your old namespace as
+  // BRIDGE so the hub imports your admin passphrase hash and paired browsers
+  // on first boot (find the id with `npx wrangler kv namespace list`). Remove
+  // it again once the new relay has run once.
+  //   ,"kv_namespaces": [{ "binding": "BRIDGE", "id": "YOUR_OLD_KV_NAMESPACE_ID" }]
+
+  // Optional hardening:
+  //   npx wrangler secret put ADMIN_PSK_SHA256   (hex SHA-256 of your passphrase)
+  // and a per-IP limit on pairing attempts:
+  //   ,"ratelimits": [{ "name": "REGISTER_LIMITER", "namespace_id": "1001",
+  //                     "simple": { "limit": 20, "period": 60 } }]
+}

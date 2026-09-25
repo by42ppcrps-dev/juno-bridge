@@ -12,9 +12,19 @@ function fmtTime(t) {
   return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
+// What the background worker last heard from the relay.
+const RELAY_STATES = {
+  ok: ["dot", "Active — connected, listening for Juno's commands."],
+  "ok/live": ["dot", "Active — live connection, commands arrive instantly."],
+  "ok/polling": ["dot", "Active — connected by polling (live connection unavailable)."],
+  unreachable: ["dot warn", "Active, but the relay is unreachable — retrying."],
+  error: ["dot warn", "Active, but the relay is returning errors — retrying."],
+  rejected: ["dot bad", "The relay no longer recognises this browser — re-pair in Options."],
+};
+
 async function refresh() {
   const s = await chrome.storage.local.get({
-    deviceToken: null, enabled: true, allowlist: [], log: [],
+    deviceToken: null, enabled: true, allowlist: [], log: [], relayStatus: null,
   });
 
   if (!s.deviceToken) {
@@ -28,8 +38,11 @@ async function refresh() {
     toggleBtn.textContent = "Resume";
     toggleBtn.className = "primary";
   } else {
-    dot.className = "dot";
-    statusText.textContent = "Active — listening for Juno's commands.";
+    const rs = s.relayStatus || {};
+    const [cls, text] = RELAY_STATES[rs.state + "/" + rs.via] || RELAY_STATES[rs.state] ||
+      ["dot warn", "Active — connecting to the relay…"];
+    dot.className = cls;
+    statusText.textContent = text;
     toggleBtn.hidden = false;
     toggleBtn.textContent = "Pause";
     toggleBtn.className = "danger";
@@ -54,6 +67,12 @@ async function refresh() {
     tt.textContent = fmtTime(e.t);
     li.appendChild(tt);
     li.appendChild(document.createTextNode(`${e.action}${e.target ? " — " + e.target.slice(0, 80) : ""}`));
+    if (e.error) {
+      const why = document.createElement("span");
+      why.className = "err";
+      why.textContent = e.error;
+      li.appendChild(why);
+    }
     logList.appendChild(li);
   }
 }
@@ -68,9 +87,8 @@ optionsBtn.addEventListener("click", () => {
   chrome.runtime.openOptionsPage();
 });
 
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg && msg.type === "juno-log") refresh();
+// Covers log entries, pause/resume, pairing and relay status alike.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local") refresh();
 });
-
-chrome.storage.onChanged.addListener(refresh);
 refresh();
