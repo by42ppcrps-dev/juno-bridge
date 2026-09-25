@@ -243,28 +243,39 @@ const HANDLERS = {
 /* ---------- relay I/O ---------- */
 
 async function postResult(deviceToken, id, ok, data, error) {
-  await fetch(JUNO_RELAY_URL + "/result", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ token: deviceToken, id, ok, data: data || null, error: error || null }),
-  });
+  try {
+    await fetch(JUNO_RELAY_URL + "/result", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: deviceToken, id, ok, data: data || null, error: error || null }),
+    });
+  } catch {
+    /* Relay unreachable: the command was already consumed from the queue,
+       so the driver will see it as pending until it gives up. Either way,
+       a failed result-post must never kill the poll loop. */
+  }
 }
 
 async function handleCommand(cmd, state) {
   const { id, action, params } = cmd;
-  const handler = HANDLERS[action];
-  if (!handler) {
-    await postResult(state.deviceToken, id, false, null, "unknown action: " + action);
-    await logActivity({ action, target: "", ok: false });
-    return;
-  }
+  let ok = false;
   try {
-    const data = await handler(params || {}, state);
-    await postResult(state.deviceToken, id, true, data, null);
+    const handler = HANDLERS[action];
+    if (!handler) {
+      await postResult(state.deviceToken, id, false, null, "unknown action: " + action);
+    } else {
+      const data = await handler(params || {}, state);
+      await postResult(state.deviceToken, id, true, data, null);
+      ok = true;
+    }
   } catch (e) {
     const msg = (e && e.message) || String(e);
     await postResult(state.deviceToken, id, false, null, msg.slice(0, 500));
-    await logActivity({ action, target: "", ok: false });
+  }
+  try {
+    await logActivity({ action, target: "", ok });
+  } catch {
+    /* local log is best-effort */
   }
 }
 
@@ -272,7 +283,26 @@ async function handleCommand(cmd, state) {
 
 let polling = false;
 
+let failStreak = 0;
+
+// Backoff when the relay is unreachable: 2.5s doubling up to 60s, so a
+// dead relay doesn't get hammered and the loop stays cheap while down.
+function pollDelayMs() {
+  return Math.min(POLL_MS * Math.pow(2, Math.min(failStreak, 4)), 60000);
+}
+
 async function pollOnce() {
+  try {
+    await pollOnceInner();
+    failStreak = 0;
+  } catch {
+    // Nothing — not storage, not the network, not a handler bug — is
+    // allowed to kill the poll loop. Back off and try again next tick.
+    failStreak++;
+  }
+}
+
+async function pollOnceInner() {
   const state = await getState();
   if (!state.enabled || !state.deviceToken) return;
   let res;
@@ -306,7 +336,7 @@ async function loop() {
     // eslint-disable-next-line no-constant-condition
     while (true) {
       await pollOnce();
-      await new Promise((r) => setTimeout(r, POLL_MS));
+      await new Promise((r) => setTimeout(r, pollDelayMs()));
       const { enabled, deviceToken } = await chrome.storage.local.get({
         enabled: true, deviceToken: null,
       });
