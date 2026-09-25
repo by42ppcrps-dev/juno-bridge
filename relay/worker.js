@@ -9,8 +9,12 @@
  *   with short TTLs. Nothing here is reachable unless you know the URL.
  *
  * Concurrency model: one driver, one extension per device token. Each
- * command is its own KV key (`q:<token>:<ts>:<rand>`), so enqueue/dequeue
- * never do read-modify-write on shared state — there is no queue race.
+ * device has a single queue key holding a JSON array, so polling costs one
+ * KV read — never a list. (KV list operations are capped at 1,000/day on the
+ * free tier; a 2.5s poll loop would burn that in ~20 minutes. Reads get
+ * 100,000/day, which comfortably fits two devices polling around the clock.)
+ * Enqueue/dequeue are read-modify-write on that one key; with a single
+ * driver and a single extension per device there is no queue race.
  */
 
 const enc = new TextEncoder();
@@ -87,8 +91,10 @@ async function requireDevice(req, env, body) {
   return { token: tok, dev };
 }
 
-function cmdKey(deviceToken, cmdId, ts) {
-  return "q:" + deviceToken + ":" + String(ts).padStart(13, "0") + ":" + cmdId;
+// One queue key per device: a JSON array of commands. Polling is a single
+// KV read; enqueue/dequeue are read-modify-write on this key.
+function queueKey(deviceToken) {
+  return "queue:" + deviceToken;
 }
 
 async function resolveDevice(env, selector) {
@@ -110,6 +116,17 @@ function clientIp(req) {
 
 export default {
   async fetch(req, env) {
+    try {
+      return await handleFetch(req, env);
+    } catch (e) {
+      // Never leak a bare 1101: a KV outage (e.g. daily quota exhausted)
+      // should read as what it is so the driver/extension can back off.
+      return json({ error: "kv_unavailable" }, 503);
+    }
+  },
+};
+
+async function handleFetch(req, env) {
     const url = new URL(req.url);
     const path = url.pathname;
 
@@ -158,11 +175,17 @@ export default {
       if (!deviceToken) return json({ error: "no_device" }, 404, path);
       const id = "cmd_" + randHex(8);
       const ts = Date.now();
-      await env.BRIDGE.put(
-        cmdKey(deviceToken, id, ts),
-        JSON.stringify({ id, action, params: body.params && typeof body.params === "object" ? body.params : {}, issued_at: ts }),
-        { expirationTtl: 600 } // uncollected commands evaporate
-      );
+      const qk = queueKey(deviceToken);
+      const queue = (await env.BRIDGE.get(qk, "json")) || [];
+      queue.push({
+        id,
+        action,
+        params: body.params && typeof body.params === "object" ? body.params : {},
+        issued_at: ts,
+      });
+      await env.BRIDGE.put(qk, JSON.stringify(queue), {
+        expirationTtl: 600, // uncollected commands evaporate
+      });
       return json({ ok: true, id, device: deviceToken.slice(0, 8) + "…" }, 200, path);
     }
 
@@ -214,16 +237,17 @@ export default {
     if (path === "/poll" && req.method === "POST") {
       const d = await requireDevice(req, env, body);
       if (d.err) return d.err;
-      const prefix = "q:" + d.token + ":";
-      const listed = await env.BRIDGE.list({ prefix, limit: 100 });
-      if (!listed.keys.length) return new Response(null, { status: 204, headers: corsHeaders(path) });
-      // Keys sort chronologically (ts-padded), so the first key is the oldest command.
-      listed.keys.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-      const key = listed.keys[0].name;
-      const raw = await env.BRIDGE.get(key, "json");
-      await env.BRIDGE.delete(key);
-      if (!raw) return new Response(null, { status: 204, headers: corsHeaders(path) });
-      return json({ cmd: raw }, 200, path);
+      // Single KV read — never a list (see header comment for why).
+      const qk = queueKey(d.token);
+      const queue = (await env.BRIDGE.get(qk, "json")) || [];
+      if (!queue.length) return new Response(null, { status: 204, headers: corsHeaders(path) });
+      const cmd = queue.shift();
+      if (queue.length) {
+        await env.BRIDGE.put(qk, JSON.stringify(queue), { expirationTtl: 600 });
+      } else {
+        await env.BRIDGE.delete(qk);
+      }
+      return json({ cmd }, 200, path);
     }
 
     // ---- device: post a command result ----
@@ -246,5 +270,4 @@ export default {
     }
 
     return json({ error: "not_found" }, 404, path);
-  },
-};
+}
