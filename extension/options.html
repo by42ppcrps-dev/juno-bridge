@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Juno Bridge — Options</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0 auto; padding: 32px; max-width: 560px; color: #1c1c1e; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 15px; margin-top: 28px; }
+  p, label { font-size: 14px; }
+  .hint { color: #6e6e73; font-size: 13px; }
+  input[type=text], textarea { width: 100%; font-size: 14px; padding: 8px; border: 1px solid #c7c7cc; border-radius: 8px; box-sizing: border-box; }
+  textarea { height: 110px; font-family: ui-monospace, monospace; }
+  button { font-size: 14px; padding: 8px 14px; border-radius: 8px; border: 1px solid #c7c7cc; background: #fff; cursor: pointer; margin-top: 8px; }
+  button.primary { background: #007aff; color: #fff; border-color: #007aff; }
+  button.danger { background: #ff453a; color: #fff; border-color: #ff453a; }
+  #status { margin-top: 12px; font-size: 14px; min-height: 20px; }
+  #status.ok { color: #34c759; }
+  #status.err { color: #ff453a; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input { flex: 1; }
+  code { background: #f2f2f7; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  .warn { background: #fff8e6; border: 1px solid #ffd60a; border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+</style>
+</head>
+<body>
+  <h1>Juno Bridge — Options</h1>
+  <p class="hint">Relay: <code id="relayUrl"></code></p>
+
+  <h2>1 · Pair this browser</h2>
+  <p id="pairState" class="hint">Not registered.</p>
+  <div class="row">
+    <input type="text" id="deviceName" placeholder="Device name (e.g. Work laptop)" autocomplete="off" spellcheck="false">
+  </div>
+  <div class="row" style="margin-top:8px">
+    <input type="text" id="code" placeholder="Pairing code (e.g. K7Q2M9XA)" autocomplete="off" spellcheck="false">
+    <button id="registerBtn" class="primary">Register</button>
+  </div>
+  <p class="hint">Ask your Juno operator for a pairing code — it's single-use and expires in 10 minutes.</p>
+  <button id="unregisterBtn" class="danger" hidden>Unregister this browser</button>
+
+  <h2>2 · Site allowlist</h2>
+  <p class="hint">Juno can only act on these sites — one domain per line. Empty means
+  nowhere: add at least one site before Juno can do anything. <code>*</code> means
+  everywhere (not recommended).</p>
+  <textarea id="allowlist" spellcheck="false"></textarea>
+
+  <h2>3 · Advanced</h2>
+  <label><input type="checkbox" id="allowEval"> Allow Juno to run arbitrary page JavaScript (<code>eval</code>)</label>
+  <div class="warn" style="margin-top:10px">Off by default. Only enable if you understand that page scripts run with the page's full privileges.</div>
+
+  <div><button id="saveBtn" class="primary">Save settings</button></div>
+  <div id="status"></div>
+
+  <script src="config.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>
