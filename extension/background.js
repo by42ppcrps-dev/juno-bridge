@@ -325,7 +325,26 @@ async function pollOnceInner() {
     return;
   }
   if (payload && payload.cmd) {
-    await handleCommand(payload.cmd, state);
+    // A command that never settles (hung debugger/CDP call) must not stall
+    // the poll loop. Race it against a timeout; on timeout report the
+    // command as failed and keep polling. (If the handler settles late its
+    // result post is idempotent — the relay just overwrites result:<id>.)
+    try {
+      await Promise.race([
+        handleCommand(payload.cmd, state),
+        new Promise((_, rej) =>
+          setTimeout(() => rej(new Error("command timed out after 30s")), 30000)
+        ),
+      ]);
+    } catch (e) {
+      await postResult(
+        state.deviceToken,
+        payload.cmd.id,
+        false,
+        null,
+        ((e && e.message) || String(e)).slice(0, 200)
+      );
+    }
   }
 }
 
