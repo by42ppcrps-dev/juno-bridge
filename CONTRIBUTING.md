@@ -16,8 +16,11 @@ few ground rules keep it trustworthy.
 
 Open an issue before building:
 
-- Any new **state-changing** command (click, type, key, navigate already
-  exist; anything beyond those is a security conversation).
+- Any new **state-changing** command (navigate, click, type, key, scroll
+  and close already exist; anything beyond those is a security conversation).
+- Changes to delivery semantics: commands are delivered at most once and
+  stale ones (over 2 minutes old) are refused — that is what keeps a dropped
+  connection from repeating a click.
 - Changes to the auth model, the allowlist semantics, or the kill switch.
 - Anything that touches the relay's admin endpoints.
 
@@ -25,9 +28,11 @@ Open an issue before building:
 
 1. Fork the repo and create a branch from `master`.
 2. Keep changes small and focused — one concern per PR.
-3. Test end to end: deploy the relay, pair a browser, run the new behavior
-   through `driver/jb.py`. PRs that were never run against a real browser
-   won't be merged.
+3. Test end to end: deploy the relay (`cd relay && npx wrangler deploy`),
+   pair a browser, and run the new behavior through `driver/jb.py`. If you
+   touch the transport, test both the live WebSocket and the HTTP polling
+   fallback (the side panel shows which one is active). PRs that were never
+   run against a real browser won't be merged.
 4. Update the README if your change affects setup or usage.
 5. Open the PR with a clear description of what changed and how you tested it.
 

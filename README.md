@@ -49,6 +49,12 @@ block in `relay/wrangler.jsonc` and put your old namespace id in it
 passphrase hash and paired browsers, so nothing needs re-pairing. The old
 driver and extensions keep working against the new relay while you upgrade.
 
+**Updating the extension:** copy the new files into the folder Chrome already
+loads it from, then click the reload ↻ icon on its card in `chrome://extensions`.
+Chrome derives an unpacked extension's identity from its folder path, so
+loading the update from a *different* folder installs a fresh copy that has to
+be paired again. Each Chrome profile is its own device.
+
 ### 2 · Point the extension at your relay
 
 1. In `extension/config.js`, set `JUNO_RELAY_URL` to your Worker URL.

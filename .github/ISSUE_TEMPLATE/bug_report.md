@@ -11,9 +11,11 @@ A clear description of the bug.
 
 ## Setup
 
-- Extension version:
-- Relay: Cloudflare Worker (pastebin of `relay/worker.js` version/commit if modified)
+- Extension version (chrome://extensions):
+- Relay: commit you deployed from, and whether `relay/worker.js` is modified
+- Upgraded from the KV-based relay (v1.0.x)? yes / no
 - Driver: `jb.py` from this repo, or modified?
+- Side panel connection state: live / polling / unreachable / rejected
 - Chrome version / OS:
 
 ## Steps to reproduce
@@ -26,8 +28,10 @@ A clear description of the bug.
 
 ## Logs
 
-Paste the relevant output from `jb.py` (redact your passphrase and any
-device tokens) and anything from the extension's side-panel activity log.
+Paste the relevant output from `jb.py` and `jb.py devices` (redact your
+passphrase and any device tokens), anything from the extension's side-panel
+activity log (failed entries include the reason), and — if the relay is
+involved — `npx wrangler tail` output from around the failure.
 
 > **Security bugs:** do not file them here. See CONTRIBUTING.md — report
 > vulnerabilities privately.
