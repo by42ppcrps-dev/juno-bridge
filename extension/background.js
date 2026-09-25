@@ -124,7 +124,7 @@ const SNAPSHOT_JS = `(() => {
 })()`;
 
 async function cmdPing() {
-  return { version: JUNO_BRIDGE_VERSION, relay: JUNO_RELAY_URL };
+  return { version: chrome.runtime.getManifest().version, relay: JUNO_RELAY_URL };
 }
 
 async function cmdTabs() {
