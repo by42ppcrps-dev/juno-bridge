@@ -4,7 +4,10 @@ The CLI talks to this process over a private Unix socket. The process owns
 the relay HTTP client, a separate TypeSafe client, and the admin passphrase.
 The passphrase and the TypeSafe key are not sent on the socket. Certificate
 verification stays on, and redirects are not followed, so a bearer token is
-not sent to another host.
+not sent to another host. One client disconnecting does not stop the process.
+Ping and stop are answered while a relay or TypeSafe request is still running.
+Those requests stay on one worker so a libcurl handle is not shared across
+threads.
 
 Set JUNO_OPERATOR=0 or JUNO_BRIDGE_HTTP=curl to skip this process and use
 one curl subprocess per request instead.
@@ -16,15 +19,20 @@ import hmac
 import importlib.util
 import json
 import os
+import queue
 import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 FRAME_MAX = 20 * 1024 * 1024
 CONNECT_TIMEOUT = 10
+# An idle client cannot sit on the accept path. Tests shorten this.
+READ_DEADLINE_S = 5
+WORK_QUEUE_MAX = 16
 
 # libcurl option numbers. VERIFYHOST 2 and VERIFYPEER 1 stay set on purpose.
 CURLOPT_TIMEOUT = 13
@@ -356,9 +364,16 @@ def handle_message(msg, client, typesafe_getter=None):
     return {"ok": True, "status": status, "payload": payload}
 
 
-def _recv_line(conn):
+def _recv_line(conn, deadline=None):
+    """Read one JSON line. deadline is seconds from now; None keeps the socket timeout."""
     buf = bytearray()
+    started = time.monotonic()
     while b"\n" not in buf:
+        if deadline is not None:
+            remaining = deadline - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError("read deadline")
+            conn.settimeout(remaining)
         chunk = conn.recv(65536)
         if not chunk:
             break
@@ -371,25 +386,119 @@ def _recv_line(conn):
     return line
 
 
-def serve_conn(conn, token, client, typesafe_getter=None):
+def _safe_send(conn, payload):
+    """Write one frame. A closed client is that client's problem."""
     try:
-        line = _recv_line(conn)
-        if line is None:
-            return False
-        msg = json.loads(line.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeError, OperatorError):
-        conn.sendall(b'{"ok":false,"error":"bad message"}\n')
+        if isinstance(payload, (bytes, bytearray)):
+            encoded = bytes(payload)
+        else:
+            encoded = json.dumps(payload).encode("utf-8")
+        if len(encoded) > FRAME_MAX:
+            encoded = b'{"ok":false,"error":"response too large"}'
+        if not encoded.endswith(b"\n"):
+            encoded += b"\n"
+        conn.sendall(encoded)
+    except OSError:
         return False
-    supplied = msg.get("token") if isinstance(msg, dict) else None
-    if not isinstance(supplied, str) or not hmac.compare_digest(supplied, token):
-        conn.sendall(b'{"ok":false,"error":"unauthorized"}\n')
-        return False
-    result = handle_message(msg, client, typesafe_getter)
-    encoded = json.dumps(result).encode("utf-8")
-    if len(encoded) > FRAME_MAX:
-        encoded = b'{"ok":false,"error":"response too large"}'
-    conn.sendall(encoded + b"\n")
-    return bool(result.get("stop"))
+    return True
+
+
+class _ServeGate:
+    """Serializes the decision to queue work with the decision to shut down."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.closing = False
+
+
+def _enqueue(work, gate, conn, msg):
+    with gate.lock:
+        if gate.closing:
+            return "closing"
+        try:
+            work.put_nowait((conn, msg))
+        except queue.Full:
+            return "full"
+    return "queued"
+
+
+def _worker_loop(work, client, typesafe_getter, gate):
+    """One thread owns the relay client and the TypeSafe client."""
+    while True:
+        item = work.get()
+        if item is None:
+            return
+        conn, msg = item
+        try:
+            with gate.lock:
+                closing = gate.closing
+            if closing:
+                _safe_send(conn, {"ok": False, "error": "operator is stopping"})
+            else:
+                try:
+                    result = handle_message(msg, client, typesafe_getter)
+                except Exception:
+                    result = {"ok": False, "error": "request failed"}
+                _safe_send(conn, result)
+        except Exception:
+            pass
+        finally:
+            _close_quietly(conn)
+
+
+def _read_conn(conn, token, work, gate, stop, on_stop=None, on_stop_sent=None):
+    """Read one request. Ping and stop do not wait behind upstream work."""
+    handed = False
+    try:
+        try:
+            line = _recv_line(conn, deadline=READ_DEADLINE_S)
+        except OperatorError:
+            _safe_send(conn, {"ok": False, "error": "bad message"})
+            return
+        except OSError:
+            return
+        if not line:
+            return
+        try:
+            msg = json.loads(line.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeError):
+            _safe_send(conn, {"ok": False, "error": "bad message"})
+            return
+        if not isinstance(msg, dict):
+            _safe_send(conn, {"ok": False, "error": "bad message"})
+            return
+        supplied = msg.get("token")
+        if not isinstance(supplied, str) or not hmac.compare_digest(supplied, token):
+            _safe_send(conn, {"ok": False, "error": "unauthorized"})
+            return
+        op = msg.get("op")
+        if op in ("ping", "stop"):
+            result = handle_message(msg, None)
+            # Drop the listening socket before the reply, so a health check
+            # that arrives as this response is read cannot attach again.
+            # The send is still finished before the process leaves serve().
+            stopping = bool(result.get("stop"))
+            if stopping and on_stop is not None:
+                on_stop()
+            try:
+                _safe_send(conn, result)
+            finally:
+                if stopping and on_stop_sent is not None:
+                    on_stop_sent()
+            return
+        status = _enqueue(work, gate, conn, msg)
+        if status == "queued":
+            handed = True
+            return
+        if status == "full":
+            _safe_send(conn, {"ok": False, "error": "operator is busy"})
+        else:
+            _safe_send(conn, {"ok": False, "error": "operator is stopping"})
+    except OSError:
+        return
+    finally:
+        if not handed:
+            _close_quietly(conn)
 
 
 def socket_alive(path):
@@ -442,35 +551,81 @@ def serve(client=None, ready=None, stop=None, typesafe=None):
         srv.bind(str(path))
     except OSError:
         _close_quietly(typesafe_box[0])
+        srv.close()
         if ready:
             ready.set()
         return 0
     os.chmod(path, 0o600)
     srv.listen(8)
     srv.settimeout(0.2)
+    if stop is None:
+        stop = threading.Event()
+    work = queue.Queue(maxsize=WORK_QUEUE_MAX)
+    gate = _ServeGate()
+    worker = threading.Thread(
+        target=_worker_loop,
+        args=(work, client, typesafe_getter, gate),
+        name="juno-operator-worker",
+        daemon=True,
+    )
+    worker.start()
+    removed = False
+    # Set until a stop reply is in progress, so shutdown does not wait
+    # when the listener closed for another reason.
+    stop_sent = threading.Event()
+    stop_sent.set()
+
+    def request_stop():
+        nonlocal removed
+        stop.set()
+        with gate.lock:
+            if not removed:
+                removed = True
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        try:
+            srv.close()
+        except OSError:
+            pass
+
+    def begin_stop():
+        stop_sent.clear()
+        request_stop()
+
     if ready:
         ready.set()
-    stopping = False
     try:
-        while not stopping and not (stop and stop.is_set()):
+        while not stop.is_set():
             try:
                 conn, _addr = srv.accept()
             except socket.timeout:
                 continue
             except OSError:
                 break
-            try:
-                stopping = serve_conn(conn, token, client, typesafe_getter)
-            finally:
-                conn.close()
+            threading.Thread(
+                target=_read_conn,
+                args=(conn, token, work, gate, stop, begin_stop, stop_sent.set),
+                name="juno-operator-conn",
+                daemon=True,
+            ).start()
     finally:
-        srv.close()
+        request_stop()
+        # The socket is already gone. Stay until the stop reply is written
+        # so the process does not exit underneath that client.
+        stop_sent.wait(2)
+        with gate.lock:
+            gate.closing = True
+        while True:
+            try:
+                work.put(None, timeout=0.2)
+                break
+            except queue.Full:
+                continue
+        worker.join()
         _close_quietly(client)
         _close_quietly(typesafe_box[0])
-        try:
-            path.unlink()
-        except OSError:
-            pass
     return 0
 
 

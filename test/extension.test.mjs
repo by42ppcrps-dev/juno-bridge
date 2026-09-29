@@ -2035,6 +2035,107 @@ describe("extension", { concurrency: 1 }, () => {
     }
   });
 
+  test("a workflow does not replace its snapshot until the steps that use it are done", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    env.page.setNodes([
+      labeledButton("Download", { x: 10, y: 20, width: 80, height: 20 }),
+      invoices,
+    ]);
+    const cmd = await runWorkflow(env, [
+      { op: "click", ref: "e1", after: { observe: "snapshot" } },
+      { op: "click", ref: "e1", expect: { text: "Invoices" } },
+    ], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.data.steps[0].result.y, 90);
+    assert.equal(body.data.steps[1].result.y, 90);
+    const next = body.data.observation;
+    assert.match(next.snapshot, /^snap_[0-9a-f]{32}$/);
+    assert.notEqual(next.snapshot, snapshot);
+    assert.equal(next.url, "https://example.com/page");
+    assert.equal(next.elements[0].text, "Download");
+    assert.equal(next.elements[0].snapshot, undefined);
+    assert.equal(next.redaction, "heuristic");
+    dropHold(env);
+    const stale = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const staleBody = resultFor(env, stale.id);
+    assert.equal(staleBody.ok, false, JSON.stringify(staleBody));
+    assert.match(staleBody.error, /snapshot is stale/);
+    assert.equal(staleBody.data.dispatched, false);
+    assert.deepEqual(staleBody.data.steps.map((step) => step.status), ["unstarted"]);
+  });
+
+  test("the observation after a click is a new snapshot the next action can use", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({
+      button: invoices,
+      nodes: [invoices],
+      async onCommand(info, page) {
+        if (info.method === "Input.dispatchMouseEvent" && info.params && info.params.type === "mouseReleased") {
+          page.setNodes([
+            page.button,
+            labeledButton("Download", { x: 10, y: 40, width: 80, height: 20 }),
+          ]);
+        }
+      },
+    });
+    const first = await takeSnapshot(env);
+    const cmd = await runWorkflow(env, [
+      { op: "click", ref: "e1", expect: { text: "Invoices" }, after: { observe: "snapshot" } },
+    ], first);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    const next = body.data.observation;
+    assert.match(next.snapshot, /^snap_[0-9a-f]{32}$/);
+    assert.notEqual(next.snapshot, first);
+    assert.equal(next.url, "https://example.com/page");
+    assert.equal(next.redaction, "heuristic");
+    const download = next.elements.find((el) => el.text === "Download");
+    assert.ok(download, JSON.stringify(next.elements));
+    assert.equal(download.snapshot, undefined);
+    assert.notEqual(download.ref, undefined);
+    for (const el of next.elements) assert.equal(el.snapshot, undefined);
+
+    const described = methodCalls(env, "DOM.describeNode").length;
+    dropHold(env);
+    const stale = await runWorkflow(env, [{ op: "click", ref: "e1" }], first);
+    const staleBody = resultFor(env, stale.id);
+    assert.equal(staleBody.ok, false, JSON.stringify(staleBody));
+    assert.match(staleBody.error, /snapshot is stale/);
+    assert.equal(staleBody.data.dispatched, false);
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+
+    dropHold(env);
+    const missing = await runWorkflow(env, [{ op: "click", ref: "e9" }], next.snapshot);
+    const missingBody = resultFor(env, missing.id);
+    assert.equal(missingBody.ok, false, JSON.stringify(missingBody));
+    assert.match(missingBody.error, /element e9 is gone/);
+    assert.equal(missingBody.data.dispatched, false);
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+
+    dropHold(env);
+    const again = await runWorkflow(env, [
+      { op: "click", ref: download.ref, expect: { text: "Download" } },
+    ], next.snapshot);
+    const againBody = resultFor(env, again.id);
+    assert.equal(againBody.ok, true, JSON.stringify(againBody));
+    assert.equal(againBody.data.before.snapshot, next.snapshot);
+    assert.equal(againBody.data.steps[0].result.x, 50);
+    assert.equal(againBody.data.steps[0].result.y, 50);
+    assert.equal(methodCalls(env, "DOM.describeNode").length, described);
+
+    env.page.realm.performance.timeOrigin += 5000;
+    const reloaded = await runWorkflow(env, [{ op: "click", ref: download.ref }], next.snapshot);
+    const reloadedBody = resultFor(env, reloaded.id);
+    assert.equal(reloadedBody.ok, false, JSON.stringify(reloadedBody));
+    assert.match(reloadedBody.error, /snapshot is stale/);
+    assert.equal(reloadedBody.error.includes("http"), false);
+    assert.equal(reloadedBody.data.dispatched, false);
+    assert.deepEqual(reloadedBody.data.steps.map((step) => step.status), ["unstarted"]);
+  });
+
   test("element readiness uses the snapshot taken before the click", async () => {
     const env = bootPage();
     const snapshot = await takeSnapshot(env);

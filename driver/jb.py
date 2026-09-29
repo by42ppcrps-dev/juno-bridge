@@ -16,11 +16,12 @@ Setup:
                        # waits up to 60s for the result and prints it
                        # exits 1 if that result is a failure
   jb.py jev target|page|step ... --tab <id> --goal <text> [--device name]
-                       [--observation <file>] [--click]
+                       [--observation <file>] [--after-ready <json>] [--click]
                        # optional, off unless JUNO_JEV=1. A billed TypeSafe
                        # call. Does nothing to the browser unless --click.
                        # --click submits that snapshot's ref. --observation
                        # reuses a snapshot instead of taking one.
+                       # --after-ready adds one bounded condition to that click.
 
 Actions: ping, tabs, navigate, screenshot, snapshot, text, click, type, key,
          scroll, close, eval, workflow
@@ -29,6 +30,7 @@ Actions: ping, tabs, navigate, screenshot, snapshot, text, click, type, key,
   jb.py operator stop
 
 Normal commands go through that process so the HTTP client stays alive.
+A client that closes its socket does not stop the process.
 An enabled Jev call uses a separate client in the same process.
 JUNO_OPERATOR=0 uses one curl subprocess per relay request instead.
 
@@ -447,7 +449,7 @@ def cmd_jev(args):
     element = target.get("element") if isinstance(target.get("element"), dict) else {}
     clicked = run_action(
         "workflow",
-        mod.bound_click(opts["tab"], snapshot_id, element),
+        mod.bound_click(opts["tab"], snapshot_id, element, opts.get("ready")),
         opts["device"],
     )
     clicked_data = clicked.get("data") if isinstance(clicked.get("data"), dict) else {}

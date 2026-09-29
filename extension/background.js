@@ -893,7 +893,30 @@ async function waitReady(auth, ready, inheritedSnapshot) {
   }
 }
 
-async function collectAfter(auth, after) {
+// A new id and a new binding. Copying the id the action started with would
+// make the new elements answer to the previous capture.
+async function retainObservedSnapshot(auth) {
+  await ensureWorld(auth);
+  const snapshotId = newSnapshotId();
+  const described = await evaluate(auth, snapshotSource("store", snapshotId));
+  refuseDrifted(auth.verb, auth, described && described.url);
+  if (!described || typeof described !== "object") throw new Error(`${auth.verb}: snapshot failed`);
+  await retainSnapshot(auth, snapshotId, described);
+  return {
+    observe: "snapshot",
+    observed: true,
+    ...described,
+    snapshot: snapshotId,
+    redaction: "heuristic",
+  };
+}
+
+function observationNeedsCapture(observation) {
+  if (!observation || observation.observe !== "snapshot") return false;
+  return typeof observation.snapshot !== "string" || !SNAPSHOT_ID_RE.test(observation.snapshot);
+}
+
+async function collectAfter(auth, after, retainSnapshotNow) {
   validateAfter(after, auth.snapshot);
   if (after.ready) await waitReady(auth, after.ready, auth.snapshot);
   const href = await readDocumentUrl(auth);
@@ -901,6 +924,9 @@ async function collectAfter(auth, after) {
     throw new Error(`${auth.verb}: tab navigated away from the authorized page`);
   }
   if (after.observe === "snapshot") {
+    // Retaining replaces every other id for this document. A later step that
+    // still names the snapshot this workflow started with must run first.
+    if (retainSnapshotNow) return retainObservedSnapshot(auth);
     const snap = await evaluate(auth, snapshotSource("ephemeral"));
     refuseDrifted(auth.verb, auth, snap && snap.url);
     if (!snap || typeof snap !== "object") throw new Error(`${auth.verb}: snapshot failed`);
@@ -972,7 +998,7 @@ async function cmdClick(params, state, ctx, epoch) {
     await requireReadyTarget(auth, params && params.after);
     await clickAt(auth, x, y);
     if (!params || !params.after) return { tabId: auth.tabId, x, y };
-    const observation = await collectAfter(auth, params.after);
+    const observation = await collectAfter(auth, params.after, true);
     return { tabId: auth.tabId, x, y, dispatched: true, observed: true, observation };
   });
 }
@@ -986,7 +1012,7 @@ async function cmdType(params, state, ctx, epoch) {
     await requireReadyTarget(auth, params && params.after);
     await cdp(auth, "Input.insertText", { text }, { dispatch: true });
     if (!params || !params.after) return { tabId: auth.tabId, chars: text.length };
-    const observation = await collectAfter(auth, params.after);
+    const observation = await collectAfter(auth, params.after, true);
     return { tabId: auth.tabId, chars: text.length, dispatched: true, observed: true, observation };
   });
 }
@@ -1009,7 +1035,7 @@ async function cmdKey(params, state, ctx, epoch) {
       : { ...base, type: "rawKeyDown" }, { dispatch: true });
     await cdp(auth, "Input.dispatchKeyEvent", { ...base, type: "keyUp" }, { dispatch: true });
     if (!params || !params.after) return { tabId: auth.tabId, key: def.key };
-    const observation = await collectAfter(auth, params.after);
+    const observation = await collectAfter(auth, params.after, true);
     return { tabId: auth.tabId, key: def.key, dispatched: true, observed: true, observation };
   });
 }
@@ -1037,7 +1063,7 @@ async function cmdScroll(params, state, ctx, epoch) {
     }
     const pos = await evaluate(auth, `({ x: Math.round(scrollX), y: Math.round(scrollY) })`);
     if (!params || !params.after) return { tabId: auth.tabId, scroll: pos };
-    const observation = await collectAfter(auth, params.after);
+    const observation = await collectAfter(auth, params.after, true);
     return { tabId: auth.tabId, scroll: pos, dispatched: true, observed: true, observation };
   });
 }
@@ -1136,7 +1162,7 @@ async function assertSameDocument(auth) {
   }
 }
 
-async function runStep(auth, step, ctx) {
+async function runStep(auth, step, ctx, retainSnapshotNow) {
   if (step.op === "click") {
     const found = await evaluate(auth, resolveRefExpression(step.ref, auth.snapshot));
     if (found && found.stale) throw new Error("workflow: snapshot is stale");
@@ -1153,12 +1179,12 @@ async function runStep(auth, step, ctx) {
     if (found.inView !== true) throw new Error("workflow: element " + step.ref + " is outside the viewport");
     ctx.target += ` @${found.x},${found.y}`;
     await clickAt(auth, found.x, found.y);
-    const observation = step.after ? await collectAfter(auth, step.after) : null;
+    const observation = step.after ? await collectAfter(auth, step.after, retainSnapshotNow) : null;
     return { result: { ref: step.ref, x: found.x, y: found.y }, observation };
   }
   if (step.op === "type") {
     await cdp(auth, "Input.insertText", { text: step.text }, { dispatch: true });
-    const observation = step.after ? await collectAfter(auth, step.after) : null;
+    const observation = step.after ? await collectAfter(auth, step.after, retainSnapshotNow) : null;
     return { result: { chars: step.text.length }, observation };
   }
   if (step.op === "key") {
@@ -1171,7 +1197,7 @@ async function runStep(auth, step, ctx) {
       ? { ...base, type: "keyDown", text: def.text, unmodifiedText: def.text }
       : { ...base, type: "rawKeyDown" }, { dispatch: true });
     await cdp(auth, "Input.dispatchKeyEvent", { ...base, type: "keyUp" }, { dispatch: true });
-    const observation = step.after ? await collectAfter(auth, step.after) : null;
+    const observation = step.after ? await collectAfter(auth, step.after, retainSnapshotNow) : null;
     return { result: { key: def.key }, observation };
   }
   if (step.op === "scroll") {
@@ -1186,7 +1212,7 @@ async function runStep(auth, step, ctx) {
       await evaluate(auth, `window.scrollBy(${dx}, ${dy})`, { dispatch: true });
     }
     const pos = await evaluate(auth, `({ x: Math.round(scrollX), y: Math.round(scrollY) })`);
-    const observation = step.after ? await collectAfter(auth, step.after) : null;
+    const observation = step.after ? await collectAfter(auth, step.after, retainSnapshotNow) : null;
     return { result: { scroll: pos }, observation };
   }
   if (step.op === "snapshot") {
@@ -1254,8 +1280,9 @@ async function cmdWorkflow(params, state, ctx, epoch) {
         }
         bag.steps[i].status = "running";
         const dispatchedBefore = !!(control && control.dispatched);
+        const laterNeedsSnapshot = steps.slice(i + 1).some(stepNeedsSnapshot);
         try {
-          const out = await runStep(auth, steps[i], ctx);
+          const out = await runStep(auth, steps[i], ctx, !laterNeedsSnapshot);
           bag.steps[i].status = "completed";
           if (out && out.result) bag.steps[i].result = out.result;
           if (out && out.observation) {
@@ -1279,6 +1306,12 @@ async function cmdWorkflow(params, state, ctx, epoch) {
           }
           throw workflowError(errMsg(e), workflowReport(bag, status, control));
         }
+      }
+      // The steps that needed the starting snapshot have finished. The view
+      // this workflow returns is a new capture, not that id stamped onto new elements.
+      if (observationNeedsCapture(bag.observation)) {
+        bag.observation = await retainObservedSnapshot(auth);
+        bag.observed = true;
       }
       return {
         status: "completed",

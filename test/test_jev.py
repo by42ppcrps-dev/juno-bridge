@@ -1001,3 +1001,206 @@ class JevTests(unittest.TestCase):
         self.assertEqual(created[0].context.verify_mode, self.jev.ssl.CERT_REQUIRED)
         self.assertNotIn(SECRET, str(caught.exception))
         self.assertIn("[redacted]", str(caught.exception))
+
+    def test_observation_wrappers_load_and_an_ephemeral_view_does_not(self):
+        snap = {
+            "snapshot": self.snap_id("b"),
+            "url": "https://example.com/invoices",
+            "title": "Invoices",
+            "elements": [self.element("e2", "Download")],
+            "redaction": "heuristic",
+        }
+        payloads = (
+            snap,
+            {"ok": True, "data": snap},
+            {"ok": True, "data": {"observation": snap, "steps": [{"status": "completed"}]}},
+            {"ok": True, "click": {"issued": True, "snapshot": self.snap_id("a"), "observation": snap}},
+        )
+        for payload in payloads:
+            with self.subTest(payload=sorted(payload)):
+                path = self.write_observation(payload)
+                loaded = self.jev.read_observation(path)
+                self.assertEqual(loaded["snapshot"], snap["snapshot"])
+                self.assertEqual(loaded["elements"][0]["ref"], "e2")
+        ephemeral = self.write_observation({
+            "observe": "snapshot",
+            "observed": True,
+            "title": "Invoices",
+            "url": "https://example.com/invoices",
+            "elements": [self.element("e1", "Invoices")],
+            "redaction": "heuristic",
+        })
+        with self.assertRaises(ValueError) as caught:
+            self.jev.read_observation(ephemeral)
+        self.assertIn("snapshot id", str(caught.exception))
+
+    def test_the_returned_observation_drives_the_next_click_without_another_snapshot(self):
+        self.enable()
+        first = self.snap_id("a")
+        second = self.snap_id("b")
+        third = self.snap_id("c")
+        returned = {
+            "observe": "snapshot",
+            "observed": True,
+            "snapshot": second,
+            "url": "https://example.com/invoices",
+            "title": "Invoices",
+            "elements": [self.element("e1", "Invoices"), self.element("e2", "Download")],
+            "redaction": "heuristic",
+        }
+        self.patch_actions([
+            self.snapshot([self.element("e1", "Invoices")], snapshot=first),
+            {"ok": True, "data": {"dispatched": True, "observation": returned, "steps": [{"status": "completed"}]}},
+        ])
+        self.patch_post(self.answer({"target": ("e1", 0.91)}))
+        code, out, err = self.run_jev(
+            "target", "--tab", "7", "--goal", "Open invoices", "--click"
+        )
+        self.assertEqual(code, 0, err)
+        self.assertNotIn(SECRET, out + err)
+        path = self.write_observation(json.loads(out))
+        self.posts.clear()
+        self.actions.clear()
+        later = {
+            "observe": "snapshot",
+            "observed": True,
+            "snapshot": third,
+            "url": "https://example.com/invoices",
+            "elements": [self.element("e1", "Done")],
+            "redaction": "heuristic",
+        }
+        self.patch_actions([{
+            "ok": True,
+            "data": {"dispatched": True, "observation": later, "steps": [{"status": "completed"}]},
+        }])
+        self.patch_post(self.answer({"target": ("e2", 0.95)}))
+        code, out, err = self.run_jev(
+            "target", "--tab", "7", "--goal", "Download the invoice",
+            "--observation", path, "--click",
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual([item[0] for item in self.actions], ["workflow"])
+        self.assertEqual(self.actions[0][1]["snapshot"], second)
+        self.assertEqual(self.actions[0][1]["steps"][0]["ref"], "e2")
+        self.assertEqual(self.actions[0][1]["steps"][0]["after"], {"observe": "snapshot"})
+        self.assertEqual(len(self.posts), 1)
+        report = json.loads(out)
+        self.assertEqual(report["click"]["observation"]["snapshot"], third)
+
+    def test_after_ready_is_checked_before_a_browser_or_model_call(self):
+        self.enable()
+        self.patch_post(self.answer({"target": "e1"}))
+        self.patch_actions([self.snapshot([self.element("e1", "Invoices")])])
+        cases = (
+            "{",
+            "[]",
+            '{"type":"javascript"}',
+            '{"type":"text","text":""}',
+            '{"type":"element_visible","ref":"e1","snapshot":"%s"}' % self.snap_id("a"),
+            '{"type":"element_visible","ref":"nope"}',
+            '{"type":"text","text":"Ready","timeoutMs":15001}',
+            '{"type":"text","text":"Ready","timeoutMs":true}',
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                self.posts.clear()
+                self.actions.clear()
+                with self.assertRaises(SystemExit) as caught:
+                    jb.main([
+                        "jb.py", "jev", "target", "--tab", "7", "--goal", "Find it",
+                        "--click", "--after-ready", raw,
+                    ])
+                self.assertEqual(caught.exception.code, 2)
+                self.assertEqual(self.actions, [])
+                self.assertEqual(self.posts, [])
+        with self.assertRaises(SystemExit) as caught:
+            jb.main([
+                "jb.py", "jev", "target", "--tab", "7", "--goal", "Find it",
+                "--after-ready", '{"type":"text","text":"Ready"}',
+            ])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(self.actions, [])
+
+    def test_after_ready_is_sent_only_when_the_click_asks_for_it(self):
+        self.enable()
+        snap = self.snap_id("d")
+        self.patch_actions([
+            self.snapshot([self.element("e1", "Invoices")], snapshot=snap),
+            {"ok": True, "data": {"dispatched": True, "steps": [{"status": "completed"}]}},
+        ])
+        self.patch_post(self.answer({"target": ("e1", 0.9)}))
+        ready = '{"type":"text","text":"Download","timeoutMs":1000}'
+        code, _out, err = self.run_jev(
+            "target", "--tab", "7", "--goal", "Find the invoice", "--click",
+            "--after-ready", ready,
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.actions[1][1]["steps"][0]["after"], {
+            "observe": "snapshot",
+            "ready": {"type": "text", "text": "Download", "timeoutMs": 1000},
+        })
+        self.assertNotIn("snapshot", self.actions[1][1]["steps"][0]["after"]["ready"])
+        self.assertEqual(len(self.posts), 1)
+
+    def test_proceed_can_click_and_still_loses_to_the_other_checks(self):
+        snap = self.snap_id("e")
+        self.enable()
+        self.patch_actions([
+            self.snapshot([self.element("e1", "Invoices")], snapshot=snap),
+            {"ok": True, "data": {"dispatched": True, "steps": [{"status": "completed"}]}},
+        ])
+        self.patch_post(self.answer({
+            "target": ("e1", 0.95),
+            "page": "search_results",
+            "step": "proceed_with_selected_target",
+        }))
+        code, out, _err = self.run_jev(
+            "target", "page", "step", "--tab", "7", "--goal", "Find the invoice", "--click"
+        )
+        self.assertEqual(code, 0)
+        report = json.loads(out)
+        self.assertTrue(report["click"]["issued"])
+        self.assertNotIn("handoff", report["click"])
+        self.assertEqual([item[0] for item in self.actions], ["snapshot", "workflow"])
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(set(self.posts[0][0]["questions"]), {"target", "page", "step"})
+        self.assertIn(
+            "proceed_with_selected_target",
+            self.posts[0][0]["questions"]["step"]["criteria"],
+        )
+
+        self.posts.clear()
+        self.actions.clear()
+        self.patch_actions([self.snapshot([self.element("e1", "Invoices")], snapshot=snap)])
+        self.patch_post(self.answer({
+            "target": ("e1", 0.5),
+            "page": "other",
+            "step": "proceed_with_selected_target",
+        }))
+        code, out, _err = self.run_jev(
+            "target", "page", "step", "--tab", "7", "--goal", "Find the invoice", "--click"
+        )
+        self.assertEqual(code, 1)
+        report = json.loads(out)
+        self.assertFalse(report["click"]["issued"])
+        self.assertIn("confidence", report["click"]["reason"])
+        self.assertEqual([item[0] for item in self.actions], ["snapshot"])
+        self.assertEqual(len(self.posts), 1)
+
+        self.posts.clear()
+        self.actions.clear()
+        self.patch_actions([self.snapshot([self.element("e1", "Invoices")], snapshot=snap)])
+        self.patch_post(self.answer({
+            "target": ("e1", 0.95),
+            "page": "login_required",
+            "step": "proceed_with_selected_target",
+        }))
+        code, out, _err = self.run_jev(
+            "target", "page", "step", "--tab", "7", "--goal", "Find the invoice", "--click"
+        )
+        self.assertEqual(code, 1)
+        report = json.loads(out)
+        self.assertEqual(report["click"]["handoff"], "login_required")
+        self.assertFalse(report["click"]["issued"])
+        self.assertEqual([item[0] for item in self.actions], ["snapshot"])
+        self.assertEqual(len(self.posts), 1)

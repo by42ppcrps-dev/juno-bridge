@@ -54,9 +54,11 @@ The bill is whatever TypeSafe charges that key. `jb.py send` never calls Jev. Th
 
 USAGE = (
     "usage: jb.py jev target|page|step ... --tab <id> --goal <text> "
-    "[--device name] [--observation <file>] [--click]"
+    "[--device name] [--observation <file>] [--after-ready <json>] [--click]"
 )
 SNAPSHOT_ID_RE = re.compile(r"^snap_[0-9a-f]{32}$")
+REF_RE = re.compile(r"^e[1-9][0-9]{0,2}$")
+READY_TYPES = ("text", "element_visible", "element_enabled")
 BLOCKING_PAGES = ("login_required", "validation_error", "unexpected")
 
 
@@ -121,6 +123,46 @@ def api_key():
     )
 
 
+def parse_ready(raw):
+    """One bounded condition for the click. It does not carry a snapshot id."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--after-ready must be JSON") from exc
+    if not isinstance(raw, dict) or isinstance(raw, list):
+        raise ValueError("--after-ready must be a JSON object")
+    if "snapshot" in raw:
+        raise ValueError("--after-ready does not take a snapshot id")
+    unknown = set(raw) - {"type", "text", "ref", "timeoutMs"}
+    if unknown:
+        raise ValueError("--after-ready has an unknown field")
+    kind = raw.get("type")
+    if kind not in READY_TYPES:
+        raise ValueError("--after-ready type must be text, element_visible, or element_enabled")
+    ready = {"type": kind}
+    if "timeoutMs" in raw:
+        timeout = raw["timeoutMs"]
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 0 or timeout > 15000:
+            raise ValueError("--after-ready timeoutMs must be an integer from 0 to 15000")
+        ready["timeoutMs"] = timeout
+    if kind == "text":
+        text = raw.get("text")
+        if not isinstance(text, str) or not 1 <= len(text) <= 200:
+            raise ValueError("--after-ready text must be 1 to 200 characters")
+        if "ref" in raw:
+            raise ValueError("--after-ready text does not take a ref")
+        ready["text"] = text
+    else:
+        ref = raw.get("ref")
+        if not isinstance(ref, str) or REF_RE.fullmatch(ref) is None:
+            raise ValueError("--after-ready ref must be an element ref such as e1")
+        if "text" in raw:
+            raise ValueError("--after-ready element condition does not take text")
+        ready["ref"] = ref
+    return ready
+
+
 def parse_args(args):
     kinds = []
     tab = None
@@ -128,6 +170,7 @@ def parse_args(args):
     device = "default"
     click = False
     observation = None
+    ready = None
     i = 0
     while i < len(args):
         token = args[i]
@@ -136,7 +179,7 @@ def parse_args(args):
                 kinds.append(token)
         elif token == "--click":
             click = True
-        elif token in ("--tab", "--goal", "--device", "--observation"):
+        elif token in ("--tab", "--goal", "--device", "--observation", "--after-ready"):
             if i + 1 >= len(args):
                 raise ValueError(USAGE)
             value = args[i + 1]
@@ -149,6 +192,8 @@ def parse_args(args):
                 goal = value.strip()
             elif token == "--observation":
                 observation = value
+            elif token == "--after-ready":
+                ready = parse_ready(value)
             else:
                 device = value.strip() or "default"
         else:
@@ -160,6 +205,8 @@ def parse_args(args):
         raise ValueError(f"--goal must be at most {GOAL_MAX} characters")
     if click and "target" not in kinds:
         raise ValueError("--click requires the target decision")
+    if ready is not None and not click:
+        raise ValueError("--after-ready requires --click")
     if observation is not None and not observation.strip():
         raise ValueError(USAGE)
     return {
@@ -169,6 +216,7 @@ def parse_args(args):
         "device": device,
         "click": click,
         "observation": observation,
+        "ready": ready,
     }
 
 
@@ -183,24 +231,45 @@ def usable_observation(data):
     return isinstance(data.get("elements"), list)
 
 
+def _nested_observation(value):
+    """A snapshot object, or the observation inside a saved result."""
+    if usable_observation(value):
+        return value
+    if not isinstance(value, dict):
+        return None
+    if usable_observation(value.get("observation")):
+        return value["observation"]
+    click = value.get("click")
+    if isinstance(click, dict) and usable_observation(click.get("observation")):
+        return click["observation"]
+    return None
+
+
 def read_observation(path):
-    """Load a snapshot the caller already has. A bad file is not replaced."""
+    """Load a snapshot the caller already has. A bad file is not replaced.
+
+    The file may be the observation itself, a snapshot result (`data`),
+    a workflow result (`data.observation`), or a jev report (`click.observation`).
+    """
     try:
         with open(path, encoding="utf-8") as handle:
             raw = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("observation could not be read") from exc
-    if isinstance(raw, dict):
-        nested = raw.get("data")
-        if isinstance(nested, dict) and usable_observation(nested):
-            return nested
-        if usable_observation(raw):
-            return raw
-    raise ValueError("observation needs a snapshot id, a url, and elements")
+    found = _nested_observation(raw)
+    if found is None and isinstance(raw, dict):
+        found = _nested_observation(raw.get("data"))
+    if found is None:
+        raise ValueError("observation needs a snapshot id, a url, and elements")
+    return found
 
 
 def mutation_block(decisions):
-    """A handoff that must not become a browser mutation. None means act."""
+    """A handoff that must not become a browser mutation. None means act.
+
+    proceed_with_selected_target does not stop the click and does not
+    authorize it. The target checks still have to pass.
+    """
     decisions = decisions if isinstance(decisions, dict) else {}
     step = (decisions.get("step") or {}).get("choice")
     if step == "escalate":
@@ -215,12 +284,17 @@ def mutation_block(decisions):
     return None, None
 
 
-def bound_click(tab_id, snapshot_id, element):
+def bound_click(tab_id, snapshot_id, element, ready=None):
     """One workflow step. The extension checks the saved node, then observes."""
+    after = {"observe": "snapshot"}
+    # The workflow's snapshot is the capture from before the click. A new
+    # element is not in that capture, so element readiness cannot see it.
+    if ready:
+        after["ready"] = ready
     step = {
         "op": "click",
         "ref": element.get("ref"),
-        "after": {"observe": "snapshot"},
+        "after": after,
     }
     expect = {}
     tag = element.get("tag")
@@ -329,9 +403,13 @@ def prepare(snapshot, kinds, goal):
             "type": "choice",
             "instructions": (
                 "Given `goal` and this page, what should happen next? "
+                "proceed_with_selected_target means the selected target is the next action. "
                 "This choice does not authorize an action."
             ),
             "criteria": {
+                "proceed_with_selected_target": (
+                    "Continue with the selected target. This answer does not grant permission to act."
+                ),
                 "observe": "Take another observation before acting.",
                 "recover": (
                     "The situation matches a routine recovery the operator already "

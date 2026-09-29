@@ -9,7 +9,7 @@ const read = (path) => fs.readFileSync(new URL(path, root), "utf8");
 
 test("manifest identifies the experimental preview", () => {
   const manifest = JSON.parse(read("extension/manifest.json"));
-  assert.equal(manifest.version, "1.4.4");
+  assert.equal(manifest.version, "1.4.5");
   assert.ok(manifest.description.length <= 132, manifest.description);
   assert.match(manifest.description, /Experimental preview/);
   assert.match(manifest.description, /cannot undo one already sent to Chrome/);
@@ -36,6 +36,9 @@ test("readme states the safeguards the code actually provides", () => {
   assert.match(readme, /`snap_` plus 32 hex digits/);
   assert.match(readme, /Fixes in 1\.4\.3/);
   assert.match(readme, /Fixes in 1\.4\.4/);
+  assert.match(readme, /Fixes in 1\.4\.5/);
+  assert.match(readme, /proceed_with_selected_target/);
+  assert.match(readme, /--after-ready/);
   assert.match(readme, /element_visible/);
   assert.match(readme, /element_enabled/);
   assert.match(readme, /timeoutMs/);

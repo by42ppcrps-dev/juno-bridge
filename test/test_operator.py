@@ -3,8 +3,10 @@
 import importlib.util
 import json
 import os
+import socket
 import stat
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -411,6 +413,167 @@ class OperatorTests(unittest.TestCase):
                 os.environ.pop("TYPESAFE_API_KEY", None)
             else:
                 os.environ["TYPESAFE_API_KEY"] = saved
+
+    def _bodies_with(self, client, marker):
+        needle = marker.encode("utf-8")
+        return [call for call in client.calls if call[3] and needle in call[3]]
+
+    def test_a_slow_request_and_a_dropped_client_leave_the_operator_usable(self):
+        secret = "typesafe-test-key-not-real"
+        saved = os.environ.get("TYPESAFE_API_KEY")
+        os.environ["TYPESAFE_API_KEY"] = secret
+        started = threading.Event()
+        release = threading.Event()
+
+        class Holding:
+            def __init__(self):
+                self.posts = []
+                self.closed = False
+
+            def post(self, body, key, timeout=30):
+                self.posts.append((body, key, timeout))
+                started.set()
+                if not release.wait(5):
+                    raise TimeoutError("held")
+                return {"answers": {"target": {"choice": "none"}}, "marker": body.get("marker")}
+
+            def close(self):
+                self.closed = True
+
+        session = Holding()
+        client = FakeClient()
+        outcome = {}
+        follow = {}
+        slow = None
+        other = None
+        try:
+            token = self.start(client, typesafe=session)
+            with mock.patch.object(self.op.subprocess, "Popen", side_effect=AssertionError("spawned")):
+                def run_slow():
+                    try:
+                        outcome["res"] = self.op.systemone({"questions": {"target": {}}, "marker": "held"})
+                    except Exception as exc:
+                        outcome["err"] = exc
+
+                slow = threading.Thread(target=run_slow, daemon=True)
+                slow.start()
+                self.assertTrue(started.wait(2), "model request did not start")
+                began = time.monotonic()
+                self.assertTrue(self.op.ping_ok())
+                self.assertLess(time.monotonic() - began, 1.5)
+
+                def run_follow():
+                    try:
+                        follow["res"] = self.op.transact({
+                            "token": token,
+                            "method": "POST",
+                            "path": "/admin/run",
+                            "data": {"request_id": "req_follow01", "action": "click"},
+                            "timeout": 5,
+                        }, timeout=8)
+                    except Exception as exc:
+                        follow["err"] = exc
+
+                other = threading.Thread(target=run_follow, daemon=True)
+                other.start()
+                time.sleep(0.2)
+                abandoned = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                abandoned.settimeout(2)
+                try:
+                    abandoned.connect(self.sock)
+                    abandoned.sendall((json.dumps({
+                        "token": token,
+                        "method": "POST",
+                        "path": "/admin/run",
+                        "data": {"request_id": "req_abandoned1", "action": "click"},
+                    }) + "\n").encode("utf-8"))
+                    time.sleep(0.2)
+                finally:
+                    abandoned.close()
+                release.set()
+                slow.join(3)
+                other.join(3)
+                # The follow response is written before the worker reaches the
+                # request that was queued behind it. Wait for that send too.
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if (self._bodies_with(client, "req_follow01")
+                            and self._bodies_with(client, "req_abandoned1")):
+                        break
+                    time.sleep(0.02)
+            self.assertNotIn("err", outcome, outcome.get("err"))
+            self.assertEqual(outcome["res"]["marker"], "held")
+            self.assertEqual(len(session.posts), 1)
+            self.assertNotIn("err", follow, follow.get("err"))
+            self.assertTrue(follow["res"]["ok"])
+            self.assertEqual(len(self._bodies_with(client, "req_follow01")), 1)
+            self.assertEqual(len(self._bodies_with(client, "req_abandoned1")), 1)
+            self.assertTrue(self.thread.is_alive())
+            self.assertTrue(self.op.ping_ok())
+            stopped = self.op.transact({"token": token, "op": "stop"})
+            self.assertTrue(stopped.get("ok"))
+            self.thread.join(2)
+            self.assertFalse(self.thread.is_alive())
+            self.thread = None
+            self.assertEqual(len(self._bodies_with(client, "req_follow01")), 1)
+            self.assertEqual(len(self._bodies_with(client, "req_abandoned1")), 1)
+            self.assertEqual(len(session.posts), 1)
+            self.assertTrue(session.closed)
+        finally:
+            release.set()
+            if slow is not None:
+                slow.join(3)
+            if other is not None:
+                other.join(3)
+            if saved is None:
+                os.environ.pop("TYPESAFE_API_KEY", None)
+            else:
+                os.environ["TYPESAFE_API_KEY"] = saved
+
+    def test_an_idle_client_cannot_hold_the_operator(self):
+        client = FakeClient()
+        token = self.start(client)
+        previous = self.op.READ_DEADLINE_S
+        self.op.READ_DEADLINE_S = 0.3
+        idle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            idle.connect(self.sock)
+            idle.sendall(b'{"token":')
+            self.assertTrue(self.op.ping_ok())
+            time.sleep(0.6)
+            idle.settimeout(1)
+            try:
+                leftover = idle.recv(100)
+            except OSError:
+                leftover = b""
+            self.assertFalse(leftover)
+            self.assertTrue(self.op.ping_ok())
+            self.assertTrue(self.thread.is_alive())
+            again = self.op.transact({"token": token, "op": "ping"})
+            self.assertTrue(again.get("pong"))
+            self.assertEqual(client.calls, [])
+        finally:
+            self.op.READ_DEADLINE_S = previous
+            idle.close()
+
+    def test_a_worker_failure_stays_on_that_connection(self):
+        def boom(*_args):
+            raise RuntimeError("secret-token-value")
+
+        client = FakeClient(boom)
+        token = self.start(client)
+        failed = self.op.transact({
+            "token": token,
+            "method": "GET",
+            "path": "/admin/ping",
+            "timeout": 5,
+        })
+        self.assertFalse(failed["ok"])
+        self.assertEqual(failed["error"], "request failed")
+        self.assertNotIn("secret-token-value", json.dumps(failed))
+        self.assertTrue(self.op.ping_ok())
+        self.assertTrue(self.thread.is_alive())
+        self.assertEqual(len(client.calls), 1)
 
 
 if __name__ == "__main__":
