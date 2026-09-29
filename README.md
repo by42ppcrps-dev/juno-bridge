@@ -8,7 +8,7 @@ attach to the browser profile you use every day.
 The operator sends commands (navigate, snapshot, click, type, …). The relay
 pushes them to the extension over a WebSocket, and the extension runs them
 with `chrome.debugger`. Commands and results pass through the relay. This
-tree is extension v1.4.2.
+tree is extension v1.4.3.
 
 ## What the safeguards actually do
 
@@ -118,7 +118,7 @@ No model call runs inside the workflow.
 
 ```bash
 python3 driver/jb.py send click '{"tabId":123456,"x":50,"y":30,"after":{"observe":"snapshot","ready":{"type":"text","text":"Results","timeoutMs":15000}}}'
-python3 driver/jb.py send workflow '{"tabId":123456,"snapshot":"snap_00000001","steps":[{"op":"click","ref":"e1"},{"op":"type","text":"invoice"},{"op":"key","key":"Enter"}]}'
+python3 driver/jb.py send workflow '{"tabId":123456,"snapshot":"snap_0123456789abcdef0123456789abcdef","steps":[{"op":"click","ref":"e1"},{"op":"type","text":"invoice"},{"op":"key","key":"Enter"}]}'
 ```
 
 ## Fixes in 1.4.1
@@ -138,6 +138,14 @@ python3 driver/jb.py send workflow '{"tabId":123456,"snapshot":"snap_00000001","
   before input. A replacement that copied the old attributes is refused,
   including one with the same tag and label. If this worker restarts, the
   saved ids are gone and the old snapshot is refused.
+
+## Fixes in 1.4.3
+
+- A snapshot id is 128 random bits (`snap_` plus 32 hex digits). After this
+  worker restarts, a new capture gets a different id. An id saved earlier
+  is refused, including when that new capture would otherwise have reused it.
+- The extension binding has to be present every time a snapshot id is used.
+  A page that still holds the id is not accepted when the binding is gone.
 
 The result status is `completed`, `cancelled`, `interrupted`, `uncertain`,
 or `unobserved`. `uncertain` means some input may already have reached
@@ -251,7 +259,7 @@ and exits 1 when `ok` is not true. With several paired browsers, commands go
 to the most recently paired one unless you pass a device id (from
 `devices`). `revoke <device-id>` unpairs one. `send` does not call Jev.
 
-`snapshot` returns an id (`snap_` plus eight hex digits) and gives each
+`snapshot` returns an id (`snap_` plus 32 hex digits) and gives each
 element a `ref` (`e1`, `e2`, …) in the order the page was walked. A ref
 belongs to that snapshot id. The extension keeps Chrome's node id for each
 captured element, scoped to that document. It does not treat attributes on
@@ -259,8 +267,9 @@ the page as the identity of a target. Pass the id to `workflow`, or to
 `element_visible` and `element_enabled`, to use those elements. The next
 snapshot replaces that id. A same-URL reload, a restarted extension worker,
 or a node the browser can no longer resolve refuses the old id instead of
-selecting a different element. An `x`/`y` click still uses the coordinates
-you send.
+selecting a different element. A capture taken after that restart gets a
+new id, so an earlier id is not reused. An `x`/`y` click still uses the
+coordinates you send.
 
 Actions: `ping`, `tabs`, `navigate`, `screenshot`, `snapshot`, `text`,
 `click`, `type`, `key`, `scroll`, `close`, `workflow`, `eval` (`eval` runs

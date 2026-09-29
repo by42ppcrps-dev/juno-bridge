@@ -21,8 +21,11 @@
  *    choosing the next step. Pause, page, and permission checks still run
  *    before every step and every input event.
  *  - A snapshot ref is one node from that capture. This worker stores
- *    Chrome's backend node id for it, scoped to the document. Attributes on
- *    the page are not that identity. If the id cannot be resolved, the
+ *    Chrome's backend node id for it, scoped to the document. The id a
+ *    caller saves is 128 random bits, so a restarted worker cannot issue
+ *    that same id for a different capture. The extension binding is
+ *    required even when the page still holds the id. Attributes on the
+ *    page are not that identity. If the id cannot be resolved, the
  *    command stops before it sends input.
  *  - Existing-tab commands require an explicit tabId. There is no fallback
  *    to whichever tab is active.
@@ -54,11 +57,14 @@ const WORKFLOW_MAX_STEPS = 10;
 const READY_BUDGET_MS = 15000;
 const READY_POLL_MS = 50;
 const REF_RE = /^e[1-9][0-9]{0,2}$/;
-const SNAPSHOT_ID_RE = /^snap_[0-9a-f]{8}$/;
+const SNAPSHOT_ID_RE = /^snap_[0-9a-f]{32}$/;
+// A new worker starts this at zero. Ids must not be derived from it:
+// every worker's first capture would otherwise be snap_00000001.
 let snapshotSerial = 0;
 // snapshot id → { tabId, doc, url, nodes: [{ ref, backendNodeId }] }.
 // The page can copy attributes onto another element; the backend node id
-// cannot. The map dies with this worker, and a lost entry is a stale ref.
+// cannot. The map dies with this worker. A missing entry is a stale ref
+// even when the isolated world still names that snapshot.
 const snapshotBindings = new Map();
 const SNAPSHOT_BINDING_MAX = 32;
 const RESULT_ACK_MS_DEFAULT = 5000;
@@ -382,8 +388,11 @@ function commandAgeMs(cmd, relayNow, receivedAt, now) {
 /* ---------- command implementations ---------- */
 
 function newSnapshotId() {
-  snapshotSerial += 1;
-  return "snap_" + snapshotSerial.toString(16).padStart(8, "0");
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, "0");
+  return "snap_" + hex;
 }
 
 // Interactive elements with viewport-relative centre points (the coordinate
@@ -606,6 +615,15 @@ function forgetSnapshots() {
   snapshotBindings.clear();
 }
 
+// Test hook. A restarted worker loses the map and starts its counter over.
+// Production ids do not read that counter; the reset is what makes a
+// counter-based id collide with the previous worker's first capture.
+function simulateWorkerRestart() {
+  snapshotBindings.clear();
+  snapshotSerial = 0;
+  return snapshotSerial;
+}
+
 // Record backend node ids for the elements the store expression just held.
 // A later command resolves those ids. It does not search the DOM for a copy.
 async function retainSnapshot(auth, snapshotId, described) {
@@ -816,15 +834,16 @@ async function bindSnapshot(auth, snapshotId) {
   if (!doc || doc.url !== auth.url || typeof doc.doc !== "string") {
     throw new Error(`${auth.verb}: could not confirm the authorized page`);
   }
+  const binding = snapshotBindings.get(snapshotId);
+  // A newer capture deletes the old id. A reload changes the document key.
+  // A restarted worker drops the map. The page holder is not a substitute:
+  // this check runs even when that holder still names the id.
+  if (!binding || binding.tabId !== auth.tabId || binding.doc !== doc.doc || binding.url !== auth.url) {
+    throw new Error(`${auth.verb}: snapshot is stale`);
+  }
   let held = await evaluate(auth, HOLD_JS);
   const holdMatches = held && held.snapshot === snapshotId && held.doc === doc.doc && held.url === auth.url;
   if (!holdMatches) {
-    const binding = snapshotBindings.get(snapshotId);
-    // A newer capture deletes the old id. A reload changes the document key.
-    // Either one is stale before any node is resolved.
-    if (!binding || binding.tabId !== auth.tabId || binding.doc !== doc.doc || binding.url !== auth.url) {
-      throw new Error(`${auth.verb}: snapshot is stale`);
-    }
     const restored = await restoreSnapshot(auth, snapshotId, binding);
     if (!restored || restored.ok !== true) throw new Error(`${auth.verb}: snapshot is stale`);
     held = await evaluate(auth, HOLD_JS);
@@ -1766,6 +1785,7 @@ if (typeof JUNO_TEST !== "undefined" && JUNO_TEST) {
     SNAPSHOT_JS,
     pageTextExpression,
     forgetSnapshots,
+    simulateWorkerRestart,
     attachSocket(ws) { socket = ws; },
     setResultAckMs(ms) { resultAckTimeoutMs = ms; },
     epoch() { return controlEpoch; },

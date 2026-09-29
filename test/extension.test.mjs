@@ -1,10 +1,20 @@
 // Mock checks for the extension service worker. They do not load Chrome.
 
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, test } from "node:test";
 import vm from "node:vm";
+
+// The extension realm's Uint8Array is not the host's. Fill a host buffer,
+// then copy the bytes so getRandomValues accepts the view.
+function fillRandom(target) {
+  const host = new Uint8Array(target.length);
+  webcrypto.getRandomValues(host);
+  for (let i = 0; i < host.length; i++) target[i] = host[i];
+  return target;
+}
 
 const root = path.resolve(import.meta.dirname, "..");
 const source = ["config.js", "allowlist.js", "background.js"]
@@ -429,6 +439,11 @@ function boot(options = {}) {
     clearInterval,
     queueMicrotask,
     WebSocket: MockWebSocket,
+    crypto: {
+      getRandomValues(target) {
+        return fillRandom(target);
+      },
+    },
   };
   sandbox.fetch = async (url, opts) => {
     let body = null;
@@ -440,6 +455,11 @@ function boot(options = {}) {
   vm.createContext(sandbox);
   sandbox.JUNO_TEST = true;
   sandbox.WebSocket = MockWebSocket;
+  sandbox.crypto = {
+    getRandomValues(target) {
+      return fillRandom(target);
+    },
+  };
   sandbox.chrome = chrome;
   sandbox.importScripts = () => {};
   sandbox.fetch = sandbox.fetch;
@@ -595,11 +615,14 @@ function bootPage(extra = {}) {
       if (method === "Page.createIsolatedWorld") {
         page.worlds.push(params);
         // A new debugger session gets a new isolated world. The previous
-        // private mapping does not come with it.
-        vm.runInContext(
-          "globalThis.__junoHold = undefined; delete globalThis.__junoHold;",
-          page.realm,
-        );
+        // private mapping does not come with it. preserveWorld keeps the
+        // holder so a test can require the extension binding anyway.
+        if (!extra.preserveWorld) {
+          vm.runInContext(
+            "globalThis.__junoHold = undefined; delete globalThis.__junoHold;",
+            page.realm,
+          );
+        }
         return { executionContextId: 4 };
       }
       if (method === "Runtime.evaluate" && params && params.expression === "location.href") {
@@ -650,7 +673,7 @@ async function takeSnapshot(env) {
   await env.juno.schedule(cmd, env.now());
   const body = resultFor(env, cmd.id);
   assert.equal(body.ok, true, JSON.stringify(body));
-  assert.match(body.data.snapshot, /^snap_[0-9a-f]{8}$/);
+  assert.match(body.data.snapshot, /^snap_[0-9a-f]{32}$/);
   return body.data.snapshot;
 }
 
@@ -1814,6 +1837,39 @@ describe("extension", { concurrency: 1 }, () => {
     assert.equal(freshBody.data.steps[0].result.y, 30);
   });
 
+  test("a restarted worker does not reuse a snapshot id for a new capture", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const first = await takeSnapshot(env);
+    assert.equal(env.juno.simulateWorkerRestart(), 0);
+    const settings = labeledButton("Settings", { x: 10, y: 20, width: 80, height: 20 });
+    env.page.setNodes([settings]);
+    const second = await takeSnapshot(env);
+    assert.notEqual(first, second);
+    const stale = await runWorkflow(env, [{ op: "click", ref: "e1" }], first);
+    const staleBody = resultFor(env, stale.id);
+    assert.equal(staleBody.ok, false, JSON.stringify(staleBody));
+    assert.match(staleBody.error, /snapshot is stale/);
+    assert.equal(staleBody.error.includes("http"), false);
+    assert.equal(staleBody.data.status, "failed");
+    assert.equal(staleBody.data.dispatched, false);
+    assert.deepEqual(staleBody.data.steps.map((step) => step.status), ["unstarted"]);
+    assert.deepEqual(mouseTypes(env), []);
+    assert.equal(JSON.stringify(staleBody).includes("Settings"), false);
+    const fresh = await runWorkflow(env, [{ op: "click", ref: "e1" }], second);
+    const freshBody = resultFor(env, fresh.id);
+    assert.equal(freshBody.ok, true, JSON.stringify(freshBody));
+    assert.equal(freshBody.data.before.elements[0].text, "Settings");
+    assert.equal(freshBody.data.steps[0].result.x, 50);
+    assert.equal(freshBody.data.steps[0].result.y, 30);
+    const mice = env.debuggerCalls.filter((call) => call.method === "Input.dispatchMouseEvent");
+    assert.equal(mice.length, 3);
+    for (const call of mice) {
+      assert.equal(call.params.x, 50);
+      assert.equal(call.params.y, 30);
+    }
+  });
+
   test("a same-url reload before a workflow refuses the snapshot", async () => {
     const env = bootPage();
     const snapshot = await takeSnapshot(env);
@@ -1910,6 +1966,28 @@ describe("extension", { concurrency: 1 }, () => {
     assert.equal(body.data.steps[0].status, "unstarted");
     assert.deepEqual(mouseTypes(env), []);
     assert.equal(JSON.stringify(body).includes("Settings"), false);
+  });
+
+  test("a page holder is refused when the extension binding is gone", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ preserveWorld: true, button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    env.juno.forgetSnapshots();
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /snapshot is stale/);
+    assert.equal(body.error.includes("http"), false);
+    assert.equal(body.data.status, "failed");
+    assert.equal(body.data.dispatched, false);
+    assert.equal(body.data.steps[0].status, "unstarted");
+    assert.deepEqual(mouseTypes(env), []);
+    assert.equal(JSON.stringify(body).includes("Invoices"), false);
+    const held = vm.runInContext(
+      "globalThis.__junoHold ? globalThis.__junoHold.snapshot : null",
+      env.page.realm,
+    );
+    assert.equal(held, snapshot);
   });
 
   test("a node id the browser cannot resolve is refused", async () => {
@@ -2128,7 +2206,7 @@ describe("extension", { concurrency: 1 }, () => {
         y: 5,
         after: {
           observe: "text",
-          ready: { type: "element_visible", ref: "e1", snapshot: "snap_00000099", timeoutMs: 0 },
+          ready: { type: "element_visible", ref: "e1", snapshot: "snap_" + "9".repeat(32), timeoutMs: 0 },
         },
       },
     });
@@ -2139,6 +2217,30 @@ describe("extension", { concurrency: 1 }, () => {
     assert.equal(body.data, null);
     assert.deepEqual(mouseTypes(env), []);
     assert.equal(methodCalls(env, "attach").length, 2);
+  });
+
+  test("an eight-digit snapshot id is refused before attach", async () => {
+    const env = bootPage();
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        x: 4,
+        y: 5,
+        after: {
+          observe: "text",
+          ready: { type: "element_visible", ref: "e1", snapshot: "snap_00000001", timeoutMs: 0 },
+        },
+      },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /ready: snapshot required/);
+    assert.equal(body.data, null);
+    assert.equal(methodCalls(env, "attach").length, 0);
+    assert.deepEqual(mouseTypes(env), []);
   });
 
   test("an out of range timeout is refused before input", async () => {
