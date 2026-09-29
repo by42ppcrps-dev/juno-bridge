@@ -20,6 +20,10 @@
  *    is released. It is not held between commands or while a model is
  *    choosing the next step. Pause, page, and permission checks still run
  *    before every step and every input event.
+ *  - A snapshot ref is one node from that capture. This worker stores
+ *    Chrome's backend node id for it, scoped to the document. Attributes on
+ *    the page are not that identity. If the id cannot be resolved, the
+ *    command stops before it sends input.
  *  - Existing-tab commands require an explicit tabId. There is no fallback
  *    to whichever tab is active.
  *  - A command is authorized against one page. The tab's URL and the
@@ -52,6 +56,11 @@ const READY_POLL_MS = 50;
 const REF_RE = /^e[1-9][0-9]{0,2}$/;
 const SNAPSHOT_ID_RE = /^snap_[0-9a-f]{8}$/;
 let snapshotSerial = 0;
+// snapshot id → { tabId, doc, url, nodes: [{ ref, backendNodeId }] }.
+// The page can copy attributes onto another element; the backend node id
+// cannot. The map dies with this worker, and a lost entry is a stale ref.
+const snapshotBindings = new Map();
+const SNAPSHOT_BINDING_MAX = 32;
 const RESULT_ACK_MS_DEFAULT = 5000;
 const NAV_WAIT_MS = 15000;
 const CDP_VERSION = "1.3";
@@ -399,13 +408,6 @@ function snapshotSource(mode, snapshotId) {
   hold.nodes = [];
   hold.snapshot = ${idLiteral};
   hold.url = location.href;
-  const marked = document.querySelectorAll("[data-juno-snap]");
-  for (const prev of marked) {
-    if (!prev || !prev.removeAttribute) continue;
-    prev.removeAttribute("data-juno-snap");
-    prev.removeAttribute("data-juno-ref");
-    prev.removeAttribute("data-juno-doc");
-  }
   const source = document.querySelectorAll(sel);`
     : read
       ? `const hold = globalThis.__junoHold;
@@ -457,16 +459,7 @@ function snapshotSource(mode, snapshotId) {
     if (secret) item.redacted = true;
     if (el.disabled) item.disabled = true;
     els.push(item);
-    if (storing && hold) {
-      hold.nodes.push(el);
-      // The marks sit on the DOM node, so a later command can find this
-      // element after the isolated world is gone. A newer snapshot removes them.
-      if (el.setAttribute) {
-        el.setAttribute("data-juno-snap", hold.snapshot);
-        el.setAttribute("data-juno-ref", ref);
-        el.setAttribute("data-juno-doc", String(origin));
-      }
-    }
+    if (storing && hold) hold.nodes.push(el);
   }
   const result = { title: document.title, url: location.href,
     viewport: { w: vw, h: vh }, scroll: { x: Math.round(scrollX), y: Math.round(scrollY) },
@@ -594,15 +587,85 @@ async function cmdScreenshot(params, state, ctx, epoch) {
   return { tabId: auth.tabId, image: "data:image/jpeg;base64," + data, redaction: "none" };
 }
 
+function rememberSnapshot(snapshotId, binding) {
+  const stale = [];
+  for (const [id, prev] of snapshotBindings) {
+    if (id !== snapshotId && prev.tabId === binding.tabId && prev.doc === binding.doc) stale.push(id);
+  }
+  for (const id of stale) snapshotBindings.delete(id);
+  snapshotBindings.delete(snapshotId);
+  snapshotBindings.set(snapshotId, binding);
+  while (snapshotBindings.size > SNAPSHOT_BINDING_MAX) {
+    const oldest = snapshotBindings.keys().next().value;
+    if (oldest === snapshotId) break;
+    snapshotBindings.delete(oldest);
+  }
+}
+
+function forgetSnapshots() {
+  snapshotBindings.clear();
+}
+
+// Record backend node ids for the elements the store expression just held.
+// A later command resolves those ids. It does not search the DOM for a copy.
+async function retainSnapshot(auth, snapshotId, described) {
+  const elements = described.elements;
+  if (!Array.isArray(elements)) throw new Error("snapshot: snapshot failed");
+  if (typeof described.doc !== "string" || described.url !== auth.url) {
+    throw new Error("snapshot: could not retain the captured nodes");
+  }
+  const remote = await cdp(auth, "Runtime.evaluate", {
+    expression: `(() => {
+      const hold = globalThis.__junoHold;
+      if (!hold || hold.snapshot !== ${JSON.stringify(snapshotId)} || !Array.isArray(hold.nodes)) return null;
+      return hold.nodes;
+    })()`,
+    returnByValue: false,
+    awaitPromise: true,
+    contextId: auth.contextId,
+  });
+  if (remote && remote.exceptionDetails) throw new Error("snapshot: could not retain the captured nodes");
+  const nodes = [];
+  if (elements.length > 0) {
+    const listId = remote && remote.result && remote.result.objectId;
+    if (!listId) throw new Error("snapshot: could not retain the captured nodes");
+    const props = await cdp(auth, "Runtime.getProperties", { objectId: listId, ownProperties: true });
+    const byIndex = new Map();
+    for (const prop of (props && props.result) || []) {
+      if (!prop || !/^\d+$/.test(prop.name)) continue;
+      const id = prop.value && prop.value.objectId;
+      if (!id) continue;
+      byIndex.set(Number(prop.name), id);
+    }
+    if (byIndex.size !== elements.length) throw new Error("snapshot: could not retain the captured nodes");
+    for (let i = 0; i < elements.length; i++) {
+      const describedNode = await cdp(auth, "DOM.describeNode", { objectId: byIndex.get(i) });
+      const backendNodeId = describedNode && describedNode.node && describedNode.node.backendNodeId;
+      if (!Number.isInteger(backendNodeId) || backendNodeId <= 0) {
+        throw new Error("snapshot: could not retain the captured nodes");
+      }
+      nodes.push({ ref: "e" + (i + 1), backendNodeId });
+    }
+  }
+  rememberSnapshot(snapshotId, {
+    tabId: auth.tabId,
+    doc: described.doc,
+    url: described.url,
+    nodes,
+  });
+}
+
 async function cmdSnapshot(params, state, ctx, epoch) {
   const auth = await authorizeTab(params, state, ctx, "snapshot", epoch);
   const snapshotId = newSnapshotId();
   const snap = await withDebugger(auth, async () => {
     await ensureWorld(auth);
-    return evaluate(auth, snapshotSource("store", snapshotId));
+    const described = await evaluate(auth, snapshotSource("store", snapshotId));
+    refuseDrifted("snapshot", auth, described && described.url);
+    if (!described || typeof described !== "object") throw new Error("snapshot: snapshot failed");
+    await retainSnapshot(auth, snapshotId, described);
+    return described;
   });
-  refuseDrifted("snapshot", auth, snap && snap.url);
-  if (!snap || typeof snap !== "object") throw new Error("snapshot: snapshot failed");
   return { tabId: auth.tabId, ...snap, snapshot: snapshotId, redaction: "heuristic" };
 }
 
@@ -682,30 +745,69 @@ function elementReadySnapshot(after) {
   return ready.snapshot || null;
 }
 
-function restoreHoldSource(snapshotId) {
+function installHoldSource(snapshotId, docKey, url) {
   const snapJson = JSON.stringify(snapshotId);
-  return `(() => {
-    const snap = ${snapJson};
-    const origin = (typeof performance !== "undefined" && performance && performance.timeOrigin) || 0;
-    const key = location.href + "\\0" + origin;
-    const list = document.querySelectorAll('[data-juno-snap="' + snap + '"][data-juno-doc="' + origin + '"]');
-    if (!list || !list.length) return { ok: false, count: 0 };
+  const docJson = JSON.stringify(docKey);
+  const urlJson = JSON.stringify(url);
+  // Arguments are the nodes DOM.resolveNode returned, in ref order. A missing
+  // argument stays empty. Nothing here looks at attributes or the live order.
+  return `function() {
     const nodes = [];
-    for (const el of list) {
-      if (!el || el.isConnected === false) continue;
-      const ref = el.getAttribute ? (el.getAttribute("data-juno-ref") || "") : "";
-      const m = /^e(\\d+)$/.exec(ref);
-      if (!m) return { ok: false, count: 0 };
-      const index = Number(m[1]) - 1;
-      if (index < 0 || index > 299 || nodes[index]) return { ok: false, count: 0 };
-      nodes[index] = el;
+    let identified = 0;
+    for (let i = 0; i < arguments.length; i++) {
+      const el = arguments[i];
+      if (!el) {
+        nodes.push(null);
+        continue;
+      }
+      identified += 1;
+      nodes.push(el);
     }
-    let count = 0;
-    for (const el of nodes) if (el) count += 1;
-    if (!count) return { ok: false, count: 0 };
-    globalThis.__junoHold = { key: key, nodes: nodes, url: location.href, snapshot: snap };
-    return { ok: true, count: count, doc: key };
-  })()`;
+    if (!identified) return { ok: false, count: 0 };
+    globalThis.__junoHold = {
+      key: ${docJson},
+      nodes: nodes,
+      url: ${urlJson},
+      snapshot: ${snapJson},
+    };
+    return { ok: true, count: identified };
+  }`;
+}
+
+async function callInPage(auth, functionDeclaration, args) {
+  const res = await cdp(auth, "Runtime.callFunctionOn", {
+    functionDeclaration,
+    arguments: args,
+    executionContextId: auth.contextId,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (res && res.exceptionDetails) {
+    const detail = res.exceptionDetails;
+    const why = (detail.exception && (detail.exception.description || detail.exception.value)) || detail.text || "exception";
+    throw new Error("page threw: " + String(why).slice(0, 300));
+  }
+  return res && res.result ? res.result.value : undefined;
+}
+
+async function restoreSnapshot(auth, snapshotId, binding) {
+  const args = [];
+  for (const entry of binding.nodes) {
+    let objectId = null;
+    try {
+      const resolved = await cdp(auth, "DOM.resolveNode", {
+        backendNodeId: entry.backendNodeId,
+        executionContextId: auth.contextId,
+      });
+      if (resolved && !resolved.exceptionDetails && resolved.object) {
+        objectId = resolved.object.objectId || null;
+      }
+    } catch {
+      objectId = null;
+    }
+    args.push(objectId ? { objectId } : { value: null });
+  }
+  return callInPage(auth, installHoldSource(snapshotId, binding.doc, binding.url), args);
 }
 
 async function bindSnapshot(auth, snapshotId) {
@@ -717,10 +819,14 @@ async function bindSnapshot(auth, snapshotId) {
   let held = await evaluate(auth, HOLD_JS);
   const holdMatches = held && held.snapshot === snapshotId && held.doc === doc.doc && held.url === auth.url;
   if (!holdMatches) {
-    const restored = await evaluate(auth, restoreHoldSource(snapshotId));
-    if (!restored || restored.ok !== true || restored.doc !== doc.doc) {
+    const binding = snapshotBindings.get(snapshotId);
+    // A newer capture deletes the old id. A reload changes the document key.
+    // Either one is stale before any node is resolved.
+    if (!binding || binding.tabId !== auth.tabId || binding.doc !== doc.doc || binding.url !== auth.url) {
       throw new Error(`${auth.verb}: snapshot is stale`);
     }
+    const restored = await restoreSnapshot(auth, snapshotId, binding);
+    if (!restored || restored.ok !== true) throw new Error(`${auth.verb}: snapshot is stale`);
     held = await evaluate(auth, HOLD_JS);
     if (!held || held.snapshot !== snapshotId || held.doc !== doc.doc || held.url !== auth.url) {
       throw new Error(`${auth.verb}: snapshot is stale`);
@@ -728,6 +834,18 @@ async function bindSnapshot(auth, snapshotId) {
   }
   auth.doc = doc.doc;
   auth.snapshot = snapshotId;
+}
+
+// Element readiness names a ref. Confirm that node is still the captured one
+// before any input. Visibility after the action stays in waitReady.
+async function requireReadyTarget(auth, after) {
+  const snapshotId = elementReadySnapshot(after);
+  if (!snapshotId) return;
+  await bindSnapshot(auth, snapshotId);
+  const ref = after.ready.ref;
+  const found = await evaluate(auth, resolveRefExpression(ref, snapshotId));
+  if (found && found.stale) throw new Error(`${auth.verb}: snapshot is stale`);
+  if (!found || found.ok !== true) throw new Error(`${auth.verb}: element ${ref} is gone`);
 }
 
 async function waitReady(auth, ready, inheritedSnapshot) {
@@ -832,8 +950,7 @@ async function cmdClick(params, state, ctx, epoch) {
   // Recheck before each event. Pause or navigation after mouseMoved must not
   // deliver the press and release. An event already sent cannot be undone.
   return await withDebugger(auth, async () => {
-    const bound = elementReadySnapshot(params && params.after);
-    if (bound) await bindSnapshot(auth, bound);
+    await requireReadyTarget(auth, params && params.after);
     await clickAt(auth, x, y);
     if (!params || !params.after) return { tabId: auth.tabId, x, y };
     const observation = await collectAfter(auth, params.after);
@@ -847,8 +964,7 @@ async function cmdType(params, state, ctx, epoch) {
   const { text } = params;
   if (typeof text !== "string" || !text) throw new Error("type: missing text");
   return await withDebugger(auth, async () => {
-    const bound = elementReadySnapshot(params && params.after);
-    if (bound) await bindSnapshot(auth, bound);
+    await requireReadyTarget(auth, params && params.after);
     await cdp(auth, "Input.insertText", { text }, { dispatch: true });
     if (!params || !params.after) return { tabId: auth.tabId, chars: text.length };
     const observation = await collectAfter(auth, params.after);
@@ -868,8 +984,7 @@ async function cmdKey(params, state, ctx, epoch) {
     windowsVirtualKeyCode: def.keyCode, nativeVirtualKeyCode: def.keyCode,
   };
   return await withDebugger(auth, async () => {
-    const bound = elementReadySnapshot(params && params.after);
-    if (bound) await bindSnapshot(auth, bound);
+    await requireReadyTarget(auth, params && params.after);
     await cdp(auth, "Input.dispatchKeyEvent", def.text
       ? { ...base, type: "keyDown", text: def.text, unmodifiedText: def.text }
       : { ...base, type: "rawKeyDown" }, { dispatch: true });
@@ -892,8 +1007,7 @@ async function cmdScroll(params, state, ctx, epoch) {
   }
   const atPoint = Number.isFinite(params.x) && Number.isFinite(params.y);
   return await withDebugger(auth, async () => {
-    const bound = elementReadySnapshot(params && params.after);
-    if (bound) await bindSnapshot(auth, bound);
+    await requireReadyTarget(auth, params && params.after);
     if (atPoint) {
       await cdp(auth, "Input.dispatchMouseEvent", {
         type: "mouseWheel", x: params.x, y: params.y, deltaX: dx, deltaY: dy,
@@ -1651,6 +1765,7 @@ if (typeof JUNO_TEST !== "undefined" && JUNO_TEST) {
     CMD_TIMEOUT_MS,
     SNAPSHOT_JS,
     pageTextExpression,
+    forgetSnapshots,
     attachSocket(ws) { socket = ws; },
     setResultAckMs(ms) { resultAckTimeoutMs = ms; },
     epoch() { return controlEpoch; },

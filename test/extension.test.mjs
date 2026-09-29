@@ -116,6 +116,109 @@ function dropHold(env) {
   assert.equal(vm.runInContext("globalThis.__junoHold == null", env.page.realm), true);
 }
 
+// The page can copy these onto a different node. Recovery must ignore them.
+function copyCaptureMarks(el, snapshot) {
+  el.setAttribute("data-juno-snap", snapshot);
+  el.setAttribute("data-juno-ref", "e1");
+  el.setAttribute("data-juno-doc", "1000");
+}
+
+// Remote objects and backend node ids for one page realm. A backend id is
+// assigned when the node is described and follows that object, not its attributes.
+function createPageSession(realm) {
+  let nextObject = 1;
+  let nextBackend = 1;
+  const objects = new Map();
+  const backends = new Map();
+  function track(value) {
+    const objectId = "obj_" + nextObject++;
+    objects.set(objectId, value);
+    return objectId;
+  }
+  function backendIdFor(el) {
+    if (!el || typeof el !== "object") return 0;
+    if (!el._backendNodeId) {
+      el._backendNodeId = nextBackend++;
+      backends.set(el._backendNodeId, el);
+    }
+    return el._backendNodeId;
+  }
+  return {
+    dropBackend(el) {
+      if (el && el._backendNodeId) backends.delete(el._backendNodeId);
+    },
+    handle(method, params) {
+      if (method === "Runtime.evaluate" && params && params.expression !== "location.href") {
+        let value;
+        try {
+          value = vm.runInContext(params.expression, realm);
+        } catch (err) {
+          return { exceptionDetails: { text: String((err && err.message) || err) } };
+        }
+        if (params.returnByValue === false) {
+          if (value == null) return { result: { type: "object", subtype: "null", value: null } };
+          return {
+            result: {
+              type: "object",
+              subtype: Array.isArray(value) ? "array" : "node",
+              objectId: track(value),
+            },
+          };
+        }
+        return { result: { value } };
+      }
+      if (method === "Runtime.getProperties" && params) {
+        const value = objects.get(params.objectId);
+        const result = [];
+        if (Array.isArray(value)) {
+          value.forEach((el, index) => {
+            result.push({
+              name: String(index),
+              value: el == null
+                ? { type: "object", subtype: "null", value: null }
+                : { type: "object", subtype: "node", objectId: track(el) },
+            });
+          });
+          result.push({ name: "length", value: { type: "number", value: value.length } });
+        }
+        return { result };
+      }
+      if (method === "DOM.describeNode" && params) {
+        const el = objects.get(params.objectId);
+        const backendNodeId = backendIdFor(el);
+        if (!backendNodeId) throw new Error("No node with given id found");
+        return { node: { nodeId: backendNodeId, backendNodeId, nodeName: el.tagName || "DIV" } };
+      }
+      if (method === "DOM.resolveNode" && params) {
+        const el = backends.get(params.backendNodeId);
+        if (!el) throw new Error("No node with given id found");
+        return { object: { type: "object", subtype: "node", objectId: track(el) } };
+      }
+      if (method === "Runtime.callFunctionOn" && params) {
+        const args = (params.arguments || []).map((arg) => {
+          if (arg && arg.objectId) return objects.get(arg.objectId);
+          return arg && Object.prototype.hasOwnProperty.call(arg, "value") ? arg.value : undefined;
+        });
+        realm.__callArgs = args;
+        realm.__callThis = params.objectId ? objects.get(params.objectId) : realm;
+        try {
+          const value = vm.runInContext(
+            `(function(){ const fn = (${params.functionDeclaration}); return fn.apply(globalThis.__callThis, globalThis.__callArgs); })()`,
+            realm,
+          );
+          return { result: { value } };
+        } catch (err) {
+          return { exceptionDetails: { text: String((err && err.message) || err) } };
+        } finally {
+          delete realm.__callArgs;
+          delete realm.__callThis;
+        }
+      }
+      return undefined;
+    },
+  };
+}
+
 // Replaces the 30s command timer with a callback the test fires itself.
 function captureCommandTimeout(env) {
   const realSet = env.sandbox.setTimeout;
@@ -468,12 +571,16 @@ function bootPage(extra = {}) {
     scrollY: 0,
   });
   realm.globalThis = realm;
+  const session = createPageSession(realm);
   const page = {
     realm,
     button,
     nodes,
     docReads: 0,
     worlds: [],
+    dropBackend(el) {
+      session.dropBackend(el);
+    },
     setNodes(next) {
       nodes.splice(0, nodes.length, ...next);
     },
@@ -487,25 +594,25 @@ function bootPage(extra = {}) {
       }
       if (method === "Page.createIsolatedWorld") {
         page.worlds.push(params);
+        // A new debugger session gets a new isolated world. The previous
+        // private mapping does not come with it.
+        vm.runInContext(
+          "globalThis.__junoHold = undefined; delete globalThis.__junoHold;",
+          page.realm,
+        );
         return { executionContextId: 4 };
       }
       if (method === "Runtime.evaluate" && params && params.expression === "location.href") {
         return undefined;
       }
-      if (method === "Runtime.evaluate" && params) {
-        if (String(params.expression).includes("performance.timeOrigin")) {
-          page.docReads += 1;
-          if (extra.flipOnDocRead && page.docReads === extra.flipOnDocRead) {
-            page.realm.performance.timeOrigin += 5000;
-          }
-        }
-        try {
-          const value = vm.runInContext(params.expression, page.realm);
-          return { result: { value } };
-        } catch (err) {
-          return { exceptionDetails: { text: String((err && err.message) || err) } };
+      if (method === "Runtime.evaluate" && params && String(params.expression).includes("performance.timeOrigin")) {
+        page.docReads += 1;
+        if (extra.flipOnDocRead && page.docReads === extra.flipOnDocRead) {
+          page.realm.performance.timeOrigin += 5000;
         }
       }
+      const handled = session.handle(method, params);
+      if (handled !== undefined) return handled;
       if (extra.onCommand) {
         const custom = await extra.onCommand(info, page, box);
         if (custom !== undefined) return custom;
@@ -791,21 +898,26 @@ describe("extension", { concurrency: 1 }, () => {
       element({ attrs: { name: "code" }, value: "code-VISIBLE-zeta" }),
       element({ tag: "button", text: "Save draft" }),
     ];
+    const realm = vm.createContext({
+      document: {
+        title: "Example",
+        body: { innerText: "" },
+        querySelectorAll() {
+          return elements;
+        },
+      },
+      window: { innerWidth: 1280, innerHeight: 800 },
+      location: { href },
+      performance: { timeOrigin: 1000 },
+      scrollX: 0,
+      scrollY: 0,
+    });
+    realm.globalThis = realm;
+    const session = createPageSession(realm);
     const env = boot({
-      pageEval(expr) {
-        return vm.runInNewContext(expr, {
-          document: {
-            title: "Example",
-            body: { innerText: "" },
-            querySelectorAll() {
-              return elements;
-            },
-          },
-          window: { innerWidth: 1280, innerHeight: 800 },
-          location: { href },
-          scrollX: 0,
-          scrollY: 0,
-        });
+      sendCommand({ method, params }) {
+        if (method === "Runtime.evaluate" && params && params.expression === "location.href") return undefined;
+        return session.handle(method, params);
       },
     });
     env.addTab(7, href);
@@ -1717,17 +1829,14 @@ describe("extension", { concurrency: 1 }, () => {
     assert.deepEqual(mouseTypes(env), []);
   });
 
-  test("a cleared page world still resolves the marked element", async () => {
+  test("a cleared page world still resolves the captured element", async () => {
     const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
     const env = bootPage({ button: invoices, nodes: [invoices] });
     const snapshot = await takeSnapshot(env);
-    assert.equal(invoices.getAttribute("data-juno-snap"), snapshot);
-    assert.equal(invoices.getAttribute("data-juno-ref"), "e1");
+    const decoy = labeledButton("Delete account", { x: 10, y: 20, width: 80, height: 20 });
+    copyCaptureMarks(decoy, snapshot);
     dropHold(env);
-    env.page.setNodes([
-      labeledButton("Delete account", { x: 10, y: 20, width: 80, height: 20 }),
-      invoices,
-    ]);
+    env.page.setNodes([decoy, invoices]);
     const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, true, JSON.stringify(body));
@@ -1742,12 +1851,76 @@ describe("extension", { concurrency: 1 }, () => {
     assert.equal(JSON.stringify(body).includes("Delete account"), false);
   });
 
-  test("clearing the marks refuses a snapshot whose world is gone", async () => {
-    const env = bootPage();
+  test("a cloned node that copies the capture marks is refused after reconnect", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
     const snapshot = await takeSnapshot(env);
-    env.page.button.removeAttribute("data-juno-snap");
-    env.page.button.removeAttribute("data-juno-ref");
-    env.page.button.removeAttribute("data-juno-doc");
+    const settings = labeledButton("Settings", { x: 10, y: 20, width: 80, height: 20 });
+    copyCaptureMarks(settings, snapshot);
+    invoices.isConnected = false;
+    env.page.setNodes([settings]);
+    dropHold(env);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /element e1 is gone/);
+    assert.equal(body.error.includes("Settings"), false);
+    assert.equal(body.data.status, "failed");
+    assert.equal(body.data.dispatched, false);
+    assert.equal(body.data.steps[0].status, "failed");
+    assert.equal(body.data.before.elements[0].missing, true);
+    assert.deepEqual(mouseTypes(env), []);
+    assert.equal(JSON.stringify(body).includes("Settings"), false);
+  });
+
+  test("a replacement with the same tag and label is refused after reconnect", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    const clone = labeledButton("Invoices", { x: 10, y: 20, width: 80, height: 20 });
+    copyCaptureMarks(clone, snapshot);
+    invoices.isConnected = false;
+    env.page.setNodes([clone]);
+    dropHold(env);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /element e1 is gone/);
+    assert.equal(body.data.dispatched, false);
+    assert.equal(body.data.steps[0].status, "failed");
+    assert.equal(body.data.before.elements[0].missing, true);
+    assert.deepEqual(mouseTypes(env), []);
+  });
+
+  test("a lost extension capture is not rebuilt from page marks", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    const settings = labeledButton("Settings", { x: 10, y: 20, width: 80, height: 20 });
+    copyCaptureMarks(settings, snapshot);
+    invoices.isConnected = false;
+    env.page.setNodes([settings]);
+    dropHold(env);
+    env.juno.forgetSnapshots();
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /snapshot is stale/);
+    assert.equal(body.data.dispatched, false);
+    assert.equal(body.data.steps[0].status, "unstarted");
+    assert.deepEqual(mouseTypes(env), []);
+    assert.equal(JSON.stringify(body).includes("Settings"), false);
+  });
+
+  test("a node id the browser cannot resolve is refused", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    const settings = labeledButton("Settings", { x: 10, y: 20, width: 80, height: 20 });
+    copyCaptureMarks(settings, snapshot);
+    invoices.isConnected = false;
+    env.page.setNodes([settings]);
+    env.page.dropBackend(invoices);
     dropHold(env);
     const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
     const body = resultFor(env, cmd.id);
@@ -1756,6 +1929,7 @@ describe("extension", { concurrency: 1 }, () => {
     assert.equal(body.data.dispatched, false);
     assert.equal(body.data.steps[0].status, "unstarted");
     assert.deepEqual(mouseTypes(env), []);
+    assert.equal(JSON.stringify(body).includes("Settings"), false);
   });
 
   test("a snapshot step does not retarget the authorized ref", async () => {
@@ -1861,6 +2035,37 @@ describe("extension", { concurrency: 1 }, () => {
     const scrollBody = resultFor(env, scrolled.id);
     assert.equal(scrollBody.ok, true, JSON.stringify(scrollBody));
     assert.deepEqual(env.page.realm.window.scrolls, [[0, 40]]);
+  });
+
+  test("element readiness refuses a cloned marker before input", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    const settings = labeledButton("Settings", { x: 10, y: 20, width: 80, height: 20 });
+    copyCaptureMarks(settings, snapshot);
+    invoices.isConnected = false;
+    env.page.setNodes([settings]);
+    dropHold(env);
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        x: 50,
+        y: 30,
+        after: {
+          observe: "text",
+          ready: { type: "element_enabled", ref: "e1", snapshot, timeoutMs: 0 },
+        },
+      },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /element e1 is gone/);
+    assert.equal(body.data, null);
+    assert.deepEqual(mouseTypes(env), []);
+    assert.equal(JSON.stringify(body).includes("Settings"), false);
   });
 
   test("element readiness restores a cleared snapshot before the click", async () => {

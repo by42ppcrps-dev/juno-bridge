@@ -8,7 +8,7 @@ attach to the browser profile you use every day.
 The operator sends commands (navigate, snapshot, click, type, …). The relay
 pushes them to the extension over a WebSocket, and the extension runs them
 with `chrome.debugger`. Commands and results pass through the relay. This
-tree is extension v1.4.1.
+tree is extension v1.4.2.
 
 ## What the safeguards actually do
 
@@ -98,7 +98,9 @@ observation in the same result. `after.observe` is `snapshot` or `text`.
 name a `ref` from an earlier `snapshot` and include that snapshot id.
 `timeoutMs` from 0 to 15000 is the budget for that condition. `0` checks
 the page once. The snapshot id and `timeoutMs` are checked before input
-is sent. The budget is not a sleep, and the relay's `wait` is a
+is sent. The ref has to match the browser node id saved for that snapshot.
+A node that cannot be verified stops the command before input is sent.
+The budget is not a sleep, and the relay's `wait` is a
 maximum: the response is sent when the result arrives. Shortening `wait`
 does not shorten the browser action.
 
@@ -106,9 +108,9 @@ does not shorten the browser action.
 `click` (by snapshot `ref`), `type`, `key`, `scroll`, `snapshot`, `text`,
 and `wait`. A click, or an element readiness condition, requires the
 snapshot id returned by `snapshot`. The extension resolves those refs
-against that capture. If the document changed, or a newer snapshot replaced
-that id, the workflow refuses the reference instead of clicking a different
-element. A `snapshot` step inside a workflow is only a view of the live
+against that capture's browser node ids. If the document changed, a newer
+snapshot replaced that id, or the node can no longer be resolved, the
+workflow refuses the reference instead of clicking a different element. A `snapshot` step inside a workflow is only a view of the live
 page and does not retarget the authorized refs. The extension keeps one debugger attachment for that list and
 releases it when the workflow finishes or is interrupted. A workflow holds the debugger until that workflow finishes, then releases it.
 Pause, the allowlist, and the page check still run on every step.
@@ -124,10 +126,18 @@ python3 driver/jb.py send workflow '{"tabId":123456,"snapshot":"snap_00000001","
 - The operator's reused HTTP client clears the previous request method
   before each request, so a GET that follows a POST is sent as a GET.
 - A workflow reference resolves only against the snapshot id the caller
-  selected. The captured elements are marked with that id. A missing or
-  replaced capture is refused.
+  selected. A missing or replaced capture is refused.
 - `element_visible` and `element_enabled` use that same snapshot id, and
   `timeoutMs` is checked before input is sent.
+
+## Fixes in 1.4.2
+
+- A snapshot ref is stored with Chrome's node id for that document. The
+  extension does not recover a target from attributes on the page. After the
+  debugger reconnects, the ref resolves to that node, or the command stops
+  before input. A replacement that copied the old attributes is refused,
+  including one with the same tag and label. If this worker restarts, the
+  saved ids are gone and the old snapshot is refused.
 
 The result status is `completed`, `cancelled`, `interrupted`, `uncertain`,
 or `unobserved`. `uncertain` means some input may already have reached
@@ -243,12 +253,14 @@ to the most recently paired one unless you pass a device id (from
 
 `snapshot` returns an id (`snap_` plus eight hex digits) and gives each
 element a `ref` (`e1`, `e2`, …) in the order the page was walked. A ref
-belongs to that snapshot id. The extension marks each captured element with
-that id and removes the previous snapshot's marks. Pass the id to
-`workflow`, or to `element_visible` and `element_enabled`, to use those
-elements. The next snapshot replaces the stored mapping, and a same-URL
-reload drops it. The extension then refuses the old id instead of selecting
-a different element. An `x`/`y` click still uses the coordinates you send.
+belongs to that snapshot id. The extension keeps Chrome's node id for each
+captured element, scoped to that document. It does not treat attributes on
+the page as the identity of a target. Pass the id to `workflow`, or to
+`element_visible` and `element_enabled`, to use those elements. The next
+snapshot replaces that id. A same-URL reload, a restarted extension worker,
+or a node the browser can no longer resolve refuses the old id instead of
+selecting a different element. An `x`/`y` click still uses the coordinates
+you send.
 
 Actions: `ping`, `tabs`, `navigate`, `screenshot`, `snapshot`, `text`,
 `click`, `type`, `key`, `scroll`, `close`, `workflow`, `eval` (`eval` runs
