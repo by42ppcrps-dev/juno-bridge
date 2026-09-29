@@ -94,6 +94,20 @@ function mouseTypes(env) {
     .map((call) => call.params.type);
 }
 
+function labeledButton(text, rect) {
+  const button = pageButton([rect]);
+  button.innerText = text;
+  return button;
+}
+
+function debuggerUse(env) {
+  return {
+    attach: methodCalls(env, "attach").length,
+    detach: methodCalls(env, "detach").length,
+    results: env.fetches.filter((item) => item.url.endsWith("/result")).length,
+  };
+}
+
 // Replaces the 30s command timer with a callback the test fires itself.
 function captureCommandTimeout(env) {
   const realSet = env.sandbox.setTimeout;
@@ -260,6 +274,12 @@ function boot(options = {}) {
           const tab = tabs.get(target.tabId);
           return { result: { value: (tab && (tab.href || tab.url)) || "" } };
         }
+        if (method === "Page.getFrameTree") {
+          return { frameTree: { frame: { id: "frame-1" } } };
+        }
+        if (method === "Page.createIsolatedWorld") {
+          return { executionContextId: 4 };
+        }
         if (method === "Page.captureScreenshot") return { data: "QUJD" };
         if (method === "Runtime.evaluate" && options.pageEval) {
           return { result: { value: options.pageEval(params.expression, target) } };
@@ -370,8 +390,15 @@ function pageButton(rects) {
     href: "",
     _rects: rects,
     _n: 0,
-    getAttribute() {
-      return null;
+    _attrs: {},
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name] : null;
+    },
+    setAttribute(name, value) {
+      this._attrs[name] = String(value);
+    },
+    removeAttribute(name) {
+      delete this._attrs[name];
     },
     getBoundingClientRect() {
       const rect = this._rects[Math.min(this._n, this._rects.length - 1)];
@@ -392,24 +419,57 @@ function pageButton(rects) {
 
 // One document the workflow evaluates in. location.href checks stay on the tab mock.
 function bootPage(extra = {}) {
-  const button = pageButton(extra.rects || [FILTER_RECT]);
+  const button = extra.button || pageButton(extra.rects || [FILTER_RECT]);
   if (extra.disabled) button.disabled = true;
+  const nodes = extra.nodes ? extra.nodes.slice() : [button];
   const realm = vm.createContext({
     document: {
       title: "Results",
       body: { innerText: extra.bodyText || "Results for invoices" },
-      querySelectorAll() {
-        return [button];
+      querySelectorAll(selector) {
+        const sel = String(selector || "");
+        if (sel === "[data-juno-snap]") {
+          return nodes.filter((el) => el.getAttribute && el.getAttribute("data-juno-snap"));
+        }
+        const snap = sel.match(/\[data-juno-snap="([^"]+)"\]/);
+        if (snap) {
+          const refMatch = sel.match(/\[data-juno-ref="([^"]+)"\]/);
+          const docMatch = sel.match(/\[data-juno-doc="([^"]+)"\]/);
+          return nodes.filter((el) => {
+            if (!el.getAttribute || el.isConnected === false) return false;
+            if (el.getAttribute("data-juno-snap") !== snap[1]) return false;
+            if (refMatch && el.getAttribute("data-juno-ref") !== refMatch[1]) return false;
+            if (docMatch && el.getAttribute("data-juno-doc") !== docMatch[1]) return false;
+            return true;
+          });
+        }
+        return nodes.slice();
       },
     },
-    window: { innerWidth: 800, innerHeight: 600 },
+    window: {
+      innerWidth: 800,
+      innerHeight: 600,
+      scrolls: [],
+      scrollBy(dx, dy) {
+        this.scrolls.push([dx, dy]);
+      },
+    },
     location: { href: "https://example.com/page" },
     performance: { timeOrigin: 1000 },
     scrollX: 0,
     scrollY: 0,
   });
   realm.globalThis = realm;
-  const page = { realm, button, docReads: 0, worlds: [] };
+  const page = {
+    realm,
+    button,
+    nodes,
+    docReads: 0,
+    worlds: [],
+    setNodes(next) {
+      nodes.splice(0, nodes.length, ...next);
+    },
+  };
   const box = { env: null };
   const env = boot({
     async sendCommand(info) {
@@ -455,13 +515,28 @@ function methodCalls(env, method) {
   return env.debuggerCalls.filter((call) => call.method === method);
 }
 
-function runWorkflow(env, steps) {
+function runWorkflow(env, steps, snapshot) {
+  const params = { tabId: 7, steps };
+  if (snapshot) params.snapshot = snapshot;
   const cmd = command({
     action: "workflow",
     issued_at: env.now(),
-    params: { tabId: 7, steps },
+    params,
   });
   return env.juno.schedule(cmd, env.now()).then(() => cmd);
+}
+
+async function takeSnapshot(env) {
+  const cmd = command({
+    action: "snapshot",
+    issued_at: env.now(),
+    params: { tabId: 7 },
+  });
+  await env.juno.schedule(cmd, env.now());
+  const body = resultFor(env, cmd.id);
+  assert.equal(body.ok, true, JSON.stringify(body));
+  assert.match(body.data.snapshot, /^snap_[0-9a-f]{8}$/);
+  return body.data.snapshot;
 }
 
 describe("extension", { concurrency: 1 }, () => {
@@ -1267,11 +1342,13 @@ describe("extension", { concurrency: 1 }, () => {
 
   test("a three-step workflow uses one attachment", async () => {
     const env = bootPage();
+    const snapshot = await takeSnapshot(env);
+    const before = debuggerUse(env);
     const cmd = await runWorkflow(env, [
       { op: "click", ref: "e1", expect: { tag: "button", text: "Filter" } },
       { op: "type", text: "invoices" },
       { op: "key", key: "Enter" },
-    ]);
+    ], snapshot);
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, true, JSON.stringify(body));
     assert.equal(body.data.status, "completed");
@@ -1282,27 +1359,32 @@ describe("extension", { concurrency: 1 }, () => {
     assert.equal(body.data.before.redaction, "heuristic");
     assert.equal(body.data.before.elements[0].ref, "e1");
     assert.equal(body.data.before.elements[0].text, "Filter");
-    assert.equal(env.page.worlds.length, 1);
+    assert.equal(env.page.worlds.length, before.attach + 1);
     assert.equal(env.page.worlds[0].worldName, "juno-bridge");
     assert.equal(env.page.worlds[0].frameId, "frame-1");
     assert.equal(env.page.worlds[0].grantUniveralAccess, true);
+    assert.equal(env.page.worlds[1].worldName, "juno-bridge");
+    assert.equal(env.page.worlds[1].frameId, "frame-1");
+    assert.equal(env.page.worlds[1].grantUniveralAccess, true);
     assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
     const typed = methodCalls(env, "Input.insertText");
     assert.equal(typed.length, 1);
     assert.equal(typed[0].params.text, "invoices");
     assert.equal(methodCalls(env, "Input.dispatchKeyEvent").length, 2);
-    assert.equal(methodCalls(env, "attach").length, 1);
-    assert.equal(methodCalls(env, "detach").length, 1);
-    assert.equal(env.fetches.filter((item) => item.url.endsWith("/result")).length, 1);
+    assert.equal(methodCalls(env, "attach").length, before.attach + 1);
+    assert.equal(methodCalls(env, "detach").length, before.detach + 1);
+    assert.equal(env.fetches.filter((item) => item.url.endsWith("/result")).length, before.results + 1);
   });
 
   test("a workflow stops on the first mismatched step", async () => {
     const env = bootPage();
+    const snapshot = await takeSnapshot(env);
+    const before = debuggerUse(env);
     const cmd = await runWorkflow(env, [
       { op: "click", ref: "e1" },
       { op: "click", ref: "e1", expect: { tag: "a" } },
       { op: "key", key: "Enter" },
-    ]);
+    ], snapshot);
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, false);
     assert.match(body.error, /did not match/);
@@ -1311,13 +1393,15 @@ describe("extension", { concurrency: 1 }, () => {
     assert.deepEqual(body.data.steps.map((step) => step.status), ["completed", "failed", "unstarted"]);
     assert.equal(mouseTypes(env).length, 3);
     assert.equal(methodCalls(env, "Input.dispatchKeyEvent").length, 0);
-    assert.equal(methodCalls(env, "attach").length, 1);
-    assert.equal(methodCalls(env, "detach").length, 1);
+    assert.equal(methodCalls(env, "attach").length, before.attach + 1);
+    assert.equal(methodCalls(env, "detach").length, before.detach + 1);
   });
 
   test("a disabled element is refused before dispatch", async () => {
     const env = bootPage({ disabled: true });
-    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }]);
+    const snapshot = await takeSnapshot(env);
+    const before = debuggerUse(env);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, false);
     assert.match(body.error, /is disabled/);
@@ -1325,22 +1409,24 @@ describe("extension", { concurrency: 1 }, () => {
     assert.equal(body.data.dispatched, false);
     assert.equal(body.data.steps[0].status, "failed");
     assert.deepEqual(mouseTypes(env), []);
-    assert.equal(methodCalls(env, "attach").length, 1);
-    assert.equal(methodCalls(env, "detach").length, 1);
+    assert.equal(methodCalls(env, "attach").length, before.attach + 1);
+    assert.equal(methodCalls(env, "detach").length, before.detach + 1);
   });
 
   test("an enabled element can be observed inside the workflow", async () => {
     const env = bootPage();
+    const snapshot = await takeSnapshot(env);
+    const before = debuggerUse(env);
     const cmd = await runWorkflow(env, [
       { op: "wait", ready: { type: "element_enabled", ref: "e1", timeoutMs: 0 } },
-    ]);
+    ], snapshot);
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, true, JSON.stringify(body));
     assert.equal(body.data.status, "completed");
     assert.equal(body.data.dispatched, false);
     assert.equal(body.data.steps[0].status, "completed");
     assert.deepEqual(mouseTypes(env), []);
-    assert.equal(methodCalls(env, "attach").length, 1);
+    assert.equal(methodCalls(env, "attach").length, before.attach + 1);
   });
 
   test("a workflow pauses after input already sent and leaves the rest unstarted", async () => {
@@ -1352,10 +1438,11 @@ describe("extension", { concurrency: 1 }, () => {
         }
       },
     });
+    const snapshot = await takeSnapshot(env);
     const cmd = await runWorkflow(env, [
       { op: "click", ref: "e1" },
       { op: "key", key: "Enter" },
-    ]);
+    ], snapshot);
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, false);
     assert.match(body.error, /cancelled: extension paused/);
@@ -1375,10 +1462,11 @@ describe("extension", { concurrency: 1 }, () => {
         }
       },
     });
+    const snapshot = await takeSnapshot(env);
     const cmd = await runWorkflow(env, [
       { op: "click", ref: "e1" },
       { op: "key", key: "Enter" },
-    ]);
+    ], snapshot);
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, false, JSON.stringify(body));
     assert.match(body.error, /debugger detached/);
@@ -1399,12 +1487,14 @@ describe("extension", { concurrency: 1 }, () => {
         }
       },
     });
+    const snapshot = await takeSnapshot(env);
     const timers = captureCommandTimeout(env);
     const cmd = command({
       action: "workflow",
       issued_at: env.now(),
       params: {
         tabId: 7,
+        snapshot,
         steps: [
           { op: "click", ref: "e1" },
           { op: "key", key: "Enter" },
@@ -1440,11 +1530,12 @@ describe("extension", { concurrency: 1 }, () => {
   });
 
   test("a same-url reload invalidates the remaining steps", async () => {
-    const env = bootPage({ flipOnDocRead: 3 });
+    const env = bootPage({ flipOnDocRead: 4 });
+    const snapshot = await takeSnapshot(env);
     const cmd = await runWorkflow(env, [
       { op: "click", ref: "e1" },
       { op: "click", ref: "e1" },
-    ]);
+    ], snapshot);
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, false, JSON.stringify(body));
     assert.match(body.error, /the document changed/);
@@ -1453,7 +1544,7 @@ describe("extension", { concurrency: 1 }, () => {
     assert.equal(body.data.steps[0].status, "completed");
     assert.equal(body.data.steps[1].status, "unstarted");
     assert.equal(mouseTypes(env).length, 3);
-    assert.equal(env.page.docReads, 3);
+    assert.equal(env.page.docReads, 4);
   });
 
   test("a moved element is clicked at its fresh center", async () => {
@@ -1463,7 +1554,8 @@ describe("extension", { concurrency: 1 }, () => {
         { x: 400, y: 20, width: 80, height: 20 },
       ],
     });
-    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }]);
+    const snapshot = await takeSnapshot(env);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, true, JSON.stringify(body));
     assert.equal(body.data.steps[0].result.x, 440);
@@ -1487,6 +1579,404 @@ describe("extension", { concurrency: 1 }, () => {
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, false);
     assert.match(body.error, /need 1 to 10 steps/);
+    assert.equal(body.data, null);
+    assert.equal(methodCalls(env, "attach").length, 0);
+  });
+
+  test("a workflow click without a snapshot attaches nothing", async () => {
+    const env = bootPage();
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }]);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /snapshot required/);
+    assert.equal(body.data, null);
+    assert.equal(methodCalls(env, "attach").length, 0);
+    assert.deepEqual(mouseTypes(env), []);
+  });
+
+  test("a workflow keeps the selected element after a node is inserted", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    env.page.setNodes([
+      labeledButton("Delete account", { x: 10, y: 20, width: 80, height: 20 }),
+      invoices,
+    ]);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.data.before.elements.length, 1);
+    assert.equal(body.data.before.elements[0].ref, "e1");
+    assert.equal(body.data.before.elements[0].text, "Invoices");
+    assert.equal(body.data.steps[0].result.x, 50);
+    assert.equal(body.data.steps[0].result.y, 90);
+    const mice = env.debuggerCalls.filter((call) => call.method === "Input.dispatchMouseEvent");
+    assert.equal(mice.length, 3);
+    for (const call of mice) {
+      assert.equal(call.params.x, 50);
+      assert.equal(call.params.y, 90);
+    }
+    assert.equal(JSON.stringify(body).includes("Delete account"), false);
+  });
+
+  test("consecutive workflows on one snapshot do not retarget", async () => {
+    const invoices = labeledButton("Invoices", { x: 30, y: 40, width: 20, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    env.page.setNodes([
+      labeledButton("Delete account", { x: 0, y: 0, width: 10, height: 10 }),
+      invoices,
+    ]);
+    const commands = [
+      await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot),
+      await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot),
+    ];
+    for (const cmd of commands) {
+      const body = resultFor(env, cmd.id);
+      assert.equal(body.ok, true, JSON.stringify(body));
+      assert.equal(body.data.before.elements[0].text, "Invoices");
+      assert.equal(body.data.steps[0].result.x, 40);
+      assert.equal(body.data.steps[0].result.y, 50);
+    }
+    const mice = env.debuggerCalls.filter((call) => call.method === "Input.dispatchMouseEvent");
+    assert.equal(mice.length, 6);
+    for (const call of mice) {
+      assert.equal(call.params.x, 40);
+      assert.equal(call.params.y, 50);
+    }
+  });
+
+  test("a replaced node is refused instead of clicking the new element", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 20, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    invoices.isConnected = false;
+    env.page.setNodes([
+      labeledButton("Delete account", { x: 10, y: 20, width: 80, height: 20 }),
+    ]);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /element e1 is gone/);
+    assert.equal(body.error.includes("Delete account"), false);
+    assert.equal(body.data.status, "failed");
+    assert.equal(body.data.dispatched, false);
+    assert.equal(body.data.steps[0].status, "failed");
+    assert.equal(body.data.before.elements[0].missing, true);
+    assert.deepEqual(mouseTypes(env), []);
+    assert.equal(JSON.stringify(body).includes("Delete account"), false);
+  });
+
+  test("a newer snapshot makes the previous ref stale", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const first = await takeSnapshot(env);
+    const remove = labeledButton("Delete account", { x: 10, y: 20, width: 80, height: 20 });
+    env.page.setNodes([remove, invoices]);
+    const second = await takeSnapshot(env);
+    assert.notEqual(first, second);
+    const stale = await runWorkflow(env, [{ op: "click", ref: "e1" }], first);
+    const staleBody = resultFor(env, stale.id);
+    assert.equal(staleBody.ok, false, JSON.stringify(staleBody));
+    assert.match(staleBody.error, /snapshot is stale/);
+    assert.equal(staleBody.error.includes("http"), false);
+    assert.equal(staleBody.data.dispatched, false);
+    assert.deepEqual(staleBody.data.steps.map((step) => step.status), ["unstarted"]);
+    assert.deepEqual(mouseTypes(env), []);
+    const fresh = await runWorkflow(env, [
+      { op: "click", ref: "e1", expect: { text: "Delete account" } },
+    ], second);
+    const freshBody = resultFor(env, fresh.id);
+    assert.equal(freshBody.ok, true, JSON.stringify(freshBody));
+    assert.equal(freshBody.data.before.elements[0].text, "Delete account");
+    assert.equal(freshBody.data.before.elements[1].text, "Invoices");
+    assert.equal(freshBody.data.steps[0].result.x, 50);
+    assert.equal(freshBody.data.steps[0].result.y, 30);
+  });
+
+  test("a same-url reload before a workflow refuses the snapshot", async () => {
+    const env = bootPage();
+    const snapshot = await takeSnapshot(env);
+    env.page.realm.performance.timeOrigin += 5000;
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /snapshot is stale/);
+    assert.equal(body.error.includes("http"), false);
+    assert.equal(body.data.status, "failed");
+    assert.equal(body.data.dispatched, false);
+    assert.equal(body.data.steps[0].status, "unstarted");
+    assert.deepEqual(mouseTypes(env), []);
+  });
+
+  test("a cleared page world still resolves the marked element", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    assert.equal(invoices.getAttribute("data-juno-snap"), snapshot);
+    assert.equal(invoices.getAttribute("data-juno-ref"), "e1");
+    delete env.page.realm.__junoHold;
+    env.page.setNodes([
+      labeledButton("Delete account", { x: 10, y: 20, width: 80, height: 20 }),
+      invoices,
+    ]);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.data.before.elements[0].text, "Invoices");
+    assert.equal(body.data.steps[0].result.x, 50);
+    assert.equal(body.data.steps[0].result.y, 90);
+    const mice = env.debuggerCalls.filter((call) => call.method === "Input.dispatchMouseEvent");
+    assert.equal(mice.length, 3);
+    for (const call of mice) {
+      assert.equal(call.params.y, 90);
+    }
+    assert.equal(JSON.stringify(body).includes("Delete account"), false);
+  });
+
+  test("clearing the marks refuses a snapshot whose world is gone", async () => {
+    const env = bootPage();
+    const snapshot = await takeSnapshot(env);
+    env.page.button.removeAttribute("data-juno-snap");
+    env.page.button.removeAttribute("data-juno-ref");
+    env.page.button.removeAttribute("data-juno-doc");
+    delete env.page.realm.__junoHold;
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /snapshot is stale/);
+    assert.equal(body.data.dispatched, false);
+    assert.equal(body.data.steps[0].status, "unstarted");
+    assert.deepEqual(mouseTypes(env), []);
+  });
+
+  test("a snapshot step does not retarget the authorized ref", async () => {
+    const invoices = labeledButton("Invoices", { x: 10, y: 80, width: 80, height: 20 });
+    const env = bootPage({ button: invoices, nodes: [invoices] });
+    const snapshot = await takeSnapshot(env);
+    env.page.setNodes([
+      labeledButton("Delete account", { x: 10, y: 20, width: 80, height: 20 }),
+      invoices,
+    ]);
+    const cmd = await runWorkflow(env, [
+      { op: "snapshot" },
+      { op: "click", ref: "e1" },
+    ], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.data.before.elements[0].text, "Invoices");
+    assert.equal(body.data.observation.elements[0].text, "Delete account");
+    assert.equal(body.data.steps[1].result.x, 50);
+    assert.equal(body.data.steps[1].result.y, 90);
+    const mice = env.debuggerCalls.filter((call) => call.method === "Input.dispatchMouseEvent");
+    assert.equal(mice.length, 3);
+    for (const call of mice) {
+      assert.equal(call.params.y, 90);
+    }
+  });
+
+  test("element readiness uses the snapshot taken before the click", async () => {
+    const env = bootPage();
+    const snapshot = await takeSnapshot(env);
+    for (const type of ["element_visible", "element_enabled"]) {
+      const cmd = command({
+        action: "click",
+        issued_at: env.now(),
+        params: {
+          tabId: 7,
+          x: 4,
+          y: 5,
+          after: {
+            observe: "text",
+            ready: { type, ref: "e1", snapshot, timeoutMs: 0 },
+          },
+        },
+      });
+      await env.juno.schedule(cmd, env.now());
+      const body = resultFor(env, cmd.id);
+      assert.equal(body.ok, true, type + " " + JSON.stringify(body));
+      assert.equal(body.data.dispatched, true);
+      assert.equal(body.data.observed, true);
+      assert.equal(body.data.observation.observe, "text");
+      assert.equal(body.data.observation.text.includes("Results"), true);
+    }
+    assert.equal(mouseTypes(env).length, 6);
+  });
+
+  test("type, key, and scroll wait on the stored element before input", async () => {
+    const env = bootPage();
+    const snapshot = await takeSnapshot(env);
+    const typed = command({
+      action: "type",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        text: "hi",
+        after: {
+          observe: "text",
+          ready: { type: "element_visible", ref: "e1", snapshot, timeoutMs: 0 },
+        },
+      },
+    });
+    await env.juno.schedule(typed, env.now());
+    assert.equal(resultFor(env, typed.id).ok, true, JSON.stringify(resultFor(env, typed.id)));
+    assert.equal(methodCalls(env, "Input.insertText").length, 1);
+    const keyed = command({
+      action: "key",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        key: "Enter",
+        after: {
+          observe: "text",
+          ready: { type: "element_enabled", ref: "e1", snapshot, timeoutMs: 0 },
+        },
+      },
+    });
+    await env.juno.schedule(keyed, env.now());
+    const body = resultFor(env, keyed.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(methodCalls(env, "Input.dispatchKeyEvent").length, 2);
+    const scrolled = command({
+      action: "scroll",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        dy: 40,
+        after: {
+          observe: "text",
+          ready: { type: "element_visible", ref: "e1", snapshot, timeoutMs: 0 },
+        },
+      },
+    });
+    await env.juno.schedule(scrolled, env.now());
+    const scrollBody = resultFor(env, scrolled.id);
+    assert.equal(scrollBody.ok, true, JSON.stringify(scrollBody));
+    assert.deepEqual(env.page.realm.window.scrolls, [[0, 40]]);
+  });
+
+  test("element readiness restores a cleared snapshot before the click", async () => {
+    const env = bootPage();
+    const snapshot = await takeSnapshot(env);
+    delete env.page.realm.__junoHold;
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        x: 4,
+        y: 5,
+        after: {
+          observe: "text",
+          ready: { type: "element_enabled", ref: "e1", snapshot, timeoutMs: 0 },
+        },
+      },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.data.observed, true);
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+  });
+
+  test("element readiness without a snapshot attaches nothing", async () => {
+    const env = bootPage();
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        x: 4,
+        y: 5,
+        after: {
+          observe: "snapshot",
+          ready: { type: "element_visible", ref: "e1", timeoutMs: 0 },
+        },
+      },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /ready: snapshot required/);
+    assert.equal(body.data, null);
+    assert.equal(methodCalls(env, "attach").length, 0);
+    assert.deepEqual(mouseTypes(env), []);
+  });
+
+  test("a forged snapshot is refused before the click", async () => {
+    const env = bootPage();
+    await takeSnapshot(env);
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        x: 4,
+        y: 5,
+        after: {
+          observe: "text",
+          ready: { type: "element_visible", ref: "e1", snapshot: "snap_00000099", timeoutMs: 0 },
+        },
+      },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /snapshot is stale/);
+    assert.equal(body.data, null);
+    assert.deepEqual(mouseTypes(env), []);
+    assert.equal(methodCalls(env, "attach").length, 2);
+  });
+
+  test("an out of range timeout is refused before input", async () => {
+    const env = bootPage();
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        x: 4,
+        y: 5,
+        after: { observe: "text", ready: { type: "text", text: "Results", timeoutMs: 15001 } },
+      },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /timeoutMs must be between 0 and 15000/);
+    assert.equal(body.data, null);
+    assert.equal(methodCalls(env, "attach").length, 0);
+    assert.deepEqual(mouseTypes(env), []);
+  });
+
+  test("a workflow rejects an out of range timeout before attaching", async () => {
+    const env = bootPage();
+    const snapshot = await takeSnapshot(env);
+    const before = debuggerUse(env);
+    const cmd = await runWorkflow(env, [
+      {
+        op: "click",
+        ref: "e1",
+        after: { observe: "text", ready: { type: "text", text: "Results", timeoutMs: 15001 } },
+      },
+    ], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /timeoutMs must be between 0 and 15000/);
+    assert.equal(body.data, null);
+    assert.equal(methodCalls(env, "attach").length, before.attach);
+    assert.deepEqual(mouseTypes(env), []);
+  });
+
+  test("a text workflow rejects a malformed snapshot before attaching", async () => {
+    const env = boot();
+    env.addTab(7, "https://example.com/page");
+    const cmd = await runWorkflow(env, [
+      { op: "wait", ready: { type: "text", text: "Results", timeoutMs: 0 } },
+    ], "not-a-snapshot");
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /snapshot required/);
     assert.equal(body.data, null);
     assert.equal(methodCalls(env, "attach").length, 0);
   });

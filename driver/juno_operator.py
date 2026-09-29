@@ -194,6 +194,8 @@ class LibcurlSession:
         if kind is ctypes.c_long:
             self.longs[option] = int(value)
             value = ctypes.c_long(self.longs[option])
+        elif value is None:
+            value = ctypes.c_void_p(None)
         elif isinstance(value, int):
             value = ctypes.c_void_p(value)
         code = self.lib.curl_easy_setopt(self.easy, int(option), value)
@@ -216,6 +218,9 @@ class LibcurlSession:
         self._setopt(CURLOPT_SSL_VERIFYPEER, 1, ctypes.c_long)
         self._setopt(CURLOPT_SSL_VERIFYHOST, 2, ctypes.c_long)
         method = method.upper()
+        # A reused easy handle keeps CURLOPT_CUSTOMREQUEST. Clear it before
+        # choosing this request's method, or a GET after a POST stays a POST.
+        self._setopt(CURLOPT_CUSTOMREQUEST, None, ctypes.c_char_p)
         if method == "GET":
             self._setopt(CURLOPT_HTTPGET, 1, ctypes.c_long)
         else:

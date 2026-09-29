@@ -8,7 +8,7 @@ attach to the browser profile you use every day.
 The operator sends commands (navigate, snapshot, click, type, …). The relay
 pushes them to the extension over a WebSocket, and the extension runs them
 with `chrome.debugger`. Commands and results pass through the relay. This
-tree is extension v1.4.0.
+tree is extension v1.4.1.
 
 ## What the safeguards actually do
 
@@ -94,22 +94,40 @@ A click, key, type, or scroll can carry `after`. The extension performs the
 action, waits for an optional readiness condition, and returns that
 observation in the same result. `after.observe` is `snapshot` or `text`.
 `after.ready.type` is `text`, `element_visible`, or `element_enabled`.
+`text` matches visible page text. `element_visible` and `element_enabled`
+name a `ref` from an earlier `snapshot` and include that snapshot id.
 `timeoutMs` from 0 to 15000 is the budget for that condition. `0` checks
-the page once. The budget is not a sleep, and the relay's `wait` is a
+the page once. The snapshot id and `timeoutMs` are checked before input
+is sent. The budget is not a sleep, and the relay's `wait` is a
 maximum: the response is sent when the result arrives. Shortening `wait`
 does not shorten the browser action.
 
 `workflow` runs 1 to 10 already-chosen steps on one tab. The steps are
 `click` (by snapshot `ref`), `type`, `key`, `scroll`, `snapshot`, `text`,
-and `wait`. The extension keeps one debugger attachment for that list and
+and `wait`. A click, or an element readiness condition, requires the
+snapshot id returned by `snapshot`. The extension resolves those refs
+against that capture. If the document changed, or a newer snapshot replaced
+that id, the workflow refuses the reference instead of clicking a different
+element. A `snapshot` step inside a workflow is only a view of the live
+page and does not retarget the authorized refs. The extension keeps one debugger attachment for that list and
 releases it when the workflow finishes or is interrupted. A workflow holds the debugger until that workflow finishes, then releases it.
 Pause, the allowlist, and the page check still run on every step.
 No model call runs inside the workflow.
 
 ```bash
 python3 driver/jb.py send click '{"tabId":123456,"x":50,"y":30,"after":{"observe":"snapshot","ready":{"type":"text","text":"Results","timeoutMs":15000}}}'
-python3 driver/jb.py send workflow '{"tabId":123456,"steps":[{"op":"click","ref":"e1"},{"op":"type","text":"invoice"},{"op":"key","key":"Enter"}]}'
+python3 driver/jb.py send workflow '{"tabId":123456,"snapshot":"snap_00000001","steps":[{"op":"click","ref":"e1"},{"op":"type","text":"invoice"},{"op":"key","key":"Enter"}]}'
 ```
+
+## Fixes in 1.4.1
+
+- The operator's reused HTTP client clears the previous request method
+  before each request, so a GET that follows a POST is sent as a GET.
+- A workflow reference resolves only against the snapshot id the caller
+  selected. The captured elements are marked with that id. A missing or
+  replaced capture is refused.
+- `element_visible` and `element_enabled` use that same snapshot id, and
+  `timeoutMs` is checked before input is sent.
 
 The result status is `completed`, `cancelled`, `interrupted`, `uncertain`,
 or `unobserved`. `uncertain` means some input may already have reached
@@ -223,9 +241,14 @@ and exits 1 when `ok` is not true. With several paired browsers, commands go
 to the most recently paired one unless you pass a device id (from
 `devices`). `revoke <device-id>` unpairs one. `send` does not call Jev.
 
-`snapshot` gives each element a `ref` (`e1`, `e2`, …) in the order the page
-was walked. A ref belongs to that snapshot. The next snapshot numbers its
-own. Coordinates stay on the element for a later click.
+`snapshot` returns an id (`snap_` plus eight hex digits) and gives each
+element a `ref` (`e1`, `e2`, …) in the order the page was walked. A ref
+belongs to that snapshot id. The extension marks each captured element with
+that id and removes the previous snapshot's marks. Pass the id to
+`workflow`, or to `element_visible` and `element_enabled`, to use those
+elements. The next snapshot replaces the stored mapping, and a same-URL
+reload drops it. The extension then refuses the old id instead of selecting
+a different element. An `x`/`y` click still uses the coordinates you send.
 
 Actions: `ping`, `tabs`, `navigate`, `screenshot`, `snapshot`, `text`,
 `click`, `type`, `key`, `scroll`, `close`, `workflow`, `eval` (`eval` runs

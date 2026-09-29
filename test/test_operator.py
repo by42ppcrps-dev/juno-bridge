@@ -21,15 +21,33 @@ PSK = "correct-horse-battery"
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def do_GET(self):
-        self.server.ports.append(self.client_address[1])
+    def _record(self):
+        if hasattr(self.server, "ports"):
+            self.server.ports.append(self.client_address[1])
+        if hasattr(self.server, "methods"):
+            self.server.methods.append(self.command)
+        if hasattr(self.server, "paths"):
+            self.server.paths.append(self.path)
         self.server.saw_header = self.headers.get("X-Juno-Test")
+
+    def _reply(self):
         body = b'{"ok":true}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_GET(self):
+        self._record()
+        self._reply()
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        self._record()
+        self._reply()
 
     def log_message(self, _fmt, *_args):
         return
@@ -220,6 +238,56 @@ class OperatorTests(unittest.TestCase):
             self.assertEqual(len(server.ports), 2)
             self.assertEqual(len(set(server.ports)), 1)
             self.assertEqual(server.saw_header, "1")
+            self.assertEqual(session.longs[self.op.CURLOPT_SSL_VERIFYPEER], 1)
+            self.assertEqual(session.longs[self.op.CURLOPT_SSL_VERIFYHOST], 2)
+            self.assertEqual(session.longs[self.op.CURLOPT_FOLLOWLOCATION], 0)
+        finally:
+            if session is not None:
+                session.close()
+            server.shutdown()
+            thread.join(2)
+            server.server_close()
+
+    def _libcurl_server(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.ports = []
+        server.methods = []
+        server.paths = []
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    def test_libcurl_switches_methods_on_a_reused_handle(self):
+        if not self.op.curl_library_path():
+            self.skipTest("libcurl not installed")
+        server, thread = self._libcurl_server()
+        session = None
+        try:
+            session = self.op.LibcurlSession()
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+            headers = ["X-Juno-Test: 1"]
+            # The driver posts a command, then GETs the result while it is pending.
+            sequence = [
+                ("GET", "/admin/ping", None),
+                ("POST", "/admin/run", b'{"action":"click","request_id":"req_method01"}'),
+                ("GET", "/admin/result?id=cmd_" + ("ab" * 8), None),
+                ("POST", "/admin/run", b'{"action":"click","request_id":"req_method02"}'),
+                ("GET", "/admin/devices", None),
+                ("POST", "/admin/cmd", b'{"action":"ping","request_id":"req_method03"}'),
+            ]
+            for method, path, body in sequence:
+                status, _payload = session.request(method, base + path, headers, body, 5)
+                self.assertEqual(status, 200, method + " " + path)
+            self.assertEqual(
+                server.methods,
+                ["GET", "POST", "GET", "POST", "GET", "POST"],
+            )
+            self.assertEqual(
+                [path.split("?")[0] for path in server.paths],
+                ["/admin/ping", "/admin/run", "/admin/result", "/admin/run", "/admin/devices", "/admin/cmd"],
+            )
+            self.assertEqual(len(server.ports), 6)
+            self.assertEqual(len(set(server.ports)), 1)
             self.assertEqual(session.longs[self.op.CURLOPT_SSL_VERIFYPEER], 1)
             self.assertEqual(session.longs[self.op.CURLOPT_SSL_VERIFYHOST], 2)
             self.assertEqual(session.longs[self.op.CURLOPT_FOLLOWLOCATION], 0)

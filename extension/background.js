@@ -50,6 +50,8 @@ const WORKFLOW_MAX_STEPS = 10;
 const READY_BUDGET_MS = 15000;
 const READY_POLL_MS = 50;
 const REF_RE = /^e[1-9][0-9]{0,2}$/;
+const SNAPSHOT_ID_RE = /^snap_[0-9a-f]{8}$/;
+let snapshotSerial = 0;
 const RESULT_ACK_MS_DEFAULT = 5000;
 const NAV_WAIT_MS = 15000;
 const CDP_VERSION = "1.3";
@@ -326,7 +328,7 @@ async function evaluate(auth, expression, opts = {}) {
     awaitPromise: true,
   };
   // location.href checks go through readDocumentUrl and stay in the main
-  // world. contextId is set only while a workflow holds nodes for one document.
+  // world. contextId is set once this command has entered the isolated world.
   if (auth.contextId) params.contextId = auth.contextId;
   const res = await cdp(auth, "Runtime.evaluate", params, opts);
   if (res.exceptionDetails) {
@@ -370,27 +372,65 @@ function commandAgeMs(cmd, relayNow, receivedAt, now) {
 
 /* ---------- command implementations ---------- */
 
+function newSnapshotId() {
+  snapshotSerial += 1;
+  return "snap_" + snapshotSerial.toString(16).padStart(8, "0");
+}
+
 // Interactive elements with viewport-relative centre points (the coordinate
 // space Input.dispatchMouseEvent uses). Values are copied only for fields
 // that fail the secret check above.
-function snapshotSource(storeNodes) {
-  // storeNodes keeps the DOM node next to its ref inside an isolated world.
-  // A one-shot snapshot leaves hold null, so its result matches the script
-  // that does not store nodes.
-  const holdPrelude = storeNodes
-    ? "const hold = globalThis.__junoHold;"
-    : "const hold = null;";
+// mode "store" replaces the node list for snapshotId. A later capture must
+// not append: e1 would then name a different node than the new numbering.
+// mode "read" describes those stored nodes and does not walk the live DOM.
+// mode "ephemeral" walks the live DOM and stores nothing.
+function snapshotSource(mode, snapshotId) {
+  const store = mode === "store";
+  const read = mode === "read";
+  const idLiteral = JSON.stringify(store ? snapshotId : "");
+  const prelude = store
+    ? `const origin = (typeof performance !== "undefined" && performance && performance.timeOrigin) || 0;
+  const key = location.href + "\\0" + origin;
+  let hold = globalThis.__junoHold;
+  if (!hold || hold.key !== key) {
+    hold = { key: key, nodes: [], url: location.href, snapshot: ${idLiteral} };
+    globalThis.__junoHold = hold;
+  }
+  hold.nodes = [];
+  hold.snapshot = ${idLiteral};
+  hold.url = location.href;
+  const marked = document.querySelectorAll("[data-juno-snap]");
+  for (const prev of marked) {
+    if (!prev || !prev.removeAttribute) continue;
+    prev.removeAttribute("data-juno-snap");
+    prev.removeAttribute("data-juno-ref");
+    prev.removeAttribute("data-juno-doc");
+  }
+  const source = document.querySelectorAll(sel);`
+    : read
+      ? `const hold = globalThis.__junoHold;
+  if (!hold || !Array.isArray(hold.nodes) || !hold.snapshot) return null;
+  const source = hold.nodes;`
+      : `const hold = null;
+  const source = document.querySelectorAll(sel);`;
   return `(() => {
-  ${holdPrelude}
   const SECRET_AUTOCOMPLETE = ${SECRET_AUTOCOMPLETE};
   const SECRET_HINT = ${SECRET_HINT};
   const sel = 'a,button,input,select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="menuitem"],[role="tab"],[contenteditable="true"]';
+  ${prelude}
+  const reading = ${read ? "true" : "false"};
+  const storing = ${store ? "true" : "false"};
   const vw = window.innerWidth, vh = window.innerHeight;
   const els = [];
-  for (const el of document.querySelectorAll(sel)) {
+  for (const el of source) {
     if (els.length >= 300) break;
+    const ref = 'e' + (els.length + 1);
+    if (reading && (!el || el.isConnected === false)) {
+      els.push({ ref: ref, missing: true });
+      continue;
+    }
     const r = el.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) continue;
+    if (!reading && (r.width <= 0 || r.height <= 0)) continue;
     const tag = el.tagName.toLowerCase();
     const type = (el.getAttribute('type') || '').toLowerCase();
     const ac = (el.getAttribute('autocomplete') || '').toLowerCase().split(/ +/).pop();
@@ -408,35 +448,59 @@ function snapshotSource(storeNodes) {
     const text = ((isField ? '' : el.innerText) || value || el.getAttribute('aria-label') ||
       el.getAttribute('placeholder') || el.getAttribute('title') || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
     const x = Math.round(r.x + r.width / 2), y = Math.round(r.y + r.height / 2);
-    // ref is this snapshot's handle (e1, e2, ...). It is not a DOM id, and a
-    // later snapshot assigns its own refs. Callers resolve a ref in code.
-    const item = { ref: 'e' + (els.length + 1), tag, text, x, y, w: Math.round(r.width), h: Math.round(r.height),
-      inView: x >= 0 && y >= 0 && x < vw && y < vh };
+    // ref is this snapshot's handle (e1, e2, ...). It is not a DOM id.
+    // Another snapshot replaces the stored nodes and issues its own id.
+    const item = { ref: ref, tag, text, x, y, w: Math.round(r.width), h: Math.round(r.height),
+      inView: x >= 0 && y >= 0 && x < vw && y < vh && r.width > 0 && r.height > 0 };
     if (el.href) item.href = String(el.href).slice(0, 160);
     if (type) item.inputType = type;
     if (secret) item.redacted = true;
     if (el.disabled) item.disabled = true;
     els.push(item);
-    if (hold) hold.nodes.push(el);
+    if (storing && hold) {
+      hold.nodes.push(el);
+      // The marks sit on the DOM node, so a later command can find this
+      // element after the isolated world is gone. A newer snapshot removes them.
+      if (el.setAttribute) {
+        el.setAttribute("data-juno-snap", hold.snapshot);
+        el.setAttribute("data-juno-ref", ref);
+        el.setAttribute("data-juno-doc", String(origin));
+      }
+    }
   }
-  return { title: document.title, url: location.href,
+  const result = { title: document.title, url: location.href,
     viewport: { w: vw, h: vh }, scroll: { x: Math.round(scrollX), y: Math.round(scrollY) },
     elements: els };
+  if (hold && hold.snapshot) result.snapshot = hold.snapshot;
+  if (hold && hold.key) result.doc = hold.key;
+  return result;
 })()`;
 }
 
-const SNAPSHOT_JS = snapshotSource(false);
+const SNAPSHOT_JS = snapshotSource("ephemeral");
 
 // href + NUL + timeOrigin. A reload of the same URL changes timeOrigin and
 // drops the nodes held for the previous document.
 const DOC_JS = `(() => {
-  const key = location.href + "\\0" + (performance.timeOrigin || 0);
+  const origin = (typeof performance !== "undefined" && performance && performance.timeOrigin) || 0;
+  const key = location.href + "\\0" + origin;
   let hold = globalThis.__junoHold;
   if (!hold || hold.key !== key) {
-    hold = { key: key, nodes: [], url: location.href };
+    hold = { key: key, nodes: [], url: location.href, snapshot: null };
     globalThis.__junoHold = hold;
   }
-  return { doc: hold.key, url: location.href };
+  return { doc: hold.key, url: location.href, snapshot: hold.snapshot || null };
+})()`;
+
+const HOLD_JS = `(() => {
+  const hold = globalThis.__junoHold;
+  if (!hold) return null;
+  return {
+    snapshot: hold.snapshot || null,
+    doc: hold.key || null,
+    url: hold.url || location.href,
+    count: Array.isArray(hold.nodes) ? hold.nodes.length : 0,
+  };
 })()`;
 
 function pageTextExpression() {
@@ -532,9 +596,14 @@ async function cmdScreenshot(params, state, ctx, epoch) {
 
 async function cmdSnapshot(params, state, ctx, epoch) {
   const auth = await authorizeTab(params, state, ctx, "snapshot", epoch);
-  const snap = await withDebugger(auth, () => evaluate(auth, SNAPSHOT_JS));
+  const snapshotId = newSnapshotId();
+  const snap = await withDebugger(auth, async () => {
+    await ensureWorld(auth);
+    return evaluate(auth, snapshotSource("store", snapshotId));
+  });
   refuseDrifted("snapshot", auth, snap && snap.url);
-  return { tabId: auth.tabId, ...snap, redaction: "heuristic" };
+  if (!snap || typeof snap !== "object") throw new Error("snapshot: snapshot failed");
+  return { tabId: auth.tabId, ...snap, snapshot: snapshotId, redaction: "heuristic" };
 }
 
 async function cmdText(params, state, ctx, epoch) {
@@ -544,7 +613,12 @@ async function cmdText(params, state, ctx, epoch) {
   return { tabId: auth.tabId, ...page, redaction: "none" };
 }
 
-function readyExpression(ready) {
+function readySnapshotId(ready, inheritedSnapshot) {
+  if (ready && typeof ready.snapshot === "string") return ready.snapshot;
+  return inheritedSnapshot;
+}
+
+function readyExpression(ready, inheritedSnapshot) {
   if (!ready || typeof ready !== "object" || Array.isArray(ready)) throw new Error("ready: invalid");
   if (ready.type === "text") {
     if (typeof ready.text !== "string" || ready.text.length < 1 || ready.text.length > 200) {
@@ -555,11 +629,19 @@ function readyExpression(ready) {
   }
   if (ready.type === "element_visible" || ready.type === "element_enabled") {
     if (typeof ready.ref !== "string" || !REF_RE.test(ready.ref)) throw new Error("ready: ref required");
+    const snapshotId = readySnapshotId(ready, inheritedSnapshot);
+    if (typeof snapshotId !== "string" || !SNAPSHOT_ID_RE.test(snapshotId)) {
+      throw new Error("ready: snapshot required");
+    }
+    if (ready.snapshot !== undefined && ready.snapshot !== snapshotId) {
+      throw new Error("ready: snapshot does not match");
+    }
     const refJson = JSON.stringify(ready.ref);
+    const snapJson = JSON.stringify(snapshotId);
     const enabled = ready.type === "element_enabled" ? "if (el.disabled) return false;" : "";
     return `(() => {
       const hold = globalThis.__junoHold;
-      if (!hold || !Array.isArray(hold.nodes)) return false;
+      if (!hold || hold.snapshot !== ${snapJson} || !Array.isArray(hold.nodes)) return false;
       const m = ${refJson}.match(/^e(\\d+)$/);
       if (!m) return false;
       const el = hold.nodes[Number(m[1]) - 1];
@@ -574,24 +656,84 @@ function readyExpression(ready) {
   throw new Error("ready: unsupported condition");
 }
 
-function validateAfter(after) {
+function validateReady(ready, inheritedSnapshot) {
+  if (!ready || typeof ready !== "object" || Array.isArray(ready)) throw new Error("ready: invalid");
+  if (ready.timeoutMs !== undefined) {
+    const timeoutMs = Number(ready.timeoutMs);
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > READY_BUDGET_MS) {
+      throw new Error("ready: timeoutMs must be between 0 and 15000");
+    }
+  }
+  readyExpression(ready, inheritedSnapshot);
+}
+
+function validateAfter(after, inheritedSnapshot) {
   if (after === undefined || after === null) return;
   if (!after || typeof after !== "object" || Array.isArray(after)) throw new Error("after: invalid");
   if (after.observe !== "snapshot" && after.observe !== "text") {
     throw new Error("after: observe must be snapshot or text");
   }
-  if (after.ready !== undefined) readyExpression(after.ready);
+  if (after.ready !== undefined) validateReady(after.ready, inheritedSnapshot);
 }
 
-async function waitReady(auth, ready) {
-  const expression = readyExpression(ready);
-  let timeoutMs = READY_BUDGET_MS;
-  if (ready.timeoutMs !== undefined) {
-    timeoutMs = Number(ready.timeoutMs);
-    if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > READY_BUDGET_MS) {
-      throw new Error("ready: timeoutMs must be between 0 and 15000");
+function elementReadySnapshot(after) {
+  const ready = after && after.ready;
+  if (!ready || (ready.type !== "element_visible" && ready.type !== "element_enabled")) return null;
+  return ready.snapshot || null;
+}
+
+function restoreHoldSource(snapshotId) {
+  const snapJson = JSON.stringify(snapshotId);
+  return `(() => {
+    const snap = ${snapJson};
+    const origin = (typeof performance !== "undefined" && performance && performance.timeOrigin) || 0;
+    const key = location.href + "\\0" + origin;
+    const list = document.querySelectorAll('[data-juno-snap="' + snap + '"][data-juno-doc="' + origin + '"]');
+    if (!list || !list.length) return { ok: false, count: 0 };
+    const nodes = [];
+    for (const el of list) {
+      if (!el || el.isConnected === false) continue;
+      const ref = el.getAttribute ? (el.getAttribute("data-juno-ref") || "") : "";
+      const m = /^e(\\d+)$/.exec(ref);
+      if (!m) return { ok: false, count: 0 };
+      const index = Number(m[1]) - 1;
+      if (index < 0 || index > 299 || nodes[index]) return { ok: false, count: 0 };
+      nodes[index] = el;
+    }
+    let count = 0;
+    for (const el of nodes) if (el) count += 1;
+    if (!count) return { ok: false, count: 0 };
+    globalThis.__junoHold = { key: key, nodes: nodes, url: location.href, snapshot: snap };
+    return { ok: true, count: count, doc: key };
+  })()`;
+}
+
+async function bindSnapshot(auth, snapshotId) {
+  await ensureWorld(auth);
+  const doc = await evaluate(auth, DOC_JS);
+  if (!doc || doc.url !== auth.url || typeof doc.doc !== "string") {
+    throw new Error(`${auth.verb}: could not confirm the authorized page`);
+  }
+  let held = await evaluate(auth, HOLD_JS);
+  const holdMatches = held && held.snapshot === snapshotId && held.doc === doc.doc && held.url === auth.url;
+  if (!holdMatches) {
+    const restored = await evaluate(auth, restoreHoldSource(snapshotId));
+    if (!restored || restored.ok !== true || restored.doc !== doc.doc) {
+      throw new Error(`${auth.verb}: snapshot is stale`);
+    }
+    held = await evaluate(auth, HOLD_JS);
+    if (!held || held.snapshot !== snapshotId || held.doc !== doc.doc || held.url !== auth.url) {
+      throw new Error(`${auth.verb}: snapshot is stale`);
     }
   }
+  auth.doc = doc.doc;
+  auth.snapshot = snapshotId;
+}
+
+async function waitReady(auth, ready, inheritedSnapshot) {
+  const expression = readyExpression(ready, inheritedSnapshot || auth.snapshot);
+  let timeoutMs = READY_BUDGET_MS;
+  if (ready.timeoutMs !== undefined) timeoutMs = Number(ready.timeoutMs);
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     assertActive(auth.control || auth.epoch);
@@ -615,14 +757,14 @@ async function waitReady(auth, ready) {
 }
 
 async function collectAfter(auth, after) {
-  validateAfter(after);
-  if (after.ready) await waitReady(auth, after.ready);
+  validateAfter(after, auth.snapshot);
+  if (after.ready) await waitReady(auth, after.ready, auth.snapshot);
   const href = await readDocumentUrl(auth);
   if (href !== auth.url) {
     throw new Error(`${auth.verb}: tab navigated away from the authorized page`);
   }
   if (after.observe === "snapshot") {
-    const snap = await evaluate(auth, snapshotSource(false));
+    const snap = await evaluate(auth, snapshotSource("ephemeral"));
     refuseDrifted(auth.verb, auth, snap && snap.url);
     if (!snap || typeof snap !== "object") throw new Error(`${auth.verb}: snapshot failed`);
     return { observe: "snapshot", observed: true, ...snap, redaction: "heuristic" };
@@ -659,11 +801,12 @@ async function ensureWorld(auth) {
   return contextId;
 }
 
-function resolveRefExpression(ref) {
+function resolveRefExpression(ref, snapshotId) {
   const refJson = JSON.stringify(ref);
+  const snapJson = JSON.stringify(snapshotId);
   return `(() => {
     const hold = globalThis.__junoHold;
-    if (!hold || !Array.isArray(hold.nodes)) return { ok: false };
+    if (!hold || hold.snapshot !== ${snapJson} || !Array.isArray(hold.nodes)) return { ok: false, stale: true };
     const m = ${refJson}.match(/^e(\\d+)$/);
     if (!m) return { ok: false };
     const el = hold.nodes[Number(m[1]) - 1];
@@ -689,6 +832,8 @@ async function cmdClick(params, state, ctx, epoch) {
   // Recheck before each event. Pause or navigation after mouseMoved must not
   // deliver the press and release. An event already sent cannot be undone.
   return await withDebugger(auth, async () => {
+    const bound = elementReadySnapshot(params && params.after);
+    if (bound) await bindSnapshot(auth, bound);
     await clickAt(auth, x, y);
     if (!params || !params.after) return { tabId: auth.tabId, x, y };
     const observation = await collectAfter(auth, params.after);
@@ -702,6 +847,8 @@ async function cmdType(params, state, ctx, epoch) {
   const { text } = params;
   if (typeof text !== "string" || !text) throw new Error("type: missing text");
   return await withDebugger(auth, async () => {
+    const bound = elementReadySnapshot(params && params.after);
+    if (bound) await bindSnapshot(auth, bound);
     await cdp(auth, "Input.insertText", { text }, { dispatch: true });
     if (!params || !params.after) return { tabId: auth.tabId, chars: text.length };
     const observation = await collectAfter(auth, params.after);
@@ -721,6 +868,8 @@ async function cmdKey(params, state, ctx, epoch) {
     windowsVirtualKeyCode: def.keyCode, nativeVirtualKeyCode: def.keyCode,
   };
   return await withDebugger(auth, async () => {
+    const bound = elementReadySnapshot(params && params.after);
+    if (bound) await bindSnapshot(auth, bound);
     await cdp(auth, "Input.dispatchKeyEvent", def.text
       ? { ...base, type: "keyDown", text: def.text, unmodifiedText: def.text }
       : { ...base, type: "rawKeyDown" }, { dispatch: true });
@@ -743,6 +892,8 @@ async function cmdScroll(params, state, ctx, epoch) {
   }
   const atPoint = Number.isFinite(params.x) && Number.isFinite(params.y);
   return await withDebugger(auth, async () => {
+    const bound = elementReadySnapshot(params && params.after);
+    if (bound) await bindSnapshot(auth, bound);
     if (atPoint) {
       await cdp(auth, "Input.dispatchMouseEvent", {
         type: "mouseWheel", x: params.x, y: params.y, deltaX: dx, deltaY: dy,
@@ -760,7 +911,14 @@ async function cmdScroll(params, state, ctx, epoch) {
 
 const STEP_OPS = new Set(["click", "type", "key", "scroll", "snapshot", "text", "wait"]);
 
-function validateStep(step) {
+function stepNeedsSnapshot(step) {
+  if (!step || typeof step !== "object") return false;
+  if (step.op === "click") return true;
+  const ready = step.op === "wait" ? step.ready : step.after && step.after.ready;
+  return !!ready && (ready.type === "element_visible" || ready.type === "element_enabled");
+}
+
+function validateStep(step, inheritedSnapshot) {
   if (!step || typeof step !== "object" || Array.isArray(step) || !STEP_OPS.has(step.op)) {
     throw new Error("workflow: step op must be click, type, key, scroll, snapshot, text, or wait");
   }
@@ -789,8 +947,8 @@ function validateStep(step) {
       throw new Error("workflow: scroll needs a nonzero dx or dy");
     }
   }
-  if (step.op === "wait") readyExpression(step.ready);
-  if (step.after !== undefined) validateAfter(step.after);
+  if (step.op === "wait") validateReady(step.ready, inheritedSnapshot);
+  if (step.after !== undefined) validateAfter(step.after, inheritedSnapshot);
 }
 
 function validateWorkflow(params) {
@@ -798,8 +956,15 @@ function validateWorkflow(params) {
   if (!Array.isArray(steps) || steps.length < 1 || steps.length > WORKFLOW_MAX_STEPS) {
     throw new Error(`workflow: need 1 to ${WORKFLOW_MAX_STEPS} steps`);
   }
-  for (const step of steps) validateStep(step);
   if (!params || !Number.isInteger(params.tabId)) throw new Error("workflow: tabId required");
+  const needsSnapshot = steps.some(stepNeedsSnapshot);
+  if (needsSnapshot && (typeof params.snapshot !== "string" || !SNAPSHOT_ID_RE.test(params.snapshot))) {
+    throw new Error("workflow: snapshot required");
+  }
+  if (!needsSnapshot && params.snapshot !== undefined && (typeof params.snapshot !== "string" || !SNAPSHOT_ID_RE.test(params.snapshot))) {
+    throw new Error("workflow: snapshot required");
+  }
+  for (const step of steps) validateStep(step, params.snapshot);
 }
 
 function workflowReport(bag, status, control) {
@@ -840,7 +1005,8 @@ async function assertSameDocument(auth) {
 
 async function runStep(auth, step, ctx) {
   if (step.op === "click") {
-    const found = await evaluate(auth, resolveRefExpression(step.ref));
+    const found = await evaluate(auth, resolveRefExpression(step.ref, auth.snapshot));
+    if (found && found.stale) throw new Error("workflow: snapshot is stale");
     if (!found || found.ok !== true || !Number.isFinite(found.x) || !Number.isFinite(found.y)) {
       throw new Error("workflow: element " + step.ref + " is gone");
     }
@@ -891,7 +1057,7 @@ async function runStep(auth, step, ctx) {
     return { result: { scroll: pos }, observation };
   }
   if (step.op === "snapshot") {
-    const snap = await evaluate(auth, snapshotSource(false));
+    const snap = await evaluate(auth, snapshotSource("ephemeral"));
     refuseDrifted(auth.verb, auth, snap && snap.url);
     const observation = { observe: "snapshot", observed: true, ...snap, redaction: "heuristic" };
     return { result: { observe: "snapshot" }, observation };
@@ -902,7 +1068,7 @@ async function runStep(auth, step, ctx) {
     const observation = { observe: "text", observed: true, ...page, redaction: "none" };
     return { result: { observe: "text" }, observation };
   }
-  await waitReady(auth, step.ready);
+  await waitReady(auth, step.ready, auth.snapshot);
   return { result: { waited: true }, observation: null };
 }
 
@@ -922,16 +1088,26 @@ async function cmdWorkflow(params, state, ctx, epoch) {
   if (control) control.report = bag;
   try {
     return await withDebugger(auth, async () => {
-      await ensureWorld(auth);
-      const doc = await evaluate(auth, DOC_JS);
-      if (!doc || doc.url !== auth.url || typeof doc.doc !== "string") {
-        throw new Error("workflow: could not confirm the authorized page");
+      if (steps.some(stepNeedsSnapshot)) {
+        await bindSnapshot(auth, params.snapshot);
+        const snap = await evaluate(auth, snapshotSource("read"));
+        refuseDrifted("workflow", auth, snap && snap.url);
+        if (!snap || typeof snap !== "object" || snap.snapshot !== params.snapshot) {
+          throw new Error("workflow: snapshot is stale");
+        }
+        bag.before = { ...snap, redaction: "heuristic" };
+      } else {
+        await ensureWorld(auth);
+        const doc = await evaluate(auth, DOC_JS);
+        if (!doc || doc.url !== auth.url || typeof doc.doc !== "string") {
+          throw new Error("workflow: could not confirm the authorized page");
+        }
+        auth.doc = doc.doc;
+        const snap = await evaluate(auth, snapshotSource("ephemeral"));
+        refuseDrifted("workflow", auth, snap && snap.url);
+        if (!snap || typeof snap !== "object") throw new Error("workflow: snapshot failed");
+        bag.before = { ...snap, redaction: "heuristic" };
       }
-      auth.doc = doc.doc;
-      const snap = await evaluate(auth, snapshotSource(true));
-      refuseDrifted("workflow", auth, snap && snap.url);
-      if (!snap || typeof snap !== "object") throw new Error("workflow: snapshot failed");
-      bag.before = { ...snap, redaction: "heuristic" };
       for (let i = 0; i < steps.length; i++) {
         try {
           assertActive(control);
