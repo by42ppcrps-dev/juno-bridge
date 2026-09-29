@@ -79,7 +79,7 @@ machines. `jb.py` sends it in an `Authorization: Bearer` header over HTTPS.
 | `extension/` | Your Chrome (load unpacked) | WebSocket to the relay, HTTP polling fallback, commands via `chrome.debugger`, side panel (pause, connection, activity log), Options (pairing, allowlist) |
 | `relay/worker.js` | Cloudflare Worker + Durable Object (unlisted) | Admin API, device registration, per-device queues, result ownership |
 | `relay/wrangler.jsonc` | Your machine | Deploy config. `ADMIN_PSK_SHA256` is required |
-| `driver/jb.py`, `driver/operator.py` | Operator's machine | CLI plus a user-scoped operator process on a private Unix socket. The process keeps one relay client. `JUNO_OPERATOR=0` uses one curl subprocess per request. Optional `jev` stays off until `JUNO_JEV=1`; each enabled call is billed by TypeSafe |
+| `driver/jb.py`, `driver/juno_operator.py` | Operator's machine | CLI plus a user-scoped operator process on a private Unix socket. The process keeps one relay client. `JUNO_OPERATOR=0` uses one curl subprocess per request. Optional `jev` stays off until `JUNO_JEV=1`; each enabled call is billed by TypeSafe |
 
 ## Fixes in 1.3.1
 

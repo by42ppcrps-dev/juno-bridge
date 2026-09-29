@@ -339,7 +339,9 @@ def operator_mod():
     """Load the local operator. Importing it does not start the process."""
     global _operator
     if _operator is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "operator.py")
+        # Not operator.py: running this file puts driver/ on sys.path, and that
+        # name would shadow the stdlib operator module during startup.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "juno_operator.py")
         spec = importlib.util.spec_from_file_location("juno_operator", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
