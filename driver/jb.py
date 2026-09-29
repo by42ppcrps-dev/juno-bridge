@@ -15,9 +15,18 @@ Setup:
                        # e.g. jb.py send navigate '{"url":"https://example.com"}'
                        # waits up to 60s for the result and prints it
                        # exits 1 if that result is a failure
+  jb.py jev target|page|step ... --tab <id> --goal <text> [--device name] [--click]
+                       # optional, off unless JUNO_JEV=1. A billed TypeSafe
+                       # call. Does nothing to the browser unless --click.
 
 Actions: ping, tabs, navigate, screenshot, snapshot, text, click, type, key,
-         scroll, close, eval
+         scroll, close, eval, workflow
+
+  jb.py operator       # run the local operator process in the foreground
+  jb.py operator stop
+
+Normal commands go through that process so the HTTP client stays alive.
+JUNO_OPERATOR=0 uses one curl subprocess per request instead.
 
 Security notes:
   - The passphrase is a bearer secret. The driver sends it only in an
@@ -30,8 +39,10 @@ Security notes:
     ADMIN_PSK_SHA256 before the relay is reachable.
 """
 import hashlib
+import importlib.util
 import json
 import os
+import secrets
 import stat
 import subprocess
 import sys
@@ -81,13 +92,47 @@ def admin_psk():
     die(f"no admin passphrase — set {PSK_ENV} or write it to {PSK_FILE} (chmod 600)")
 
 
-def relay_request(method, path, data=None, timeout=30, tolerate=()):
-    """Relay call via curl. HTTP statuses in `tolerate` are returned (with the
-    status under "_status") instead of aborting.
+def operator_enabled():
+    """False keeps the per-request curl path. The default reuses one client."""
+    if os.environ.get("JUNO_OPERATOR_CHILD") == "1":
+        return False
+    if os.environ.get("JUNO_BRIDGE_HTTP", "").strip() == "curl":
+        return False
+    return os.environ.get("JUNO_OPERATOR", "1").strip() != "0"
 
-    curl is used instead of Python's urllib because some Cloudflare-fronted
-    hosts block urllib's TLS fingerprint (HTTP 403, error 1010) before the
-    request reaches the Worker, while curl's fingerprint passes.
+
+def interpret_relay(status, payload, tolerate):
+    if not isinstance(payload, dict):
+        payload = {"_raw": payload}
+    if status in tolerate:
+        copied = dict(payload)
+        copied["_status"] = status
+        return copied
+    if status is not None and not (200 <= status < 300):
+        die(f"HTTP {status}: {json.dumps(payload)[:300]}")
+    return payload
+
+
+def relay_request(method, path, data=None, timeout=30, tolerate=()):
+    """Send one relay request. The operator process is the normal path.
+
+    curl is the compatibility path (JUNO_OPERATOR=0 or JUNO_BRIDGE_HTTP=curl).
+    Some Cloudflare-fronted hosts block urllib's TLS fingerprint before the
+    request reaches the Worker. The operator uses libcurl with certificate
+    checks left on, and does not follow redirects.
+    """
+    if operator_enabled():
+        try:
+            status, payload = operator_mod().call(method, path, data, timeout)
+        except operator_mod().OperatorError as exc:
+            die(f"request failed: {exc}")
+        return interpret_relay(status, payload, tolerate)
+    return relay_request_curl(method, path, data, timeout, tolerate)
+
+
+def relay_request_curl(method, path, data=None, timeout=30, tolerate=()):
+    """One curl subprocess. HTTP statuses in `tolerate` are returned (with the
+    status under "_status") instead of aborting.
     """
     url = relay_url() + path
     headers = {"Authorization": f"Bearer {admin_psk()}"}
@@ -216,16 +261,18 @@ def finish_result(result):
     return 1
 
 
-def cmd_send(args):
-    if not args:
-        die("usage: jb.py send <action> [params-json] [device]", 2)
-    action = args[0]
-    try:
-        params = json.loads(args[1]) if len(args) > 1 else {}
-    except json.JSONDecodeError as e:
-        die(f"bad params JSON: {e}", 2)
-    device = args[2] if len(args) > 2 else "default"
-    cmd = {"device": device, "action": action, "params": params}
+def run_action(action, params, device="default"):
+    """Send one command and return the device result dict.
+
+    request_id is new for each call. A transport retry inside the operator
+    reuses this same id; it does not enqueue a second browser command.
+    """
+    cmd = {
+        "device": device,
+        "action": action,
+        "params": params,
+        "request_id": "req_" + secrets.token_hex(8),
+    }
     deadline = time.time() + 60
 
     # Fast path: enqueue and wait for the result in one request. The relay
@@ -235,7 +282,10 @@ def cmd_send(args):
         # Relay predates /admin/run: enqueue, then poll for the result.
         res = relay_request("POST", "/admin/cmd", cmd)
     elif not res.get("pending"):
-        return finish_result(res.get("result"))
+        result = res.get("result")
+        if not isinstance(result, dict):
+            die("relay returned no result")
+        return result
 
     cmd_id = res["id"]
     while time.time() < deadline:
@@ -243,10 +293,153 @@ def cmd_send(args):
         # Current relays hold this request until the result lands (up to 20s).
         r = relay_request("GET", f"/admin/result?id={cmd_id}&wait=20", timeout=35)
         if not r.get("pending"):
-            return finish_result(r.get("result"))
+            result = r.get("result")
+            if not isinstance(result, dict):
+                die("relay returned no result")
+            return result
         if time.time() - started < 1:
             time.sleep(2.0)  # older relay answered at once: don't hammer it
     die(f"timeout waiting for device (id {cmd_id})")
+
+
+def cmd_operator(args):
+    mod = operator_mod()
+    if args == ["stop"]:
+        try:
+            mod.stop()
+        except mod.OperatorError as exc:
+            die(str(exc), 2)
+        print("operator stopped")
+        return 0
+    if args:
+        die("usage: jb.py operator [stop]", 2)
+    try:
+        return mod.serve()
+    except mod.OperatorError as exc:
+        die(str(exc), 2)
+
+
+def cmd_send(args):
+    if not args:
+        die("usage: jb.py send <action> [params-json] [device]", 2)
+    action = args[0]
+    try:
+        params = json.loads(args[1]) if len(args) > 1 else {}
+    except json.JSONDecodeError as e:
+        die(f"bad params JSON: {e}", 2)
+    device = args[2] if len(args) > 2 else "default"
+    return finish_result(run_action(action, params, device))
+
+
+_jev = None
+_operator = None
+
+
+def operator_mod():
+    """Load the local operator. Importing it does not start the process."""
+    global _operator
+    if _operator is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "operator.py")
+        spec = importlib.util.spec_from_file_location("juno_operator", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _operator = mod
+    return _operator
+
+
+def jev_mod():
+    """Load the optional decision helper. It does not contact TypeSafe itself."""
+    global _jev
+    if _jev is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jev.py")
+        spec = importlib.util.spec_from_file_location("juno_jev", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _jev = mod
+    return _jev
+
+
+def cmd_jev(args):
+    """Optional billed page decisions. Off unless JUNO_JEV=1."""
+    mod = jev_mod()
+    if not mod.enabled():
+        print(mod.OFF_MESSAGE, file=sys.stderr)
+        return 2
+    try:
+        opts = mod.parse_args(args)
+    except ValueError as e:
+        die(str(e), 2)
+    try:
+        gate = mod.min_confidence() if opts["click"] else None
+    except ValueError as e:
+        die(str(e), 2)
+
+    snap = run_action("snapshot", {"tabId": opts["tab"]}, opts["device"])
+    if snap.get("ok") is not True:
+        return finish_result(snap)
+    data = snap.get("data") if isinstance(snap.get("data"), dict) else {}
+    prepared = mod.prepare(data, opts["kinds"], opts["goal"])
+    if prepared["skip_model"]:
+        report = mod.local_none(prepared, opts["goal"])
+        if opts["click"]:
+            report["ok"] = False
+            report["click"] = {
+                "issued": False,
+                "reason": "the snapshot listed no elements, so no click was issued",
+            }
+        return finish_result(report)
+
+    try:
+        key = mod.api_key()
+    except ValueError as e:
+        die(str(e), 2)
+    try:
+        response = mod.post_systemone(prepared["body"], key)
+        report = mod.interpret(response, prepared, opts["goal"])
+    except mod.JevError as e:
+        die(mod.scrub(str(e), key))
+
+    if not opts["click"]:
+        report["click"] = None
+        return finish_jev(report, key)
+
+    target = report["decisions"].get("target") or {}
+    refusal = mod.click_refusal(target, gate)
+    if refusal:
+        report["ok"] = False
+        report["click"] = {"issued": False, "reason": refusal}
+        return finish_jev(report, key)
+
+    fresh = run_action("snapshot", {"tabId": opts["tab"]}, opts["device"])
+    if fresh.get("ok") is not True:
+        report["ok"] = False
+        report["click"] = {"issued": False, "reason": "fresh snapshot failed", "result": fresh}
+        return finish_jev(report, key)
+    fresh_data = fresh.get("data") if isinstance(fresh.get("data"), dict) else {}
+    match, why = mod.revalidate(data.get("url") or "", target.get("element") or {}, fresh_data)
+    if match is None:
+        report["ok"] = False
+        report["click"] = {"issued": False, "reason": why}
+        return finish_jev(report, key)
+    clicked = run_action("click", {
+        "tabId": opts["tab"],
+        "x": match["x"],
+        "y": match["y"],
+    }, opts["device"])
+    report["click"] = {"issued": True, "ref": match.get("ref"), "result": clicked}
+    report["ok"] = clicked.get("ok") is True
+    return finish_jev(report, key)
+
+
+def finish_jev(report, key=""):
+    """Print a Jev report. The key is removed if a response echoed it."""
+    text = json.dumps(report, indent=2)
+    if key:
+        text = text.replace(key, "[redacted]")
+    print(text)
+    if isinstance(report, dict) and report.get("ok") is True:
+        return 0
+    return 1
 
 
 def main(argv):
@@ -255,7 +448,7 @@ def main(argv):
         return 2
     cmds = {"init": cmd_init, "bootstrap": cmd_bootstrap, "pair": cmd_pair,
             "ping": cmd_ping, "devices": cmd_devices, "revoke": cmd_revoke,
-            "send": cmd_send}
+            "send": cmd_send, "operator": cmd_operator, "jev": cmd_jev}
     fn = cmds.get(argv[1])
     if not fn:
         die(f"unknown command: {argv[1]}", 2)

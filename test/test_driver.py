@@ -23,7 +23,10 @@ class DriverTests(unittest.TestCase):
         os.environ["JUNO_BRIDGE_PSK"] = self.psk
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        self._operator_env = os.environ.get("JUNO_OPERATOR")
+        os.environ["JUNO_OPERATOR"] = "0"
         self.curl_configs = []
+        self.curl_bodies = []
         cfg = os.path.join(self.tmp.name, "config.json")
         jb.CONFIG_DIR = self.tmp.name
         jb.CONFIG_FILE = cfg
@@ -36,6 +39,10 @@ class DriverTests(unittest.TestCase):
             os.environ.pop("JUNO_BRIDGE_PSK", None)
         else:
             os.environ["JUNO_BRIDGE_PSK"] = self._env
+        if self._operator_env is None:
+            os.environ.pop("JUNO_OPERATOR", None)
+        else:
+            os.environ["JUNO_OPERATOR"] = self._operator_env
 
     def respond(self, responses):
         queue = list(responses)
@@ -43,7 +50,15 @@ class DriverTests(unittest.TestCase):
         def run(args, **_kwargs):
             cfg_path = args[args.index("--config") + 1]
             with open(cfg_path, encoding="utf-8") as f:
-                self.curl_configs.append(f.read())
+                text = f.read()
+            self.curl_configs.append(text)
+            body = None
+            for line in text.splitlines():
+                if line.startswith("data-binary"):
+                    data_path = line.split("@", 1)[1].strip().strip('"')
+                    with open(data_path, encoding="utf-8") as bf:
+                        body = json.load(bf)
+            self.curl_bodies.append(body)
             if not queue:
                 raise AssertionError("unexpected curl call")
             status, payload = queue.pop(0)
@@ -129,6 +144,31 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         digest = hashlib.sha256(b"0123456789abcdef").hexdigest()
         self.assertIn(digest, out.getvalue())
+
+    def test_request_id_is_reused_on_fallback_and_fresh_for_the_next_action(self):
+        cmd_id = "cmd_" + "aa" * 8
+        self.respond([
+            (404, {"error": "not_found"}),
+            (200, {"ok": True, "id": cmd_id}),
+            (200, {"pending": False, "result": {"ok": True, "data": {"n": 1}}}),
+            (200, {"ok": True, "pending": False, "id": "cmd_" + "bb" * 8, "result": {"ok": True, "data": {"n": 2}}}),
+        ])
+        self.assertEqual(jb.main(["jb.py", "send", "click", '{"tabId":7,"x":1,"y":2}']), 0)
+        self.assertEqual(jb.main(["jb.py", "send", "click", '{"tabId":7,"x":3,"y":4}']), 0)
+        posted = [body for body in self.curl_bodies if body is not None]
+        self.assertEqual([body["request_id"] for body in posted[:2]], [posted[0]["request_id"], posted[0]["request_id"]])
+        self.assertNotEqual(posted[0]["request_id"], posted[2]["request_id"])
+        self.assertRegex(posted[0]["request_id"], r"^req_[0-9a-f]{16}$")
+        self.assertRegex(posted[2]["request_id"], r"^req_[0-9a-f]{16}$")
+        self.assertIn("/admin/run", self.curl_configs[0])
+        self.assertIn("/admin/cmd", self.curl_configs[1])
+        self.assertIn("/admin/result?id=" + cmd_id, self.curl_configs[2])
+        self.assertIn("/admin/run", self.curl_configs[3])
+        self.assertIsNone(self.curl_bodies[2])
+        self.assertNotIn(self.psk, json.dumps(posted[0]))
+        self.assertEqual(posted[0]["action"], "click")
+        self.assertEqual(posted[1]["action"], "click")
+        self.assertNotIn("wait", posted[1])
 
 
 if __name__ == "__main__":

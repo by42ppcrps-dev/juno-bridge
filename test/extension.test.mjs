@@ -83,6 +83,46 @@ function tick() {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+async function until(pred) {
+  for (let i = 0; i < 40 && !pred(); i++) await tick();
+  assert.equal(pred(), true);
+}
+
+function mouseTypes(env) {
+  return env.debuggerCalls
+    .filter((call) => call.method === "Input.dispatchMouseEvent")
+    .map((call) => call.params.type);
+}
+
+// Replaces the 30s command timer with a callback the test fires itself.
+function captureCommandTimeout(env) {
+  const realSet = env.sandbox.setTimeout;
+  const realClear = env.sandbox.clearTimeout;
+  const pending = new Set();
+  env.sandbox.setTimeout = (fn, ms, ...args) => {
+    if (ms === env.juno.CMD_TIMEOUT_MS) {
+      const id = { junoCommandTimer: true, fn };
+      pending.add(id);
+      return id;
+    }
+    return realSet(fn, ms, ...args);
+  };
+  env.sandbox.clearTimeout = (id) => {
+    if (id && id.junoCommandTimer) {
+      pending.delete(id);
+      return;
+    }
+    return realClear(id);
+  };
+  return {
+    fire() {
+      const ids = [...pending];
+      pending.clear();
+      for (const id of ids) id.fn();
+    },
+  };
+}
+
 function resultFor(env, id) {
   const found = env.fetches.filter((item) => item.url.endsWith("/result") && item.body && item.body.id === id);
   return found.length ? found[found.length - 1].body : undefined;
@@ -121,6 +161,7 @@ function boot(options = {}) {
   const fetches = [];
   const fetchControl = { fn: null };
   let tabGets = 0;
+  const detachListeners = [];
   let nextTabId = 50;
   let alarmsCreated = 0;
   let panelOpens = 0;
@@ -205,6 +246,8 @@ function boot(options = {}) {
       },
       detach(target) {
         debuggerCalls.push({ method: "detach", params: target });
+        const tabId = target && target.tabId;
+        for (const fn of detachListeners) fn({ tabId });
         return Promise.resolve();
       },
       async sendCommand(target, method, params) {
@@ -223,7 +266,11 @@ function boot(options = {}) {
         }
         return {};
       },
-      onDetach: { addListener() {} },
+      onDetach: {
+        addListener(fn) {
+          detachListeners.push(fn);
+        },
+      },
     },
     sidePanel: {
       setPanelBehavior() {
@@ -295,6 +342,9 @@ function boot(options = {}) {
     addTab(id, url) {
       tabs.set(id, { id, url, active: false, status: "complete" });
     },
+    fireDetach(tabId) {
+      for (const fn of detachListeners) fn({ tabId });
+    },
     state() {
       return {
         deviceToken: store.deviceToken,
@@ -305,6 +355,113 @@ function boot(options = {}) {
       };
     },
   };
+}
+
+const FILTER_RECT = { x: 10, y: 20, width: 80, height: 20 };
+
+function pageButton(rects) {
+  return {
+    tagName: "BUTTON",
+    isConnected: true,
+    disabled: false,
+    innerText: "Filter",
+    value: "",
+    labels: null,
+    href: "",
+    _rects: rects,
+    _n: 0,
+    getAttribute() {
+      return null;
+    },
+    getBoundingClientRect() {
+      const rect = this._rects[Math.min(this._n, this._rects.length - 1)];
+      this._n += 1;
+      return {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        top: rect.y,
+        left: rect.x,
+        bottom: rect.y + rect.height,
+        right: rect.x + rect.width,
+      };
+    },
+  };
+}
+
+// One document the workflow evaluates in. location.href checks stay on the tab mock.
+function bootPage(extra = {}) {
+  const button = pageButton(extra.rects || [FILTER_RECT]);
+  if (extra.disabled) button.disabled = true;
+  const realm = vm.createContext({
+    document: {
+      title: "Results",
+      body: { innerText: extra.bodyText || "Results for invoices" },
+      querySelectorAll() {
+        return [button];
+      },
+    },
+    window: { innerWidth: 800, innerHeight: 600 },
+    location: { href: "https://example.com/page" },
+    performance: { timeOrigin: 1000 },
+    scrollX: 0,
+    scrollY: 0,
+  });
+  realm.globalThis = realm;
+  const page = { realm, button, docReads: 0, worlds: [] };
+  const box = { env: null };
+  const env = boot({
+    async sendCommand(info) {
+      const { method, params } = info;
+      if (method === "Page.getFrameTree") {
+        return { frameTree: { frame: { id: "frame-1" } } };
+      }
+      if (method === "Page.createIsolatedWorld") {
+        page.worlds.push(params);
+        return { executionContextId: 4 };
+      }
+      if (method === "Runtime.evaluate" && params && params.expression === "location.href") {
+        return undefined;
+      }
+      if (method === "Runtime.evaluate" && params) {
+        if (String(params.expression).includes("performance.timeOrigin")) {
+          page.docReads += 1;
+          if (extra.flipOnDocRead && page.docReads === extra.flipOnDocRead) {
+            page.realm.performance.timeOrigin += 5000;
+          }
+        }
+        try {
+          const value = vm.runInContext(params.expression, page.realm);
+          return { result: { value } };
+        } catch (err) {
+          return { exceptionDetails: { text: String((err && err.message) || err) } };
+        }
+      }
+      if (extra.onCommand) {
+        const custom = await extra.onCommand(info, page, box);
+        if (custom !== undefined) return custom;
+      }
+      return undefined;
+    },
+  });
+  box.env = env;
+  env.addTab(7, "https://example.com/page");
+  env.page = page;
+  return env;
+}
+
+function methodCalls(env, method) {
+  return env.debuggerCalls.filter((call) => call.method === method);
+}
+
+function runWorkflow(env, steps) {
+  const cmd = command({
+    action: "workflow",
+    issued_at: env.now(),
+    params: { tabId: 7, steps },
+  });
+  return env.juno.schedule(cmd, env.now()).then(() => cmd);
 }
 
 describe("extension", { concurrency: 1 }, () => {
@@ -333,6 +490,8 @@ describe("extension", { concurrency: 1 }, () => {
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, false);
     assert.match(body.error, /cancelled: extension paused/);
+    assert.equal(body.data.status, "uncertain");
+    assert.equal(body.data.dispatched, true);
     assert.equal(env.store.cursor, cmd.seq);
   });
 
@@ -593,6 +752,10 @@ describe("extension", { concurrency: 1 }, () => {
     const notes = result.elements.find((item) => item.text === "notes-VISIBLE-epsilon");
     assert.ok(notes);
     assert.equal(notes.redacted, undefined);
+    assert.deepEqual(
+      result.elements.map((item) => item.ref),
+      result.elements.map((_, index) => "e" + (index + 1)),
+    );
   });
 
   test("a drifted snapshot is not returned", async () => {
@@ -812,5 +975,519 @@ describe("extension", { concurrency: 1 }, () => {
     assert.equal(outcome.welcomed, false);
     assert.equal(outcome.rejected, false);
     assert.equal(MockWebSocket.latest, before);
+  });
+
+  test("reused-tab navigate does not run after pause", async () => {
+    let release = null;
+    const env = boot({
+      tabsGet(_id, n, tab) {
+        if (n !== 2) return null;
+        return new Promise((resolve) => {
+          release = () => resolve({ ...tab });
+        });
+      },
+    });
+    const updates = [];
+    const origUpdate = env.chrome.tabs.update.bind(env.chrome.tabs);
+    env.chrome.tabs.update = (id, props) => {
+      updates.push({ id, props });
+      return origUpdate(id, props);
+    };
+    env.addTab(7, "https://example.com/page");
+    const t = env.now();
+    const cmd = command({
+      action: "navigate",
+      issued_at: t,
+      params: { tabId: 7, url: "https://example.com/next" },
+    });
+    const pending = env.juno.schedule(cmd, t);
+    try {
+      await until(() => release !== null);
+      await env.chrome.storage.local.set({ enabled: false });
+      assert.equal(env.store.enabled, false);
+      release();
+      release = null;
+      await pending;
+      assert.deepEqual(updates, []);
+      assert.equal(env.tabs.get(7).url, "https://example.com/page");
+      const body = resultFor(env, cmd.id);
+      assert.equal(body.ok, false);
+      assert.match(body.error, /cancelled: extension paused/);
+    } finally {
+      if (release) release();
+      await pending;
+    }
+  });
+
+  test("a timed-out command does not act when its tab lookup resolves", async () => {
+    let release = null;
+    const env = boot({
+      tabsGet(_id, n, tab) {
+        if (n !== 1) return null;
+        return new Promise((resolve) => {
+          release = () => resolve({ ...tab });
+        });
+      },
+    });
+    const timers = captureCommandTimeout(env);
+    env.addTab(7, "https://example.com/page");
+    const t = env.now();
+    const first = command({
+      action: "click",
+      issued_at: t,
+      params: { tabId: 7, x: 1, y: 2 },
+    });
+    const pending = env.juno.schedule(first, t);
+    try {
+      await until(() => release !== null);
+      timers.fire();
+      await pending;
+      const failed = resultFor(env, first.id);
+      assert.equal(failed.ok, false);
+      assert.match(failed.error, /command timed out after 30s/);
+      assert.equal(failed.data.status, "cancelled");
+      assert.equal(failed.data.dispatched, false);
+      assert.deepEqual(mouseTypes(env), []);
+      assert.equal(env.debuggerCalls.some((call) => call.method === "attach"), false);
+
+      const later = command({
+        action: "click",
+        issued_at: env.now(),
+        params: { tabId: 7, x: 3, y: 4 },
+      });
+      await env.juno.schedule(later, env.now());
+      assert.equal(resultFor(env, later.id).ok, true);
+      assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+
+      const resume = release;
+      release = null;
+      resume();
+      await tick();
+      await tick();
+      assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+      assert.equal(resultFor(env, first.id).ok, false);
+    } finally {
+      if (release) release();
+      await pending;
+    }
+  });
+
+  test("a timed-out command does not act when debugger attach resolves", async () => {
+    const env = boot();
+    const timers = captureCommandTimeout(env);
+    let release = null;
+    let holdAttach = true;
+    env.chrome.debugger.attach = (target, version) => {
+      env.debuggerCalls.push({ method: "attach", params: target, version });
+      if (holdAttach) {
+        holdAttach = false;
+        return new Promise((resolve) => {
+          release = () => resolve();
+        });
+      }
+      return Promise.resolve();
+    };
+    env.addTab(7, "https://example.com/page");
+    const t = env.now();
+    const first = command({
+      action: "click",
+      issued_at: t,
+      params: { tabId: 7, x: 1, y: 2 },
+    });
+    const pending = env.juno.schedule(first, t);
+    try {
+      await until(() => release !== null);
+      timers.fire();
+      await pending;
+      const failed = resultFor(env, first.id);
+      assert.equal(failed.ok, false);
+      assert.match(failed.error, /command timed out after 30s/);
+      assert.equal(failed.data.status, "cancelled");
+      assert.equal(failed.data.dispatched, false);
+      assert.deepEqual(mouseTypes(env), []);
+
+      const later = command({
+        action: "click",
+        issued_at: env.now(),
+        params: { tabId: 7, x: 8, y: 9 },
+      });
+      await env.juno.schedule(later, env.now());
+      assert.equal(resultFor(env, later.id).ok, true);
+      assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+
+      const resume = release;
+      release = null;
+      resume();
+      await tick();
+      await tick();
+      assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+      assert.equal(resultFor(env, first.id).ok, false);
+    } finally {
+      if (release) release();
+      await pending;
+    }
+  });
+
+  test("a click without after still returns only the point", async () => {
+    const env = boot();
+    env.addTab(7, "https://example.com/page");
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: { tabId: 7, x: 4, y: 5 },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true);
+    assert.deepEqual(body.data, { tabId: 7, x: 4, y: 5 });
+    assert.equal(methodCalls(env, "attach").length, 1);
+    assert.equal(methodCalls(env, "detach").length, 1);
+  });
+
+  test("an allowlisted failure carries no outcome data", async () => {
+    const env = boot();
+    env.addTab(7, "https://not-allowed.example/");
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: { tabId: 7, x: 1, y: 2 },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /not in allowlist/);
+    assert.equal(body.data, null);
+    assert.equal(methodCalls(env, "attach").length, 0);
+  });
+
+  test("one click and its snapshot share one attachment", async () => {
+    const env = bootPage();
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        x: 4,
+        y: 5,
+        after: { observe: "snapshot", ready: { type: "text", text: "Results", timeoutMs: 0 } },
+      },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.data.x, 4);
+    assert.equal(body.data.y, 5);
+    assert.equal(body.data.dispatched, true);
+    assert.equal(body.data.observed, true);
+    assert.equal(body.data.observation.observe, "snapshot");
+    assert.equal(body.data.observation.redaction, "heuristic");
+    assert.equal(body.data.observation.url, "https://example.com/page");
+    assert.equal(body.data.observation.elements[0].ref, "e1");
+    assert.equal(body.data.observation.elements[0].text, "Filter");
+    assert.equal(methodCalls(env, "attach").length, 1);
+    assert.equal(methodCalls(env, "detach").length, 1);
+    assert.equal(env.fetches.filter((item) => item.url.endsWith("/result")).length, 1);
+  });
+
+  test("a missed readiness condition is unobserved after the click was sent", async () => {
+    const env = bootPage();
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        x: 4,
+        y: 5,
+        after: { observe: "snapshot", ready: { type: "text", text: "NOT-HERE", timeoutMs: 0 } },
+      },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /observation was not ready/);
+    assert.equal(body.data.status, "unobserved");
+    assert.equal(body.data.dispatched, true);
+    assert.equal(body.data.observed, false);
+    assert.equal(methodCalls(env, "attach").length, 1);
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+  });
+
+  test("an unsupported readiness condition attaches nothing", async () => {
+    const env = boot();
+    env.addTab(7, "https://example.com/page");
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        x: 1,
+        y: 2,
+        after: { observe: "snapshot", ready: { type: "javascript" } },
+      },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /ready: unsupported/);
+    assert.equal(body.data, null);
+    assert.equal(methodCalls(env, "attach").length, 0);
+    assert.deepEqual(mouseTypes(env), []);
+  });
+
+  test("navigation after a click does not return the destination", async () => {
+    const env = bootPage({
+      async onCommand({ method, params, tabs, target }) {
+        if (method === "Input.dispatchMouseEvent" && params.type === "mouseReleased") {
+          tabs.get(target.tabId).url = "https://evil.example/secret-destination";
+        }
+      },
+    });
+    const cmd = command({
+      action: "click",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        x: 4,
+        y: 5,
+        after: { observe: "snapshot" },
+      },
+    });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /navigated away from the authorized page/);
+    assert.equal(body.error.includes("secret-destination"), false);
+    assert.equal(body.error.includes("evil.example"), false);
+    assert.equal(JSON.stringify(body).includes("secret-destination"), false);
+    assert.equal(body.data.status, "uncertain");
+    assert.equal(body.data.dispatched, true);
+    assert.equal(body.data.observation, undefined);
+    assert.equal(methodCalls(env, "attach").length, 1);
+  });
+
+  test("a three-step workflow uses one attachment", async () => {
+    const env = bootPage();
+    const cmd = await runWorkflow(env, [
+      { op: "click", ref: "e1", expect: { tag: "button", text: "Filter" } },
+      { op: "type", text: "invoices" },
+      { op: "key", key: "Enter" },
+    ]);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.data.status, "completed");
+    assert.equal(body.data.dispatched, true);
+    assert.deepEqual(body.data.steps.map((step) => step.status), ["completed", "completed", "completed"]);
+    assert.equal(body.data.steps[0].result.x, 50);
+    assert.equal(body.data.steps[0].result.y, 30);
+    assert.equal(body.data.before.redaction, "heuristic");
+    assert.equal(body.data.before.elements[0].ref, "e1");
+    assert.equal(body.data.before.elements[0].text, "Filter");
+    assert.equal(env.page.worlds.length, 1);
+    assert.equal(env.page.worlds[0].worldName, "juno-bridge");
+    assert.equal(env.page.worlds[0].frameId, "frame-1");
+    assert.equal(env.page.worlds[0].grantUniveralAccess, true);
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+    const typed = methodCalls(env, "Input.insertText");
+    assert.equal(typed.length, 1);
+    assert.equal(typed[0].params.text, "invoices");
+    assert.equal(methodCalls(env, "Input.dispatchKeyEvent").length, 2);
+    assert.equal(methodCalls(env, "attach").length, 1);
+    assert.equal(methodCalls(env, "detach").length, 1);
+    assert.equal(env.fetches.filter((item) => item.url.endsWith("/result")).length, 1);
+  });
+
+  test("a workflow stops on the first mismatched step", async () => {
+    const env = bootPage();
+    const cmd = await runWorkflow(env, [
+      { op: "click", ref: "e1" },
+      { op: "click", ref: "e1", expect: { tag: "a" } },
+      { op: "key", key: "Enter" },
+    ]);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /did not match/);
+    assert.equal(body.error.includes("http"), false);
+    assert.equal(body.data.status, "failed");
+    assert.deepEqual(body.data.steps.map((step) => step.status), ["completed", "failed", "unstarted"]);
+    assert.equal(mouseTypes(env).length, 3);
+    assert.equal(methodCalls(env, "Input.dispatchKeyEvent").length, 0);
+    assert.equal(methodCalls(env, "attach").length, 1);
+    assert.equal(methodCalls(env, "detach").length, 1);
+  });
+
+  test("a disabled element is refused before dispatch", async () => {
+    const env = bootPage({ disabled: true });
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }]);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /is disabled/);
+    assert.equal(body.data.status, "failed");
+    assert.equal(body.data.dispatched, false);
+    assert.equal(body.data.steps[0].status, "failed");
+    assert.deepEqual(mouseTypes(env), []);
+    assert.equal(methodCalls(env, "attach").length, 1);
+    assert.equal(methodCalls(env, "detach").length, 1);
+  });
+
+  test("an enabled element can be observed inside the workflow", async () => {
+    const env = bootPage();
+    const cmd = await runWorkflow(env, [
+      { op: "wait", ready: { type: "element_enabled", ref: "e1", timeoutMs: 0 } },
+    ]);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.data.status, "completed");
+    assert.equal(body.data.dispatched, false);
+    assert.equal(body.data.steps[0].status, "completed");
+    assert.deepEqual(mouseTypes(env), []);
+    assert.equal(methodCalls(env, "attach").length, 1);
+  });
+
+  test("a workflow pauses after input already sent and leaves the rest unstarted", async () => {
+    const env = bootPage({
+      async onCommand({ method, params, chrome }) {
+        if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+          await chrome.storage.local.set({ enabled: false });
+          return {};
+        }
+      },
+    });
+    const cmd = await runWorkflow(env, [
+      { op: "click", ref: "e1" },
+      { op: "key", key: "Enter" },
+    ]);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /cancelled: extension paused/);
+    assert.equal(body.data.status, "uncertain");
+    assert.equal(body.data.dispatched, true);
+    assert.equal(body.data.steps[0].status, "uncertain");
+    assert.equal(body.data.steps[1].status, "unstarted");
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed"]);
+  });
+
+  test("the user detaching the debugger stops the workflow as uncertain", async () => {
+    const env = bootPage({
+      onCommand({ method, params, target }, _page, box) {
+        if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+          box.env.fireDetach(target.tabId);
+          return {};
+        }
+      },
+    });
+    const cmd = await runWorkflow(env, [
+      { op: "click", ref: "e1" },
+      { op: "key", key: "Enter" },
+    ]);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /debugger detached/);
+    assert.equal(body.data.status, "uncertain");
+    assert.equal(body.data.steps[0].status, "uncertain");
+    assert.equal(body.data.steps[1].status, "unstarted");
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed"]);
+  });
+
+  test("a timed-out workflow does not dispatch the rest of the click", async () => {
+    let release = null;
+    const env = bootPage({
+      async onCommand({ method, params }) {
+        if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+          await new Promise((resolve) => {
+            release = resolve;
+          });
+        }
+      },
+    });
+    const timers = captureCommandTimeout(env);
+    const cmd = command({
+      action: "workflow",
+      issued_at: env.now(),
+      params: {
+        tabId: 7,
+        steps: [
+          { op: "click", ref: "e1" },
+          { op: "key", key: "Enter" },
+        ],
+      },
+    });
+    const pending = env.juno.schedule(cmd, env.now());
+    try {
+      await until(() => release !== null);
+      timers.fire();
+      await pending;
+      const body = resultFor(env, cmd.id);
+      assert.equal(body.ok, false);
+      assert.match(body.error, /command timed out after 30s/);
+      assert.equal(body.data.status, "uncertain");
+      assert.equal(body.data.dispatched, true);
+      assert.equal(body.data.steps[0].status, "running");
+      assert.equal(body.data.steps[1].status, "unstarted");
+      assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed"]);
+      release();
+      release = null;
+      await tick();
+      await tick();
+      assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed"]);
+      const later = command({ action: "ping", issued_at: env.now() });
+      await env.juno.schedule(later, env.now());
+      assert.equal(resultFor(env, later.id).ok, true);
+      assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed"]);
+    } finally {
+      if (release) release();
+      await pending;
+    }
+  });
+
+  test("a same-url reload invalidates the remaining steps", async () => {
+    const env = bootPage({ flipOnDocRead: 3 });
+    const cmd = await runWorkflow(env, [
+      { op: "click", ref: "e1" },
+      { op: "click", ref: "e1" },
+    ]);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /the document changed/);
+    assert.equal(body.error.includes("http"), false);
+    assert.equal(body.data.status, "uncertain");
+    assert.equal(body.data.steps[0].status, "completed");
+    assert.equal(body.data.steps[1].status, "unstarted");
+    assert.equal(mouseTypes(env).length, 3);
+    assert.equal(env.page.docReads, 3);
+  });
+
+  test("a moved element is clicked at its fresh center", async () => {
+    const env = bootPage({
+      rects: [
+        { x: 10, y: 20, width: 80, height: 20 },
+        { x: 400, y: 20, width: 80, height: 20 },
+      ],
+    });
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }]);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, true, JSON.stringify(body));
+    assert.equal(body.data.steps[0].result.x, 440);
+    assert.equal(body.data.steps[0].result.y, 30);
+    const mice = env.debuggerCalls.filter((call) => call.method === "Input.dispatchMouseEvent");
+    assert.equal(mice.length, 3);
+    for (const call of mice) {
+      assert.equal(call.params.x, 440);
+      assert.equal(call.params.y, 30);
+    }
+  });
+
+  test("eleven steps are rejected before the debugger attaches", async () => {
+    const env = boot();
+    env.addTab(7, "https://example.com/page");
+    const steps = Array.from({ length: 11 }, () => ({
+      op: "wait",
+      ready: { type: "text", text: "Results", timeoutMs: 0 },
+    }));
+    const cmd = await runWorkflow(env, steps);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.match(body.error, /need 1 to 10 steps/);
+    assert.equal(body.data, null);
+    assert.equal(methodCalls(env, "attach").length, 0);
   });
 });

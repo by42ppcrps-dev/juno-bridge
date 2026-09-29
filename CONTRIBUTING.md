@@ -49,13 +49,14 @@ node --test
 python3 -m unittest discover -s test -p 'test_*.py'
 ```
 
-`npm test` runs both. The checks cover pause during a click, a missing tab
-id, navigation off the authorized page, local queue delay, snapshot
-redaction and its limits, pairing and revocation, result ownership,
-reconnection, HTTP polling, result acknowledgement, and the driver's exit
-status.
+`npm test` runs both. The checks cover pause during a click, pause during
+a reused-tab navigation, a command that times out and must not resume,
+a missing tab id, navigation off the authorized page, local queue delay,
+snapshot redaction and its limits, pairing and revocation, result ownership,
+reconnection, HTTP polling, result acknowledgement, duplicate request ids,
+bounded workflows, the operator process, and the driver's exit status.
 
-They do not load the extension in Chrome and they do not deploy a relay.
+They do not load the extension in Chrome, they do not deploy a relay, and the Jev checks do not call TypeSafe.
 Step 3 above is still required before a transport or browser change is merged.
 
 ## Security

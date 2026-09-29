@@ -32,6 +32,12 @@
  * and acknowledges it. Unacknowledged commands are re-sent on reconnect, and
  * the extension skips anything at or below its cursor.
  *
+ * Optional request_id on /admin/cmd and /admin/run is per device. A repeat
+ * returns the original command and does not enqueue another execution. The
+ * result is copied onto that record so a caller can read it again after
+ * GET /admin/result has consumed its own copy. The copy lasts until the
+ * ownership TTL. A different request_id is a different command.
+ *
  * Migration: on first boot, if the old KV namespace is still bound as BRIDGE,
  * paired devices are imported so nothing needs re-pairing. An imported
  * passphrase hash is kept but does not authenticate; set ADMIN_PSK_SHA256.
@@ -78,6 +84,8 @@ const PAIR_ALPHA = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const PAIR_RE = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$/;
 const TOKEN_RE = /^[0-9a-f]{64}$/;
 const CMD_ID_RE = /^cmd_[0-9a-f]{16}$/;
+const REQUEST_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const CAPABILITIES = ["idempotency", "workflow"];
 
 async function sha256hex(s) {
   const d = await crypto.subtle.digest("SHA-256", enc.encode(s));
@@ -203,6 +211,9 @@ export class BridgeHub {
     this.env = env;
     this.waiters = new Map(); // cmd id → Set of wake-up functions (in-flight /admin/result waits)
     this.owners = new Map(); // cmd id → { token, expires, done }
+    this.idem = new Map(); // token:request_id → { cmd, expires, result, gate }
+    this.idemByCmd = new Map(); // cmd id → idempotency key
+    this.idemWaiters = new Map(); // idempotency key → Set of wake-up functions
     // The runtime answers the extension's keepalive without waking the hub.
     ctx.setWebSocketAutoResponse(new globalThis.WebSocketRequestResponsePair("ping", "pong"));
     ctx.blockConcurrencyWhile(() => this.load());
@@ -229,6 +240,15 @@ export class BridgeHub {
       }
     }
     await this.purgeOwners();
+    this.idem = new Map();
+    this.idemByCmd = new Map();
+    for (const [k, v] of await s.list({ prefix: "idem:" })) {
+      if (!v || !v.cmd || typeof v.cmd.id !== "string") continue;
+      const key = k.slice("idem:".length);
+      this.idem.set(key, { cmd: v.cmd, expires: v.expires, result: v.result || null, gate: null });
+      this.idemByCmd.set(v.cmd.id, key);
+    }
+    await this.purgeIdem();
   }
 
   async importFromKv() {
@@ -289,6 +309,14 @@ export class BridgeHub {
     this.queues.delete(token);
     await this.ctx.storage.delete("queue:" + token);
     await this.saveRegistry();
+    const deadIdem = [];
+    for (const [key, entry] of this.idem) {
+      if (!key.startsWith(token + ":")) continue;
+      deadIdem.push(key);
+      this.idem.delete(key);
+      if (entry && entry.cmd) this.idemByCmd.delete(entry.cmd.id);
+    }
+    if (deadIdem.length) await this.ctx.storage.delete(deadIdem.map((key) => "idem:" + key));
     for (const ws of this.socketsFor(token)) {
       try {
         ws.close(4003, "revoked");
@@ -313,25 +341,143 @@ export class BridgeHub {
     await this.ctx.storage.put("queue:" + token, q);
   }
 
-  async enqueue(token, action, params) {
-    const q = this.queues.get(token) || { last: 0, items: [] };
-    const items = this.pending(token);
-    if (items.length >= QUEUE_MAX) return null;
-    const now = Date.now();
-    const cmd = {
-      id: "cmd_" + randHex(8),
-      seq: Math.max(now, q.last + 1),
-      action,
-      params: params && typeof params === "object" ? params : {},
-      issued_at: now,
+  // `requestId` omitted: a normal one-shot command. Present: reserve the id
+  // before any await so two overlapping calls share one execution.
+  async enqueue(token, action, params, requestId) {
+    let reserved = null;
+    let stale = [];
+    if (requestId !== undefined && requestId !== null) {
+      if (typeof requestId !== "string" || !REQUEST_ID_RE.test(requestId)) {
+        return { error: "bad_request_id", status: 400 };
+      }
+      const key = token + ":" + requestId;
+      // Drop expired records in memory before the reserve. The map update is
+      // synchronous so two overlapping calls cannot both miss it.
+      stale = this.forgetExpiredIdem();
+      const prior = this.idem.get(key);
+      if (prior && (prior.expires >= Date.now() || prior.gate)) {
+        if (stale.length) await this.ctx.storage.delete(stale.map((id) => "idem:" + id));
+        if (prior.gate) {
+          const cmd = await prior.gate;
+          if (!cmd) return null;
+          return { cmd, duplicate: true, idemKey: key };
+        }
+        if (prior.cmd) return { cmd: prior.cmd, duplicate: true, idemKey: key };
+      }
+      let resolveGate;
+      const gate = new Promise((resolve) => {
+        resolveGate = resolve;
+      });
+      const entry = { cmd: null, expires: Date.now() + OWNER_TTL_MS, result: null, gate };
+      this.idem.set(key, entry);
+      reserved = { key, entry, resolve: resolveGate, published: false };
+    }
+    try {
+      if (stale.length) await this.ctx.storage.delete(stale.map((id) => "idem:" + id));
+      const q = this.queues.get(token) || { last: 0, items: [] };
+      const items = this.pending(token);
+      if (items.length >= QUEUE_MAX) {
+        this.cancelReserve(reserved);
+        return null;
+      }
+      const now = Date.now();
+      const cmd = {
+        id: "cmd_" + randHex(8),
+        seq: Math.max(now, q.last + 1),
+        action,
+        params: params && typeof params === "object" ? params : {},
+        issued_at: now,
+      };
+      items.push(cmd);
+      if (reserved) {
+        reserved.entry.cmd = cmd;
+        this.idemByCmd.set(cmd.id, reserved.key);
+      }
+      // Owner is durable before the command is visible to the device, so a
+      // result cannot win the race against the association.
+      await this.rememberOwner(cmd.id, token);
+      if (reserved) await this.persistIdem(reserved.key);
+      await this.saveQueue(token, { last: cmd.seq, items });
+      this.push(token, [cmd]);
+      if (reserved) {
+        reserved.published = true;
+        reserved.entry.gate = null;
+        reserved.resolve(cmd);
+        reserved.resolve = null;
+      }
+      return { cmd, duplicate: false, idemKey: reserved ? reserved.key : null };
+    } catch (err) {
+      this.cancelReserve(reserved);
+      throw err;
+    }
+  }
+
+  cancelReserve(reserved) {
+    if (!reserved || !reserved.resolve) return;
+    if (!reserved.published) {
+      const current = this.idem.get(reserved.key);
+      if (current === reserved.entry) this.idem.delete(reserved.key);
+      if (reserved.entry.cmd) this.idemByCmd.delete(reserved.entry.cmd.id);
+    }
+    reserved.entry.gate = null;
+    reserved.resolve(reserved.published ? reserved.entry.cmd : null);
+    reserved.resolve = null;
+  }
+
+  async persistIdem(key) {
+    const entry = this.idem.get(key);
+    if (!entry || !entry.cmd) return;
+    const record = entry.result ? JSON.stringify(entry.result) : "";
+    const stored = {
+      cmd: entry.cmd,
+      expires: entry.expires,
+      result: record && record.length <= RESULT_PERSIST_MAX ? entry.result : null,
     };
-    items.push(cmd);
-    // Owner is durable before the command is visible to the device, so a
-    // result cannot win the race against the association.
-    await this.rememberOwner(cmd.id, token);
-    await this.saveQueue(token, { last: cmd.seq, items });
-    this.push(token, [cmd]);
-    return cmd;
+    await this.ctx.storage.put("idem:" + key, stored);
+  }
+
+  forgetExpiredIdem() {
+    const now = Date.now();
+    const dead = [];
+    for (const [key, entry] of this.idem) {
+      if (!entry || (entry.expires < now && !entry.gate)) dead.push(key);
+    }
+    for (const key of dead) {
+      const entry = this.idem.get(key);
+      this.idem.delete(key);
+      if (entry && entry.cmd) this.idemByCmd.delete(entry.cmd.id);
+    }
+    return dead;
+  }
+
+  async purgeIdem() {
+    const dead = this.forgetExpiredIdem();
+    if (dead.length) await this.ctx.storage.delete(dead.map((key) => "idem:" + key));
+  }
+
+  async waitForIdem(key, seconds) {
+    const ready = () => {
+      const entry = this.idem.get(key);
+      return entry && entry.result ? entry.result : null;
+    };
+    if (!ready() && seconds > 0) {
+      await new Promise((resolve) => {
+        const set = this.idemWaiters.get(key) || new Set();
+        this.idemWaiters.set(key, set);
+        const timer = setTimeout(() => {
+          set.delete(wake);
+          if (!set.size && this.idemWaiters.get(key) === set) this.idemWaiters.delete(key);
+          resolve();
+        }, seconds * 1000);
+        const wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        set.add(wake);
+        if (ready()) wake();
+      });
+    }
+    return ready();
   }
 
   // The extension has taken everything up to `seq`. This drops the command
@@ -380,17 +526,34 @@ export class BridgeHub {
   /* ----- results ----- */
 
   async storeResult(id, body) {
-    let record = JSON.stringify({
+    let parsed = {
       ok: !!body.ok,
       data: body.data ?? null,
       error: body.error == null ? null : String(body.error).slice(0, 1000),
       finished_at: Date.now(),
-    });
+    };
+    let record = JSON.stringify(parsed);
     if (record.length > MAX_RESULT_BYTES) {
-      record = JSON.stringify({ ok: false, data: null, error: "result_too_large", finished_at: Date.now() });
+      parsed = { ok: false, data: null, error: "result_too_large", finished_at: Date.now() };
+      record = JSON.stringify(parsed);
     }
     const entry = { record, expires: Date.now() + RESULT_TTL_MS };
     this.results.set(id, entry);
+    // Copy before waking waiters. takeResult consumes the primary record;
+    // a repeat of the same request_id reads this copy and does not run again.
+    const idemKey = this.idemByCmd.get(id);
+    if (idemKey) {
+      const idem = this.idem.get(idemKey);
+      if (idem) {
+        idem.result = parsed;
+        await this.persistIdem(idemKey);
+        const idemWaiting = this.idemWaiters.get(idemKey);
+        if (idemWaiting) {
+          this.idemWaiters.delete(idemKey);
+          for (const wake of idemWaiting) wake();
+        }
+      }
+    }
     const waiting = this.waiters.get(id);
     if (waiting) {
       this.waiters.delete(id);
@@ -493,7 +656,7 @@ export class BridgeHub {
       }
       ws.serializeAttachment({ token, since: Date.now() });
       if (typeof msg.after === "number") await this.ack(token, msg.after);
-      ws.send(JSON.stringify({ type: "welcome", now: Date.now() }));
+      ws.send(JSON.stringify({ type: "welcome", now: Date.now(), capabilities: CAPABILITIES }));
       this.push(token, this.pending(token));
       return;
     }
@@ -622,9 +785,19 @@ export class BridgeHub {
       if (!action || typeof action !== "string") return json({ error: "missing_action" }, 400);
       const dev = this.resolveDevice(body.device);
       if (dev.error) return json({ error: dev.error }, dev.status);
-      const cmd = await this.enqueue(dev.token, action, body.params);
-      if (!cmd) return json({ error: "queue_full" }, 429);
+      const hasRequest = Object.prototype.hasOwnProperty.call(body, "request_id");
+      const queued = await this.enqueue(dev.token, action, body.params, hasRequest ? body.request_id : undefined);
+      if (!queued) return json({ error: "queue_full" }, 429);
+      if (queued.error) return json({ error: queued.error }, queued.status || 400);
+      const cmd = queued.cmd;
       const device = dev.token.slice(0, 8) + "…";
+      if (queued.duplicate) {
+        if (!isRun) return json({ ok: true, id: cmd.id, device, duplicate: true });
+        const result = await this.waitForIdem(queued.idemKey, waitSeconds(body.wait, RUN_WAIT_DEFAULT_S));
+        return json(result
+          ? { ok: true, id: cmd.id, device, duplicate: true, pending: false, result }
+          : { ok: true, id: cmd.id, device, duplicate: true, pending: true });
+      }
       if (!isRun) return json({ ok: true, id: cmd.id, device });
       const result = await this.waitForResult(cmd.id, waitSeconds(body.wait, RUN_WAIT_DEFAULT_S));
       return json(result ? { ok: true, id: cmd.id, device, pending: false, result } : { ok: true, id: cmd.id, device, pending: true });
@@ -646,7 +819,7 @@ export class BridgeHub {
       const err = await requireAdmin();
       if (err) return err;
       const connected = this.order.filter((t) => this.socketsFor(t).length).length;
-      return json({ ok: true, devices: this.order.length, connected });
+      return json({ ok: true, devices: this.order.length, connected, capabilities: CAPABILITIES });
     }
 
     // ---- admin: list paired devices (ids are 8-char token prefixes) ----

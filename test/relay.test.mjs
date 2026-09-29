@@ -575,4 +575,154 @@ describe("relay", { concurrency: 1 }, () => {
     const got = await read(await hub.fetch(admin("/admin/result?id=" + enq.data.id + "&wait=0")));
     assert.equal(got.data.result.data.via, "ws");
   });
+
+  test("a missing request id does not pretend to be idempotent", async () => {
+    const { hub } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const { token } = await pairAndRegister(hub, "A");
+    const enq = await read(await hub.fetch(admin("/admin/cmd", {
+      method: "POST",
+      body: { action: "ping", device: token, params: {} },
+    })));
+    assert.equal(enq.status, 200);
+    assert.equal(Object.prototype.hasOwnProperty.call(enq.data, "duplicate"), false);
+    const first = await read(await hub.fetch(admin("/admin/cmd", {
+      method: "POST",
+      body: { action: "ping", device: token, params: {}, request_id: "req_one_aaa" },
+    })));
+    const second = await read(await hub.fetch(admin("/admin/cmd", {
+      method: "POST",
+      body: { action: "ping", device: token, params: {}, request_id: "req_two_bbb" },
+    })));
+    assert.equal(Object.prototype.hasOwnProperty.call(first.data, "duplicate"), false);
+    assert.notEqual(first.data.id, second.data.id);
+  });
+
+  test("a bad request id is refused and enqueues nothing", async () => {
+    const { hub } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const { token } = await pairAndRegister(hub, "A");
+    for (const requestId of ["short", "bad id!!", "x".repeat(65)]) {
+      const bad = await read(await hub.fetch(admin("/admin/cmd", {
+        method: "POST",
+        body: { action: "ping", device: token, params: {}, request_id: requestId },
+      })));
+      assert.equal(bad.status, 400, requestId);
+      assert.equal(bad.data.error, "bad_request_id");
+    }
+    const poll = await hub.fetch(post("/poll", { token, after: 0 }));
+    assert.equal(poll.status, 204);
+  });
+
+  test("overlapping runs with one request id share one command", async () => {
+    const { hub } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const { token } = await pairAndRegister(hub, "A");
+    const body = {
+      action: "ping",
+      device: token,
+      params: {},
+      request_id: "req_shared1",
+      wait: 5,
+    };
+    const first = hub.fetch(admin("/admin/run", { method: "POST", body }));
+    const second = hub.fetch(admin("/admin/run", { method: "POST", body }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const polled = await read(await hub.fetch(post("/poll", { token, after: 0 })));
+    assert.equal(polled.status, 200, JSON.stringify(polled.data));
+    const id = polled.data.cmd.id;
+    const posted = await read(await hub.fetch(post("/result", {
+      token, id, ok: true, data: { shared: true },
+    })));
+    assert.deepEqual(posted.data, { ok: true });
+    const [a, b] = await Promise.all([first.then(read), second.then(read)]);
+    for (const res of [a, b]) {
+      assert.equal(res.status, 200, JSON.stringify(res.data));
+      assert.equal(res.data.id, id);
+      assert.equal(res.data.pending, false);
+      assert.equal(res.data.result.data.shared, true);
+    }
+    const duplicates = [a, b].filter((res) => res.data.duplicate === true);
+    assert.equal(duplicates.length, 1);
+    const acked = await hub.fetch(post("/poll", { token, after: polled.data.cmd.seq }));
+    assert.equal(acked.status, 204);
+  });
+
+  test("a repeated request id returns the stored result after it was consumed", async () => {
+    const { hub } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const { token } = await pairAndRegister(hub, "A");
+    const requestId = "req_keep_01";
+    const pending = hub.fetch(admin("/admin/run", {
+      method: "POST",
+      body: { action: "ping", device: token, params: {}, request_id: requestId, wait: 5 },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const polled = await read(await hub.fetch(post("/poll", { token, after: 0 })));
+    const id = polled.data.cmd.id;
+    await read(await hub.fetch(post("/result", { token, id, ok: true, data: { kept: true } })));
+    const first = await read(await pending);
+    assert.equal(first.data.pending, false);
+    assert.equal(first.data.id, id);
+    assert.equal(Object.prototype.hasOwnProperty.call(first.data, "duplicate"), false);
+    assert.equal(first.data.result.data.kept, true);
+    const again = await read(await hub.fetch(admin("/admin/run", {
+      method: "POST",
+      body: { action: "ping", device: token, params: { again: true }, request_id: requestId, wait: 0 },
+    })));
+    assert.equal(again.status, 200, JSON.stringify(again.data));
+    assert.equal(again.data.duplicate, true);
+    assert.equal(again.data.id, id);
+    assert.equal(again.data.pending, false);
+    assert.equal(again.data.result.data.kept, true);
+    const gone = await read(await hub.fetch(admin("/admin/result?id=" + id + "&wait=0")));
+    assert.equal(gone.data.pending, true);
+    const quiet = await hub.fetch(post("/poll", { token, after: polled.data.cmd.seq }));
+    assert.equal(quiet.status, 204);
+  });
+
+  test("a hub reload still answers a repeated request id", async () => {
+    const storage = new MemoryStorage();
+    const env = { ADMIN_PSK_SHA256: await sha256(PASSPHRASE) };
+    const first = await bootHub(env, storage);
+    const { token } = await pairAndRegister(first.hub, "A");
+    const requestId = "req_reload1";
+    const enq = await read(await first.hub.fetch(admin("/admin/cmd", {
+      method: "POST",
+      body: { action: "ping", device: token, params: {}, request_id: requestId },
+    })));
+    const id = enq.data.id;
+    const polled = await read(await first.hub.fetch(post("/poll", { token, after: 0 })));
+    assert.equal(polled.data.cmd.id, id);
+    await read(await first.hub.fetch(post("/result", { token, id, ok: true, data: { kept: true } })));
+    const acked = await first.hub.fetch(post("/poll", { token, after: polled.data.cmd.seq }));
+    assert.equal(acked.status, 204);
+
+    const second = await bootHub(env, storage);
+    const replay = await read(await second.hub.fetch(admin("/admin/run", {
+      method: "POST",
+      body: { action: "click", device: token, params: { x: 1 }, request_id: requestId, wait: 0 },
+    })));
+    assert.equal(replay.status, 200, JSON.stringify(replay.data));
+    assert.equal(replay.data.duplicate, true);
+    assert.equal(replay.data.id, id);
+    assert.equal(replay.data.pending, false);
+    assert.equal(replay.data.result.data.kept, true);
+    const poll = await second.hub.fetch(post("/poll", { token, after: polled.data.cmd.seq }));
+    assert.equal(poll.status, 204);
+  });
+
+  test("ping and the socket welcome advertise idempotency and workflow", async () => {
+    const { hub, ctx } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const ping = await read(await hub.fetch(admin("/admin/ping")));
+    assert.equal(ping.status, 200);
+    assert.deepEqual(ping.data.capabilities, ["idempotency", "workflow"]);
+    const { token } = await pairAndRegister(hub, "A");
+    const opened = await read(await hub.fetch(wsReq("chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef")));
+    assert.equal(opened.status, 101);
+    const server = ctx.sockets.at(-1);
+    await hub.webSocketMessage(server, JSON.stringify({
+      type: "hello", token, after: 0, version: "1.3.0",
+    }));
+    const welcome = JSON.parse(server.sent[0]);
+    assert.equal(welcome.type, "welcome");
+    assert.deepEqual(welcome.capabilities, ["idempotency", "workflow"]);
+    assert.equal(typeof welcome.now, "number");
+  });
 });
