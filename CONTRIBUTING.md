@@ -18,9 +18,13 @@ Open an issue before building:
 
 - Any new **state-changing** command (navigate, click, type, key, scroll
   and close already exist; anything beyond those is a security conversation).
-- Changes to delivery semantics: commands are delivered at most once and
-  stale ones (over 2 minutes old) are refused — that is what keeps a dropped
-  connection from repeating a click.
+- Changes to delivery semantics. Commands are delivered at most once. At
+  execution the extension adds the command's age on the relay when it
+  arrived to the time spent waiting locally, and refuses the command when
+  that sum is over 2 minutes or the timestamps are unusable. Pause drops
+  the in-memory queue. A command already taken is cancelled and not retried.
+  A command not yet taken stays on the relay; resume may deliver it again,
+  and it runs only if it is still inside that window.
 - Changes to the auth model, the allowlist semantics, or the kill switch.
 - Anything that touches the relay's admin endpoints.
 
@@ -35,6 +39,24 @@ Open an issue before building:
    run against a real browser won't be merged.
 4. Update the README if your change affects setup or usage.
 5. Open the PR with a clear description of what changed and how you tested it.
+
+## Automated checks
+
+From the repo root, with no packages to install:
+
+```bash
+node --test
+python3 -m unittest discover -s test -p 'test_*.py'
+```
+
+`npm test` runs both. The checks cover pause during a click, a missing tab
+id, navigation off the authorized page, local queue delay, snapshot
+redaction and its limits, pairing and revocation, result ownership,
+reconnection, HTTP polling, result acknowledgement, and the driver's exit
+status.
+
+They do not load the extension in Chrome and they do not deploy a relay.
+Step 3 above is still required before a transport or browser change is merged.
 
 ## Security
 

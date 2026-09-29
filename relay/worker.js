@@ -15,10 +15,17 @@
  *   versions, or networks that block WebSockets).
  *
  * Auth:
- * - Admin: Authorization: Bearer <psk>. Only SHA-256(psk) is stored: either
- *   the ADMIN_PSK_SHA256 secret, or a value set once via POST /admin/bootstrap.
+ * - Admin: Authorization: Bearer <psk>, compared with the ADMIN_PSK_SHA256
+ *   secret (hex SHA-256 of the passphrase). The secret is required. A hash
+ *   stored in the Durable Object, including one imported from KV, does not
+ *   authenticate anyone. POST /admin/bootstrap is disabled — the first caller
+ *   of a fresh deploy cannot claim the relay.
  * - Device: per-device token issued at registration. It travels only in a
  *   POST body or the first WebSocket message — never in a URL.
+ * - Results: a device may submit a result only for a command id that was
+ *   enqueued for that device. The association outlives delivery
+ *   acknowledgement and lasts until the result is accepted (further posts
+ *   from the owner are duplicates) or the record expires.
  *
  * Delivery is at-most-once per command: each has a monotonically increasing
  * `seq`; the extension records the highest seq it has taken BEFORE running it
@@ -26,7 +33,8 @@
  * the extension skips anything at or below its cursor.
  *
  * Migration: on first boot, if the old KV namespace is still bound as BRIDGE,
- * the admin hash and paired devices are imported so nothing needs re-pairing.
+ * paired devices are imported so nothing needs re-pairing. An imported
+ * passphrase hash is kept but does not authenticate; set ADMIN_PSK_SHA256.
  */
 
 const enc = new TextEncoder();
@@ -35,6 +43,9 @@ const PAIR_TTL_MS = 600_000;
 const QUEUE_KEEP_MS = 180_000; // the extension refuses commands older than 2 min anyway
 const QUEUE_MAX = 100;
 const RESULT_TTL_MS = 600_000;
+// Command→device ownership outlives queue acknowledgement so a result can
+// still be checked after the command was delivered, and dies with the result.
+const OWNER_TTL_MS = RESULT_TTL_MS;
 const RESULT_PERSIST_MAX = 1_000_000; // Durable Object storage values cap at 2 MB
 const MAX_RESULT_BYTES = 20 * 1024 * 1024;
 const RESULT_WAIT_DEFAULT_S = 10;
@@ -43,6 +54,25 @@ const WAIT_MAX_S = 60;
 const HELLO_TIMEOUT_MS = 10_000;
 const MAX_SOCKETS = 16;
 const NAME_MAX = 64;
+
+// Hex SHA-256 only. A raw passphrase in this binding does not configure the relay.
+function adminSecret(env) {
+  const raw = env && env.ADMIN_PSK_SHA256;
+  if (typeof raw !== "string") return null;
+  const hex = raw.trim().toLowerCase();
+  return /^[0-9a-f]{64}$/.test(hex) ? hex : null;
+}
+
+function bootstrapDisabled(headers = {}) {
+  return jsonResponse(
+    {
+      error: "bootstrap_disabled",
+      detail: "Set the ADMIN_PSK_SHA256 secret before the relay will serve. Open enrollment is disabled.",
+    },
+    410,
+    headers
+  );
+}
 
 const PAIR_ALPHA = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const PAIR_RE = /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$/;
@@ -137,9 +167,18 @@ export default {
     const path = new URL(req.url).pathname;
     const origin = req.headers.get("origin");
     try {
-      if (path === "/") return jsonResponse({ service: "juno-bridge", ok: true });
+      if (path === "/") {
+        return jsonResponse({ service: "juno-bridge", ok: true, configured: adminSecret(env) != null });
+      }
       if (req.method === "OPTIONS") {
         return new Response(null, { status: 204, headers: corsHeaders(path, origin) });
+      }
+      // Refuse before waking the Durable Object. Bootstrap cannot claim a
+      // relay that has no secret yet, and no operational route is served until
+      // ADMIN_PSK_SHA256 is a hex SHA-256.
+      if (path === "/admin/bootstrap") return bootstrapDisabled();
+      if (!adminSecret(env)) {
+        return jsonResponse({ error: "admin_not_configured" }, 503, corsHeaders(path, origin));
       }
       // Optional: bind a Rate Limiting API binding named REGISTER_LIMITER for
       // a per-IP limit on pairing attempts.
@@ -163,8 +202,9 @@ export class BridgeHub {
     this.ctx = ctx;
     this.env = env;
     this.waiters = new Map(); // cmd id → Set of wake-up functions (in-flight /admin/result waits)
+    this.owners = new Map(); // cmd id → { token, expires, done }
     // The runtime answers the extension's keepalive without waking the hub.
-    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    ctx.setWebSocketAutoResponse(new globalThis.WebSocketRequestResponsePair("ping", "pong"));
     ctx.blockConcurrencyWhile(() => this.load());
   }
 
@@ -182,6 +222,13 @@ export class BridgeHub {
     for (const [k, v] of await s.list({ prefix: "queue:" })) this.queues.set(k.slice(6), v);
     this.results = new Map(); // id → { record: string, expires }
     for (const [k, v] of await s.list({ prefix: "res:" })) this.results.set(k.slice(4), v);
+    this.owners = new Map();
+    for (const [k, v] of await s.list({ prefix: "own:" })) {
+      if (v && typeof v.token === "string") {
+        this.owners.set(k.slice(4), { token: v.token, expires: v.expires, done: !!v.done });
+      }
+    }
+    await this.purgeOwners();
   }
 
   async importFromKv() {
@@ -189,6 +236,7 @@ export class BridgeHub {
     if (kv) {
       try {
         const h = await kv.get("cfg:admin_hash");
+        // Kept so an operator can see the old hash. Auth ignores it.
         if (h && !this.adminHash) this.adminHash = h;
         for (const t of (await kv.get("devices:index", "json")) || []) {
           if (!TOKEN_RE.test(t) || this.devices.has(t)) continue;
@@ -216,8 +264,8 @@ export class BridgeHub {
   }
 
   adminHashValue() {
-    if (this.env.ADMIN_PSK_SHA256) return String(this.env.ADMIN_PSK_SHA256).trim().toLowerCase();
-    return this.adminHash;
+    // The stored admin_hash (bootstrap, or a KV import) is not a credential.
+    return adminSecret(this.env);
   }
 
   // "default"/absent → most recently registered device; a full token; or a
@@ -278,17 +326,55 @@ export class BridgeHub {
       issued_at: now,
     };
     items.push(cmd);
+    // Owner is durable before the command is visible to the device, so a
+    // result cannot win the race against the association.
+    await this.rememberOwner(cmd.id, token);
     await this.saveQueue(token, { last: cmd.seq, items });
     this.push(token, [cmd]);
     return cmd;
   }
 
-  // The extension has taken everything up to `seq`.
+  // The extension has taken everything up to `seq`. This drops the command
+  // from the queue only. Ownership stays until the result is in (or expires),
+  // so a delivery ack is not permission for a different device to answer it.
   async ack(token, seq) {
     const q = this.queues.get(token);
     if (!q) return;
     const items = q.items.filter((c) => c.seq > seq);
     if (items.length !== q.items.length) await this.saveQueue(token, { last: q.last, items });
+  }
+
+  async rememberOwner(id, token) {
+    const entry = { token, expires: Date.now() + OWNER_TTL_MS, done: false };
+    this.owners.set(id, entry);
+    await this.ctx.storage.put("own:" + id, entry);
+    await this.purgeOwners();
+  }
+
+  async purgeOwners() {
+    const now = Date.now();
+    const dead = [];
+    for (const [id, owner] of this.owners) if (!owner || owner.expires < now) dead.push(id);
+    for (const id of dead) this.owners.delete(id);
+    if (dead.length) await this.ctx.storage.delete(dead.map((id) => "own:" + id));
+  }
+
+  // { ok: true, duplicate?: true } or { ok: false, error, status }.
+  // The first accepted body wins. A later post from the same device is a
+  // no-op receipt; any other device is rejected. The owner record is kept
+  // until expiry so that check still works after completion.
+  async acceptResult(token, id, body) {
+    await this.purgeOwners();
+    if (!this.devices.has(token)) return { ok: false, error: "unknown_device", status: 403 };
+    const owner = this.owners.get(id);
+    if (!owner) return { ok: false, error: "unknown_command", status: 403 };
+    if (owner.token !== token) return { ok: false, error: "not_command_owner", status: 403 };
+    if (owner.done) return { ok: true, duplicate: true };
+    await this.storeResult(id, body);
+    owner.done = true;
+    this.owners.set(id, owner);
+    await this.ctx.storage.put("own:" + id, owner);
+    return { ok: true };
   }
 
   /* ----- results ----- */
@@ -415,7 +501,14 @@ export class BridgeHub {
     if (msg.type === "ack" && typeof msg.seq === "number") {
       await this.ack(att.token, msg.seq);
     } else if (msg.type === "result" && typeof msg.id === "string" && CMD_ID_RE.test(msg.id)) {
-      await this.storeResult(msg.id, msg);
+      const verdict = await this.acceptResult(att.token, msg.id, msg);
+      try {
+        ws.send(JSON.stringify(verdict.ok
+          ? { type: "result_ack", id: msg.id }
+          : { type: "result_rejected", id: msg.id, error: verdict.error }));
+      } catch {
+        /* socket closing — the extension falls back to HTTP */
+      }
     }
   }
 
@@ -450,6 +543,11 @@ export class BridgeHub {
     const cors = corsHeaders(path, origin);
     const json = (data, status = 200) => jsonResponse(data, status, cors);
 
+    // Direct Durable Object requests are gated here too. The edge fetch
+    // usually answers first; this covers anything that reaches the hub.
+    if (path === "/admin/bootstrap") return bootstrapDisabled(cors);
+    if (!this.adminHashValue()) return json({ error: "admin_not_configured" }, 503);
+
     // ---- device: live WebSocket (the fast path) ----
     if (path === "/ws") {
       if ((req.headers.get("upgrade") || "").toLowerCase() !== "websocket") {
@@ -458,11 +556,11 @@ export class BridgeHub {
       // Browsers always send Origin on WebSockets; only extensions may connect.
       if (origin && !origin.startsWith("chrome-extension://")) return json({ error: "forbidden_origin" }, 403);
       if (this.ctx.getWebSockets().length >= MAX_SOCKETS) return json({ error: "too_many_sockets" }, 503);
-      const [client, server] = Object.values(new WebSocketPair());
+      const [client, server] = Object.values(new globalThis.WebSocketPair());
       this.ctx.acceptWebSocket(server);
       server.serializeAttachment({ token: null });
       // The first message must be a valid hello; drop sockets that never send one.
-      setTimeout(() => {
+      const helloTimer = setTimeout(() => {
         try {
           const a = server.deserializeAttachment();
           if (!a || !a.token) server.close(4001, "hello_timeout");
@@ -470,6 +568,7 @@ export class BridgeHub {
           /* already closed */
         }
       }, HELLO_TIMEOUT_MS);
+      if (helloTimer && typeof helloTimer.unref === "function") helloTimer.unref();
       return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -489,7 +588,7 @@ export class BridgeHub {
       const tok = bearer(req);
       if (!tok) return json({ error: "missing_auth" }, 401);
       const stored = this.adminHashValue();
-      if (!stored) return json({ error: "not_bootstrapped" }, 503);
+      if (!stored) return json({ error: "admin_not_configured" }, 503);
       if (!ctEqual(await sha256hex(tok), stored)) return json({ error: "bad_auth" }, 403);
       return null;
     };
@@ -501,16 +600,6 @@ export class BridgeHub {
       if (!TOKEN_RE.test(tok) || !this.devices.has(tok)) return { err: json({ error: "unknown_device" }, 403) };
       return { token: tok };
     };
-
-    // ---- one-shot bootstrap: set the admin PSK hash ----
-    if (path === "/admin/bootstrap" && req.method === "POST") {
-      if (this.adminHashValue()) return json({ error: "already_bootstrapped" }, 403);
-      const tok = bearer(req);
-      if (!tok || tok.length < 16) return json({ error: "psk_too_short" }, 400);
-      this.adminHash = await sha256hex(tok);
-      await this.saveRegistry();
-      return json({ ok: true, bootstrapped: true });
-    }
 
     // ---- admin: create a short-lived pairing code ----
     if (path === "/admin/pair" && req.method === "POST") {
@@ -639,8 +728,9 @@ export class BridgeHub {
       const id = body.id;
       if (!id) return json({ error: "missing_id" }, 400);
       if (typeof id !== "string" || !CMD_ID_RE.test(id)) return json({ error: "bad_id" }, 400);
-      await this.storeResult(id, body);
-      return json({ ok: true });
+      const verdict = await this.acceptResult(d.token, id, body);
+      if (!verdict.ok) return json({ error: verdict.error }, verdict.status);
+      return json(verdict.duplicate ? { ok: true, duplicate: true } : { ok: true });
     }
 
     return json({ error: "not_found" }, 404);

@@ -5,7 +5,7 @@ Setup:
   export JUNO_BRIDGE_PSK="your-admin-passphrase"   # or store it in
                                                    # ~/.config/juno-bridge/psk (mode 0600)
   jb.py init https://YOUR-RELAY.workers.dev
-  jb.py bootstrap      # one-shot: lock the relay to your passphrase
+  jb.py bootstrap      # print the ADMIN_PSK_SHA256 value to set; does not contact the relay
   jb.py pair           # mint a 10-minute pairing code for the browser
   jb.py ping           # check relay + device count
   jb.py devices        # list paired browsers (id, name, connected, pending)
@@ -14,16 +14,22 @@ Setup:
   jb.py send <action> [params-json] [device]
                        # e.g. jb.py send navigate '{"url":"https://example.com"}'
                        # waits up to 60s for the result and prints it
+                       # exits 1 if that result is a failure
 
 Actions: ping, tabs, navigate, screenshot, snapshot, text, click, type, key,
          scroll, close, eval
 
 Security notes:
-  - The passphrase is a bearer secret. It travels only in an
-    `Authorization: Bearer` header, never in URLs or logs. Keep it out of
-    shell history (prefer the psk file over the env var on shared machines).
-  - The relay stores only the SHA-256 of the passphrase, never the value.
+  - The passphrase is a bearer secret. The driver sends it only in an
+    `Authorization: Bearer` header over HTTPS, never in a URL or a log line.
+    Keep it out of shell history (prefer the psk file over the env var on
+    shared machines).
+  - The relay stores and compares the SHA-256 of the passphrase. Sending the
+    passphrase to authenticate is not the same as it never leaving the machine.
+  - `bootstrap` does not contact the relay and cannot claim one. Set
+    ADMIN_PSK_SHA256 before the relay is reachable.
 """
+import hashlib
 import json
 import os
 import stat
@@ -36,6 +42,7 @@ CONFIG_DIR = os.path.expanduser("~/.config/juno-bridge")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 PSK_FILE = os.path.join(CONFIG_DIR, "psk")
 PSK_ENV = "JUNO_BRIDGE_PSK"
+MIN_PSK_LEN = 16
 
 
 def die(msg, code=1):
@@ -160,8 +167,25 @@ def cmd_init(args):
     print("relay set to", args[0].rstrip("/"))
 
 
+def psk_sha256(psk):
+    return hashlib.sha256(psk.encode("utf-8")).hexdigest()
+
+
 def cmd_bootstrap(_args):
-    print(json.dumps(relay_request("POST", "/admin/bootstrap", {}), indent=2))
+    """Tell the operator how to set ADMIN_PSK_SHA256. Does not send the passphrase."""
+    psk = admin_psk()
+    if len(psk) < MIN_PSK_LEN:
+        die(f"passphrase must be at least {MIN_PSK_LEN} characters", 2)
+    digest = psk_sha256(psk)
+    print("Open enrollment is disabled. The relay serves admin and device")
+    print("traffic only after ADMIN_PSK_SHA256 is set to the SHA-256 of this")
+    print("passphrase. From the relay/ directory:")
+    print()
+    print("  printf '%s' \"$JUNO_BRIDGE_PSK\" | shasum -a 256 | cut -d' ' -f1 | npx wrangler secret put ADMIN_PSK_SHA256")
+    print()
+    print("Expected SHA-256:", digest)
+    print("This command does not contact the relay. After the secret is set,")
+    print("check it with: jb.py ping")
 
 
 def cmd_pair(_args):
@@ -184,6 +208,14 @@ def cmd_revoke(args):
     print(json.dumps(relay_request("POST", "/admin/revoke", {"device": args[0]}), indent=2))
 
 
+def finish_result(result):
+    """Print a device result. The process status follows result['ok']."""
+    print(json.dumps(result, indent=2))
+    if isinstance(result, dict) and result.get("ok") is True:
+        return 0
+    return 1
+
+
 def cmd_send(args):
     if not args:
         die("usage: jb.py send <action> [params-json] [device]", 2)
@@ -203,8 +235,7 @@ def cmd_send(args):
         # Relay predates /admin/run: enqueue, then poll for the result.
         res = relay_request("POST", "/admin/cmd", cmd)
     elif not res.get("pending"):
-        print(json.dumps(res["result"], indent=2))
-        return
+        return finish_result(res.get("result"))
 
     cmd_id = res["id"]
     while time.time() < deadline:
@@ -212,8 +243,7 @@ def cmd_send(args):
         # Current relays hold this request until the result lands (up to 20s).
         r = relay_request("GET", f"/admin/result?id={cmd_id}&wait=20", timeout=35)
         if not r.get("pending"):
-            print(json.dumps(r["result"], indent=2))
-            return
+            return finish_result(r.get("result"))
         if time.time() - started < 1:
             time.sleep(2.0)  # older relay answered at once: don't hammer it
     die(f"timeout waiting for device (id {cmd_id})")
@@ -229,8 +259,8 @@ def main(argv):
     fn = cmds.get(argv[1])
     if not fn:
         die(f"unknown command: {argv[1]}", 2)
-    fn(argv[2:])
-    return 0
+    code = fn(argv[2:])
+    return 0 if code is None else code
 
 
 if __name__ == "__main__":

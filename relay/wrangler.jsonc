@@ -13,14 +13,17 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BridgeHub"] }]
 
   // Upgrading from the KV-based relay (v1.0.x)? Bind your old namespace as
-  // BRIDGE so the hub imports your admin passphrase hash and paired browsers
-  // on first boot (find the id with `npx wrangler kv namespace list`). Remove
-  // it again once the new relay has run once.
+  // BRIDGE so the hub imports paired browsers on first boot (find the id with
+  // `npx wrangler kv namespace list`). An imported passphrase hash is kept
+  // and is not accepted as the admin credential. Remove the binding once the
+  // new relay has run once.
   //   ,"kv_namespaces": [{ "binding": "BRIDGE", "id": "YOUR_OLD_KV_NAMESPACE_ID" }]
 
-  // Optional hardening:
-  //   npx wrangler secret put ADMIN_PSK_SHA256   (hex SHA-256 of your passphrase)
-  // and a per-IP limit on pairing attempts:
+  // Required before any operational route will serve. GET / still answers,
+  // and POST /admin/bootstrap stays disabled (410). A hash stored in the
+  // Durable Object does not authenticate.
+  //   printf '%s' "$JUNO_BRIDGE_PSK" | shasum -a 256 | cut -d' ' -f1 | npx wrangler secret put ADMIN_PSK_SHA256
+  // Optional per-IP limit on pairing attempts:
   //   ,"ratelimits": [{ "name": "REGISTER_LIMITER", "namespace_id": "1001",
   //                     "simple": { "limit": 20, "period": 60 } }]
 }

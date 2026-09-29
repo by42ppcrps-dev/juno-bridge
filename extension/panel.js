@@ -33,7 +33,7 @@ async function refresh() {
     toggleBtn.hidden = true;
   } else if (!s.enabled) {
     dot.className = "dot paused";
-    statusText.textContent = "Paused — Juno cannot drive this browser right now.";
+    statusText.textContent = "Paused — further commands will not run. An action already sent to Chrome is not undone.";
     toggleBtn.hidden = false;
     toggleBtn.textContent = "Resume";
     toggleBtn.className = "primary";
