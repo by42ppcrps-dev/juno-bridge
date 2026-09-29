@@ -1,9 +1,10 @@
 """User-scoped operator process for Juno Bridge.
 
 The CLI talks to this process over a private Unix socket. The process owns
-the relay HTTP client and the admin passphrase. The passphrase is not sent
-on the socket. Certificate verification stays on, and redirects are not
-followed, so the bearer token is not sent to another host.
+the relay HTTP client, a separate TypeSafe client, and the admin passphrase.
+The passphrase and the TypeSafe key are not sent on the socket. Certificate
+verification stays on, and redirects are not followed, so a bearer token is
+not sent to another host.
 
 Set JUNO_OPERATOR=0 or JUNO_BRIDGE_HTTP=curl to skip this process and use
 one curl subprocess per request instead.
@@ -12,6 +13,7 @@ one curl subprocess per request instead.
 import ctypes
 import ctypes.util
 import hmac
+import importlib.util
 import json
 import os
 import socket
@@ -273,13 +275,58 @@ def request_with_retry(client, method, url, headers, body, timeout):
         return client.request(method, url, headers, body, timeout)
 
 
-def handle_message(msg, client):
+_jev = None
+
+
+def jev_mod():
+    """Load the decision helper. A separate module name avoids the CLI's copy."""
+    global _jev
+    if _jev is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jev.py")
+        spec = importlib.util.spec_from_file_location("juno_jev_operator", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _jev = mod
+    return _jev
+
+
+def _handle_systemone(msg, typesafe_getter):
+    """One System One call. The key is read here, never accepted from the socket."""
+    if any(name in msg for name in ("key", "authorization", "api_key")):
+        return {"ok": False, "error": "the TypeSafe key stays in the operator"}
+    if typesafe_getter is None:
+        return {"ok": False, "error": "TypeSafe client is not available"}
+    body = msg.get("body")
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "TypeSafe body must be an object"}
+    try:
+        timeout = int(msg.get("timeout") or 30)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "bad timeout"}
+    key = ""
+    try:
+        typesafe = typesafe_getter()
+        jev = jev_mod()
+        key = jev.api_key()
+        response = typesafe.post(body, key, timeout)
+    except ValueError as exc:
+        return {"ok": False, "error": jev_mod().scrub(str(exc), key)[:300]}
+    except Exception as exc:
+        return {"ok": False, "error": jev_mod().scrub(str(exc), key)[:300]}
+    if not isinstance(response, dict):
+        return {"ok": False, "error": "TypeSafe returned a response that was not a JSON object"}
+    return {"ok": True, "response": response}
+
+
+def handle_message(msg, client, typesafe_getter=None):
     if not isinstance(msg, dict):
         return {"ok": False, "error": "bad message"}
     if msg.get("op") == "stop":
         return {"ok": True, "stop": True}
     if msg.get("op") == "ping":
         return {"ok": True, "pong": True}
+    if msg.get("op") == "systemone":
+        return _handle_systemone(msg, typesafe_getter)
     path = msg.get("path")
     if not isinstance(path, str) or not path.startswith("/") or "://" in path or "\n" in path:
         return {"ok": False, "error": "bad path"}
@@ -324,7 +371,7 @@ def _recv_line(conn):
     return line
 
 
-def serve_conn(conn, token, client):
+def serve_conn(conn, token, client, typesafe_getter=None):
     try:
         line = _recv_line(conn)
         if line is None:
@@ -337,7 +384,7 @@ def serve_conn(conn, token, client):
     if not isinstance(supplied, str) or not hmac.compare_digest(supplied, token):
         conn.sendall(b'{"ok":false,"error":"unauthorized"}\n')
         return False
-    result = handle_message(msg, client)
+    result = handle_message(msg, client, typesafe_getter)
     encoded = json.dumps(result).encode("utf-8")
     if len(encoded) > FRAME_MAX:
         encoded = b'{"ok":false,"error":"response too large"}'
@@ -359,7 +406,15 @@ def socket_alive(path):
         probe.close()
 
 
-def serve(client=None, ready=None, stop=None):
+def _close_quietly(obj):
+    if obj is not None and hasattr(obj, "close"):
+        try:
+            obj.close()
+        except OSError:
+            pass
+
+
+def serve(client=None, ready=None, stop=None, typesafe=None):
     path = sock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if socket_alive(path):
@@ -375,10 +430,18 @@ def serve(client=None, ready=None, stop=None):
     write_private(token_path(), token)
     if client is None:
         client = LibcurlSession()
+    typesafe_box = [typesafe]
+
+    def typesafe_getter():
+        if typesafe_box[0] is None:
+            typesafe_box[0] = jev_mod().TypeSafeSession()
+        return typesafe_box[0]
+
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         srv.bind(str(path))
     except OSError:
+        _close_quietly(typesafe_box[0])
         if ready:
             ready.set()
         return 0
@@ -397,16 +460,13 @@ def serve(client=None, ready=None, stop=None):
             except OSError:
                 break
             try:
-                stopping = serve_conn(conn, token, client)
+                stopping = serve_conn(conn, token, client, typesafe_getter)
             finally:
                 conn.close()
     finally:
         srv.close()
-        if hasattr(client, "close"):
-            try:
-                client.close()
-            except OSError:
-                pass
+        _close_quietly(client)
+        _close_quietly(typesafe_box[0])
         try:
             path.unlink()
         except OSError:
@@ -478,6 +538,28 @@ def call(method, path, data, timeout):
     if not res.get("ok"):
         raise OperatorError(res.get("error") or "request failed")
     return res.get("status"), res.get("payload") if isinstance(res.get("payload"), dict) else {}
+
+
+def systemone(body, timeout=30):
+    """Send one System One request through the operator's TypeSafe client.
+
+    The API key stays in this process. The socket message carries the body only.
+    """
+    ensure()
+    token = read_private(token_path())
+    message = {
+        "token": token,
+        "op": "systemone",
+        "body": body,
+        "timeout": int(timeout),
+    }
+    res = transact(message, timeout=int(timeout) + CONNECT_TIMEOUT + 5)
+    if not res.get("ok"):
+        raise OperatorError(res.get("error") or "TypeSafe request failed")
+    response = res.get("response")
+    if not isinstance(response, dict):
+        raise OperatorError("TypeSafe returned a response that was not a JSON object")
+    return response
 
 
 def stop():

@@ -113,12 +113,15 @@ class OperatorTests(unittest.TestCase):
             child.unlink()
         self.tmp.rmdir()
 
-    def start(self, client):
+    def start(self, client, typesafe=None):
         self.stop_flag = threading.Event()
         ready = threading.Event()
+        kwargs = {"client": client, "ready": ready, "stop": self.stop_flag}
+        if typesafe is not None:
+            kwargs["typesafe"] = typesafe
         self.thread = threading.Thread(
             target=self.op.serve,
-            kwargs={"client": client, "ready": ready, "stop": self.stop_flag},
+            kwargs=kwargs,
             daemon=True,
         )
         self.thread.start()
@@ -323,6 +326,91 @@ class OperatorTests(unittest.TestCase):
                 self.op.stop()
             except self.op.OperatorError:
                 pass
+
+    def test_systemone_reuses_one_client_and_keeps_the_key_off_the_socket(self):
+        secret = "typesafe-test-key-not-real"
+        saved = os.environ.get("TYPESAFE_API_KEY")
+        os.environ["TYPESAFE_API_KEY"] = secret
+
+        class FakeTypeSafe:
+            def __init__(self):
+                self.posts = []
+                self.closed = False
+
+            def post(self, body, key, timeout=30):
+                self.posts.append((body, key, timeout))
+                return {"answers": {"target": {"choice": "none"}}}
+
+            def close(self):
+                self.closed = True
+
+        session = FakeTypeSafe()
+        client = FakeClient()
+        try:
+            token = self.start(client, typesafe=session)
+            seen = []
+            real = self.op.transact
+
+            def wrapped(message, timeout=60):
+                seen.append(json.dumps(message))
+                return real(message, timeout)
+
+            with mock.patch.object(jb.subprocess, "Popen", side_effect=AssertionError("spawned")):
+                with mock.patch.object(self.op, "transact", side_effect=wrapped):
+                    first = self.op.systemone({"questions": {"target": {}}})
+                    second = self.op.systemone({"questions": {"page": {}}})
+                    refused = real({"token": token, "op": "systemone", "key": secret, "body": {}})
+            self.assertEqual(first, {"answers": {"target": {"choice": "none"}}})
+            self.assertEqual(second, first)
+            self.assertEqual(
+                [item[0] for item in session.posts],
+                [{"questions": {"target": {}}}, {"questions": {"page": {}}}],
+            )
+            self.assertEqual(session.posts[0][1], secret)
+            self.assertEqual(session.posts[1][1], secret)
+            self.assertEqual(client.calls, [])
+            messages = [json.loads(item) for item in seen]
+            systemone_msgs = [item for item in messages if item.get("op") == "systemone"]
+            self.assertEqual(len(systemone_msgs), 2)
+            for message in messages:
+                self.assertNotIn(secret, json.dumps(message))
+                self.assertNotIn("authorization", message)
+                self.assertNotIn("api_key", message)
+            self.assertFalse(refused["ok"])
+            self.assertEqual(len(session.posts), 2)
+            jev = self.op.jev_mod()
+            old_key_file = jev.KEY_FILE
+
+            def boom(body, key, timeout=30):
+                raise jev.JevError("bad " + key)
+
+            session.post = boom
+            with mock.patch.object(jb.subprocess, "Popen", side_effect=AssertionError("spawned")):
+                with self.assertRaises(self.op.OperatorError) as caught:
+                    self.op.systemone({"questions": {"target": {}}})
+            self.assertNotIn(secret, str(caught.exception))
+            self.assertIn("[redacted]", str(caught.exception))
+            jev.KEY_FILE = str(self.tmp / "missing-typesafe-key")
+            os.environ.pop("TYPESAFE_API_KEY", None)
+            missing = self.op.handle_message(
+                {"op": "systemone", "body": {"model": "jev-latest"}},
+                FakeClient(),
+                lambda: session,
+            )
+            self.assertFalse(missing["ok"])
+            self.assertIn("TYPESAFE_API_KEY", missing["error"])
+            self.assertNotIn(secret, missing["error"])
+            stopped = self.op.transact({"token": token, "op": "stop"})
+            self.assertTrue(stopped.get("ok"))
+            self.thread.join(2)
+            self.thread = None
+            self.assertTrue(session.closed)
+            jev.KEY_FILE = old_key_file
+        finally:
+            if saved is None:
+                os.environ.pop("TYPESAFE_API_KEY", None)
+            else:
+                os.environ["TYPESAFE_API_KEY"] = saved
 
 
 if __name__ == "__main__":

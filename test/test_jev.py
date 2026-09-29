@@ -64,6 +64,7 @@ class JevTests(unittest.TestCase):
         for target, name in (
             (self.jev.urllib.request, "urlopen"),
             (self.jev.urllib.request, "build_opener"),
+            (self.jev.http.client, "HTTPSConnection"),
             (jb.subprocess, "run"),
         ):
             patcher = mock.patch.object(target, name, side_effect=refuse_network)
@@ -81,6 +82,24 @@ class JevTests(unittest.TestCase):
             os.environ.pop("JUNO_OPERATOR", None)
         else:
             os.environ["JUNO_OPERATOR"] = self._operator_env
+
+    def _force_operator(self):
+        saved = {
+            "JUNO_BRIDGE_HTTP": os.environ.get("JUNO_BRIDGE_HTTP"),
+            "JUNO_OPERATOR_CHILD": os.environ.get("JUNO_OPERATOR_CHILD"),
+        }
+
+        def restore():
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore)
+        os.environ.pop("JUNO_BRIDGE_HTTP", None)
+        os.environ.pop("JUNO_OPERATOR_CHILD", None)
+        os.environ["JUNO_OPERATOR"] = "1"
 
     def enable(self, key=SECRET):
         os.environ["JUNO_JEV"] = "1"
@@ -102,8 +121,14 @@ class JevTests(unittest.TestCase):
         item.update(extra)
         return item
 
-    def snapshot(self, elements, url="https://example.com/invoices", title="Invoices"):
-        return {"ok": True, "data": {"title": title, "url": url, "elements": elements}}
+    def snapshot(self, elements, url="https://example.com/invoices", title="Invoices", snapshot=None):
+        data = {"title": title, "url": url, "elements": elements}
+        if snapshot is not None:
+            data["snapshot"] = snapshot
+        return {"ok": True, "data": data}
+
+    def snap_id(self, digit="a"):
+        return "snap_" + (digit * 32)
 
     def answer(self, questions, tokens=1000):
         answers = {}
@@ -306,13 +331,28 @@ class JevTests(unittest.TestCase):
                 self.assertFalse(report["click"]["issued"])
                 self.assertEqual([item[0] for item in self.actions], ["snapshot"])
 
-    def test_click_uses_fresh_coordinates_after_a_matching_snapshot(self):
+    def test_click_submits_the_same_snapshot_and_returns_its_observation(self):
         self.enable()
-        fresh = self.element("e7", "Invoices", x=400, y=50)
+        snap = self.snap_id("a")
+        observed = {
+            "observe": "snapshot",
+            "observed": True,
+            "snapshot": self.snap_id("b"),
+            "url": "https://example.com/invoices",
+            "elements": [],
+            "redaction": "heuristic",
+        }
         self.patch_actions([
-            self.snapshot([self.element("e1", "Invoices")]),
-            self.snapshot([fresh]),
-            {"ok": True, "data": {"clicked": True}},
+            self.snapshot([self.element("e1", "Invoices")], snapshot=snap),
+            {
+                "ok": True,
+                "data": {
+                    "status": "completed",
+                    "dispatched": True,
+                    "observation": observed,
+                    "steps": [{"op": "click", "status": "completed"}],
+                },
+            },
         ])
         self.patch_post(self.answer({"target": ("e1", 0.8)}))
         code, out, err = self.run_jev(
@@ -322,66 +362,37 @@ class JevTests(unittest.TestCase):
         self.assertNotIn(SECRET, out + err)
         report = json.loads(out)
         self.assertTrue(report["click"]["issued"])
-        self.assertEqual(report["click"]["ref"], "e7")
-        self.assertEqual(self.actions[2][0], "click")
-        self.assertEqual(self.actions[2][1], {"tabId": 7, "x": 400, "y": 50})
+        self.assertEqual(report["click"]["ref"], "e1")
+        self.assertEqual(report["click"]["snapshot"], snap)
+        self.assertEqual(report["click"]["observation"], observed)
+        self.assertEqual([item[0] for item in self.actions], ["snapshot", "workflow"])
+        self.assertEqual(self.actions[1][1], {
+            "tabId": 7,
+            "snapshot": snap,
+            "steps": [{
+                "op": "click",
+                "ref": "e1",
+                "after": {"observe": "snapshot"},
+                "expect": {"tag": "a", "text": "Invoices"},
+            }],
+        })
+        self.assertNotIn("x", self.posts[0][0]["state"]["elements"][0])
         self.assertEqual(len(self.posts), 1)
 
-    def test_click_stops_when_the_fresh_page_does_not_match(self):
+    def test_a_stale_snapshot_is_refused_without_a_coordinate_click(self):
         self.enable()
-        original = self.element("e1", "Invoices")
-        moved = self.snapshot(
-            [self.element("e4", "Invoices", x=8, y=9)],
-            url="https://example.com/other",
-        )
-        twin = self.snapshot([
-            self.element("e4", "Invoices", x=8, y=9),
-            self.element("e5", "Invoices", x=10, y=11),
-        ])
-        outside = self.snapshot([
-            self.element("e4", "Invoices", x=8, y=9, inView=False),
-        ])
-        for fresh in (moved, twin, outside):
-            with self.subTest(url=fresh["data"]["url"], count=len(fresh["data"]["elements"])):
-                self.posts.clear()
-                self.actions.clear()
-                self.patch_actions([
-                    self.snapshot([original]),
-                    fresh,
-                ])
-                self.patch_post(self.answer({"target": "e1"}))
-                code, out, _err = self.run_jev(
-                    "target", "--tab", "7", "--goal", "Find the invoice", "--click"
-                )
-                self.assertEqual(code, 1)
-                report = json.loads(out)
-                self.assertTrue(report["billed"])
-                self.assertFalse(report["click"]["issued"])
-                self.assertEqual([item[0] for item in self.actions], ["snapshot", "snapshot"])
-
-    def test_a_failed_click_stays_a_failure_after_it_was_issued(self):
-        self.enable()
-        fresh = self.element("e7", "Invoices", x=400, y=50)
+        snap = self.snap_id("c")
         self.patch_actions([
-            self.snapshot([self.element("e1", "Invoices")]),
-            self.snapshot([fresh]),
-            {"ok": False, "error": "cancelled: extension paused"},
-        ])
-        self.patch_post(self.answer({"target": "e1"}))
-        code, out, _err = self.run_jev(
-            "target", "--tab", "7", "--goal", "Find the invoice", "--click"
-        )
-        self.assertEqual(code, 1)
-        report = json.loads(out)
-        self.assertTrue(report["click"]["issued"])
-        self.assertFalse(report["ok"])
-        self.assertEqual(self.actions[2][0], "click")
-
-    def test_a_failed_fresh_snapshot_does_not_click(self):
-        self.enable()
-        self.patch_actions([
-            self.snapshot([self.element("e1", "Invoices")]),
-            {"ok": False, "error": "cancelled: extension paused"},
+            self.snapshot([self.element("e1", "Invoices")], snapshot=snap),
+            {
+                "ok": False,
+                "error": "workflow: snapshot is stale",
+                "data": {
+                    "status": "failed",
+                    "dispatched": False,
+                    "steps": [{"status": "unstarted"}],
+                },
+            },
         ])
         self.patch_post(self.answer({"target": "e1"}))
         code, out, _err = self.run_jev(
@@ -390,8 +401,49 @@ class JevTests(unittest.TestCase):
         self.assertEqual(code, 1)
         report = json.loads(out)
         self.assertTrue(report["billed"])
-        self.assertEqual(report["click"]["reason"], "fresh snapshot failed")
-        self.assertEqual([item[0] for item in self.actions], ["snapshot", "snapshot"])
+        self.assertFalse(report["click"]["issued"])
+        self.assertTrue(report["click"]["submitted"])
+        self.assertEqual(report["click"]["reason"], "workflow: snapshot is stale")
+        self.assertEqual([item[0] for item in self.actions], ["snapshot", "workflow"])
+        self.assertNotIn("click", [item[0] for item in self.actions])
+        self.assertEqual(len(self.posts), 1)
+
+    def test_a_failed_click_stays_a_failure_after_it_was_issued(self):
+        self.enable()
+        snap = self.snap_id("d")
+        self.patch_actions([
+            self.snapshot([self.element("e1", "Invoices")], snapshot=snap),
+            {
+                "ok": False,
+                "error": "cancelled: extension paused",
+                "data": {"dispatched": True, "status": "interrupted", "steps": [{"status": "interrupted"}]},
+            },
+        ])
+        self.patch_post(self.answer({"target": "e1"}))
+        code, out, _err = self.run_jev(
+            "target", "--tab", "7", "--goal", "Find the invoice", "--click"
+        )
+        self.assertEqual(code, 1)
+        report = json.loads(out)
+        self.assertTrue(report["click"]["issued"])
+        self.assertNotIn("reason", report["click"])
+        self.assertFalse(report["ok"])
+        self.assertEqual([item[0] for item in self.actions], ["snapshot", "workflow"])
+
+    def test_a_snapshot_without_an_id_does_not_submit_a_workflow(self):
+        self.enable()
+        self.patch_actions([self.snapshot([self.element("e1", "Invoices")])])
+        self.patch_post(self.answer({"target": "e1"}))
+        code, out, _err = self.run_jev(
+            "target", "--tab", "7", "--goal", "Find the invoice", "--click"
+        )
+        self.assertEqual(code, 1)
+        report = json.loads(out)
+        self.assertTrue(report["billed"])
+        self.assertIn("snapshot id", report["click"]["reason"])
+        self.assertFalse(report["click"]["issued"])
+        self.assertEqual([item[0] for item in self.actions], ["snapshot"])
+        self.assertEqual(len(self.posts), 1)
 
     def test_snapshot_failure_does_not_call_typesafe(self):
         self.enable()
@@ -582,6 +634,199 @@ class JevTests(unittest.TestCase):
             )
             self.assertIsNotNone(reason, confidence)
 
+    def test_a_stopping_step_does_not_submit_the_workflow(self):
+        snap = self.snap_id("e")
+        for label in ("escalate", "observe", "recover"):
+            with self.subTest(label=label):
+                self.posts.clear()
+                self.actions.clear()
+                self.enable()
+                self.patch_actions([
+                    self.snapshot([self.element("e1", "Invoices")], snapshot=snap),
+                ])
+                self.patch_post(self.answer({
+                    "target": ("e1", 0.95),
+                    "page": "search_results",
+                    "step": label,
+                }))
+                code, out, _err = self.run_jev(
+                    "target", "page", "step", "--tab", "7", "--goal", "Find the invoice", "--click"
+                )
+                self.assertEqual(code, 1)
+                report = json.loads(out)
+                self.assertEqual(report["click"]["handoff"], label)
+                self.assertFalse(report["click"]["issued"])
+                self.assertEqual([item[0] for item in self.actions], ["snapshot"])
+                self.assertEqual(len(self.posts), 1)
+                self.assertEqual(
+                    set(self.posts[0][0]["questions"]),
+                    {"target", "page", "step"},
+                )
+                if label == "recover":
+                    self.assertIn("no recovery was run", report["click"]["reason"])
+
+    def test_a_blocking_page_does_not_click_and_other_does(self):
+        snap = self.snap_id("f")
+        self.enable()
+        self.patch_actions([self.snapshot([self.element("e1", "Invoices")], snapshot=snap)])
+        self.patch_post(self.answer({"target": ("e1", 0.95), "page": "login_required"}))
+        code, out, _err = self.run_jev(
+            "target", "page", "--tab", "7", "--goal", "Find the invoice", "--click"
+        )
+        self.assertEqual(code, 1)
+        report = json.loads(out)
+        self.assertEqual(report["click"]["handoff"], "login_required")
+        self.assertEqual([item[0] for item in self.actions], ["snapshot"])
+
+        self.posts.clear()
+        self.actions.clear()
+        observed = {"observe": "snapshot", "snapshot": self.snap_id("1"), "url": "https://example.com/invoices"}
+        self.patch_actions([
+            self.snapshot([self.element("e1", "Invoices")], snapshot=snap),
+            {"ok": True, "data": {"dispatched": True, "observation": observed, "steps": [{"status": "completed"}]}},
+        ])
+        self.patch_post(self.answer({"target": ("e1", 0.95), "page": "other"}))
+        code, out, _err = self.run_jev(
+            "target", "page", "--tab", "7", "--goal", "Find the invoice", "--click"
+        )
+        self.assertEqual(code, 0)
+        report = json.loads(out)
+        self.assertTrue(report["click"]["issued"])
+        self.assertEqual(report["click"]["observation"], observed)
+        self.assertEqual([item[0] for item in self.actions], ["snapshot", "workflow"])
+        self.assertEqual(len(self.posts), 1)
+
+    def write_observation(self, payload):
+        path = os.path.join(self.key_dir.name, "observation.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        return path
+
+    def test_an_observation_file_is_reused_for_one_decision_and_one_workflow(self):
+        self.enable()
+        snap = self.snap_id("2")
+        data = {
+            "title": "Invoices",
+            "url": "https://example.com/invoices",
+            "snapshot": snap,
+            "elements": [self.element("e1", "Invoices")],
+        }
+        path = self.write_observation({"ok": True, "data": data})
+        observed = {"observe": "snapshot", "snapshot": self.snap_id("3"), "elements": []}
+        self.patch_actions([{
+            "ok": True,
+            "data": {"dispatched": True, "observation": observed, "steps": [{"status": "completed"}]},
+        }])
+        self.patch_post(self.answer({"target": ("e1", 0.91)}))
+        code, out, err = self.run_jev(
+            "target", "--tab", "7", "--goal", "Find the invoice",
+            "--observation", path, "--click",
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn(SECRET, out + err)
+        report = json.loads(out)
+        self.assertEqual([item[0] for item in self.actions], ["workflow"])
+        self.assertEqual(self.actions[0][1]["snapshot"], snap)
+        self.assertEqual(self.actions[0][1]["steps"][0]["ref"], "e1")
+        self.assertEqual(self.actions[0][1]["steps"][0]["after"], {"observe": "snapshot"})
+        self.assertNotIn("x", self.actions[0][1]["steps"][0])
+        self.assertEqual(report["click"]["observation"], observed)
+        self.assertEqual(len(self.posts), 1)
+
+    def test_a_bad_observation_is_refused_before_the_model_call(self):
+        self.enable()
+        self.patch_post(self.answer({"target": "e1"}))
+        self.patch_actions([self.snapshot([self.element("e1", "Invoices")])])
+        bad = self.write_observation({
+            "data": {
+                "snapshot": "snap_00000001",
+                "url": "https://example.com/invoices",
+                "elements": [self.element("e1", "Invoices")],
+            },
+        })
+        missing = os.path.join(self.key_dir.name, "missing-observation.json")
+        for path in (bad, missing):
+            with self.subTest(path=path):
+                self.posts.clear()
+                self.actions.clear()
+                err = io.StringIO()
+                with mock.patch("sys.stderr", err):
+                    with self.assertRaises(SystemExit) as caught:
+                        jb.main([
+                            "jb.py", "jev", "target", "--tab", "7", "--goal", "Find the invoice",
+                            "--observation", path, "--click",
+                        ])
+                self.assertEqual(caught.exception.code, 2)
+                self.assertNotIn(SECRET, err.getvalue())
+                self.assertEqual(self.posts, [])
+                self.assertEqual(self.actions, [])
+
+    def test_a_reused_empty_observation_does_not_call_the_model(self):
+        os.environ["JUNO_JEV"] = "1"
+        snap = self.snap_id("4")
+        path = self.write_observation({
+            "snapshot": snap,
+            "url": "https://example.com/invoices",
+            "elements": [],
+        })
+        self.patch_post(self.answer({"target": "e1"}))
+        code, out, _err = self.run_jev(
+            "target", "--tab", "3", "--goal", "Find it", "--observation", path, "--click"
+        )
+        self.assertEqual(code, 1)
+        report = json.loads(out)
+        self.assertFalse(report["billed"])
+        self.assertFalse(report["click"]["issued"])
+        self.assertEqual(self.posts, [])
+        self.assertEqual(self.actions, [])
+
+    def test_the_operator_client_is_used_when_the_operator_is_on(self):
+        self.enable()
+        self._force_operator()
+        snap = self.snap_id("5")
+        self.patch_actions([self.snapshot([self.element("e1", "Invoices")], snapshot=snap)])
+        self.patch_post(self.answer({"target": "e1"}))
+        calls = []
+        op = jb.operator_mod()
+
+        def systemone(body, timeout=30):
+            calls.append(json.dumps(body))
+            return self.answer({"target": "e1"})
+
+        with mock.patch.object(op, "systemone", side_effect=systemone):
+            code, out, err = self.run_jev("target", "--tab", "1", "--goal", "Find it")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(SECRET, calls[0] + out + err)
+        self.assertEqual(self.posts, [])
+        self.assertIsNone(json.loads(out)["click"])
+
+    def test_a_missing_operator_key_exits_before_a_click(self):
+        os.environ["JUNO_JEV"] = "1"
+        self._force_operator()
+        snap = self.snap_id("6")
+        self.patch_actions([self.snapshot([self.element("e1", "Invoices")], snapshot=snap)])
+        self.patch_post(self.answer({"target": "e1"}))
+        op = jb.operator_mod()
+        calls = []
+
+        def systemone(body, timeout=30):
+            calls.append(body)
+            raise op.OperatorError("no TypeSafe API key — set TYPESAFE_API_KEY")
+
+        with mock.patch.object(op, "systemone", side_effect=systemone):
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                with self.assertRaises(SystemExit) as caught:
+                    jb.main([
+                        "jb.py", "jev", "target", "--tab", "1", "--goal", "Find it", "--click",
+                    ])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("TYPESAFE_API_KEY", err.getvalue())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([item[0] for item in self.actions], ["snapshot"])
+        self.assertEqual(self.posts, [])
+
     def test_send_does_not_call_jev_when_it_is_enabled(self):
         self.enable()
         os.environ["JUNO_BRIDGE_PSK"] = "correct-horse-battery"
@@ -613,3 +858,146 @@ class JevTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue()), result)
         self.assertEqual(self.posts, [])
+
+    def test_the_typesafe_session_reuses_one_verified_connection(self):
+        instances = []
+
+        class FakeResponse:
+            def __init__(self, status, body, headers=None):
+                self.status = status
+                self.headers = headers or {}
+                self._body = body
+
+            def read(self):
+                return self._body
+
+        class FakeConn:
+            def __init__(self, host, port=None, timeout=None, context=None):
+                instances.append(self)
+                self.host = host
+                self.port = port
+                self.timeout = timeout
+                self.context = context
+                self.requests = []
+                self.closed = False
+
+            def request(self, method, path, body=None, headers=None):
+                self.requests.append((method, path, headers))
+
+            def getresponse(self):
+                return FakeResponse(200, b'{"answers":{},"usage":{}}')
+
+            def close(self):
+                self.closed = True
+
+        with mock.patch.object(self.jev.http.client, "HTTPSConnection", FakeConn):
+            session = self.jev.TypeSafeSession()
+            first = session.post({"n": 1}, SECRET)
+            second = session.post({"n": 2}, SECRET)
+            session.close()
+        self.assertEqual(first["answers"], {})
+        self.assertEqual(second["answers"], {})
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(len(instances[0].requests), 2)
+        self.assertEqual(instances[0].host, "api.typesafe.ai")
+        self.assertTrue(instances[0].context.check_hostname)
+        self.assertEqual(instances[0].context.verify_mode, self.jev.ssl.CERT_REQUIRED)
+        self.assertTrue(instances[0].closed)
+        for _method, path, headers in instances[0].requests:
+            self.assertEqual(path, "/v1/systemone")
+            self.assertEqual(headers["Authorization"], "Bearer " + SECRET)
+
+    def test_the_typesafe_session_refuses_a_redirect_and_retries_429_once(self):
+        class FakeResponse:
+            def __init__(self, status, body, headers=None):
+                self.status = status
+                self.headers = headers or {}
+                self._body = body
+
+            def read(self):
+                return self._body
+
+        created = []
+
+        class RedirectConn:
+            def __init__(self, host, port=None, timeout=None, context=None):
+                created.append(self)
+                self.requests = 0
+
+            def request(self, method, path, body=None, headers=None):
+                self.requests += 1
+
+            def getresponse(self):
+                return FakeResponse(302, b"", {"Location": "https://evil.example/steal"})
+
+            def close(self):
+                return None
+
+        with mock.patch.object(self.jev.http.client, "HTTPSConnection", RedirectConn):
+            session = self.jev.TypeSafeSession()
+            with self.assertRaises(self.jev.JevError) as caught:
+                session.post({"n": 1}, SECRET)
+            session.close()
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].requests, 1)
+        self.assertNotIn("evil.example", str(caught.exception))
+        self.assertIn("302", str(caught.exception))
+
+        instances = []
+
+        class RetryConn:
+            def __init__(self, host, port=None, timeout=None, context=None):
+                instances.append(self)
+                self.n = 0
+
+            def request(self, method, path, body=None, headers=None):
+                self.n += 1
+
+            def getresponse(self):
+                if self.n == 1:
+                    return FakeResponse(429, ("slow " + SECRET).encode("utf-8"), {"Retry-After": "9"})
+                return FakeResponse(200, b'{"answers":{}}')
+
+            def close(self):
+                return None
+
+        with mock.patch.object(self.jev.http.client, "HTTPSConnection", RetryConn):
+            with mock.patch.object(self.jev.time, "sleep") as sleep:
+                session = self.jev.TypeSafeSession()
+                parsed = session.post({"n": 1}, SECRET)
+                session.close()
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].n, 2)
+        sleep.assert_called_once_with(2)
+        self.assertEqual(parsed["answers"], {})
+        self.assertNotIn(SECRET, json.dumps(parsed))
+
+    def test_a_dropped_typesafe_connection_is_not_posted_again(self):
+        created = []
+
+        class ResetConn:
+            def __init__(self, host, port=None, timeout=None, context=None):
+                created.append(self)
+                self.context = context
+                self.n = 0
+
+            def request(self, method, path, body=None, headers=None):
+                self.n += 1
+                raise OSError("reset " + SECRET)
+
+            def getresponse(self):
+                raise AssertionError("response after a dropped connection")
+
+            def close(self):
+                return None
+
+        with mock.patch.object(self.jev.http.client, "HTTPSConnection", ResetConn):
+            session = self.jev.TypeSafeSession()
+            with self.assertRaises(self.jev.JevError) as caught:
+                session.post({"n": 1}, SECRET)
+            session.close()
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].n, 1)
+        self.assertEqual(created[0].context.verify_mode, self.jev.ssl.CERT_REQUIRED)
+        self.assertNotIn(SECRET, str(caught.exception))
+        self.assertIn("[redacted]", str(caught.exception))

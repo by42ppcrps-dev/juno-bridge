@@ -8,7 +8,7 @@ attach to the browser profile you use every day.
 The operator sends commands (navigate, snapshot, click, type, …). The relay
 pushes them to the extension over a WebSocket, and the extension runs them
 with `chrome.debugger`. Commands and results pass through the relay. This
-tree is extension v1.4.3.
+tree is extension v1.4.4.
 
 ## What the safeguards actually do
 
@@ -79,7 +79,7 @@ machines. `jb.py` sends it in an `Authorization: Bearer` header over HTTPS.
 | `extension/` | Your Chrome (load unpacked) | WebSocket to the relay, HTTP polling fallback, commands via `chrome.debugger`, side panel (pause, connection, activity log), Options (pairing, allowlist) |
 | `relay/worker.js` | Cloudflare Worker + Durable Object (unlisted) | Admin API, device registration, per-device queues, result ownership |
 | `relay/wrangler.jsonc` | Your machine | Deploy config. `ADMIN_PSK_SHA256` is required |
-| `driver/jb.py`, `driver/juno_operator.py` | Operator's machine | CLI plus a user-scoped operator process on a private Unix socket. The process keeps one relay client. `JUNO_OPERATOR=0` uses one curl subprocess per request. Optional `jev` stays off until `JUNO_JEV=1`; each enabled call is billed by TypeSafe |
+| `driver/jb.py`, `driver/juno_operator.py` | Operator's machine | CLI plus a user-scoped operator process on a private Unix socket. The process keeps one relay client and, when Jev runs, a separate TypeSafe client. `JUNO_OPERATOR=0` uses one curl subprocess per relay request. Optional `jev` stays off until `JUNO_JEV=1`; each enabled call is billed by TypeSafe |
 
 ## Fixes in 1.3.1
 
@@ -147,6 +147,14 @@ python3 driver/jb.py send workflow '{"tabId":123456,"snapshot":"snap_0123456789a
 - The extension binding has to be present every time a snapshot id is used.
   A page that still holds the id is not accepted when the binding is gone.
 
+## Fixes in 1.4.4
+
+- An optional `jb.py jev --click` reuses an observation or takes one snapshot,
+  makes one TypeSafe request, and submits a workflow bound to that snapshot
+  id and ref. The workflow returns the next observation. `escalate`,
+  `observe`, and `recover` do not act, and neither do `login_required`,
+  `validation_error`, or `unexpected`. `jb.py send` does not call Jev.
+
 The result status is `completed`, `cancelled`, `interrupted`, `uncertain`,
 or `unobserved`. `uncertain` means some input may already have reached
 Chrome. A timed-out command is not sent again. `jb.py` sends a `request_id`
@@ -155,11 +163,12 @@ same id; the relay returns the existing command instead of starting another
 one. Two `send` calls are two ids and two actions.
 
 The normal path is a user-scoped operator process on a private Unix socket.
-It keeps one HTTP client. Certificate verification stays on, and redirects
-are not followed. `JUNO_OPERATOR=0` or `JUNO_BRIDGE_HTTP=curl` is the curl
-compatibility path: one curl subprocess per request. `jb.py jev` is unchanged.
-Local native messaging, and calling Jev from the operator, are not in this
-release.
+It keeps one HTTP client for the relay and a separate client for TypeSafe.
+Certificate verification stays on, and redirects are not followed.
+`JUNO_OPERATOR=0` or `JUNO_BRIDGE_HTTP=curl` is the curl compatibility path:
+one curl subprocess per relay request, and `jb.py jev` reads the TypeSafe key
+in that command. `jb.py send` does not call Jev. Local native messaging is
+not in this release.
 
 ## Breaking changes in 1.3.0
 
@@ -308,26 +317,30 @@ relying on them. Set `TYPESAFE_DEFAULT_MODEL=jev-1.13.0` to pin that model
 id instead of the alias.
 
 The key is read from `TYPESAFE_API_KEY`, or from
-`~/.config/juno-bridge/typesafe-key` when that file is mode `0600`. It stays
-in the operator process. The extension and the relay have no TypeSafe client.
+`~/.config/juno-bridge/typesafe-key` when that file is mode `0600`. On the
+normal path the operator process reads it and does not put it on the Unix
+socket. `JUNO_OPERATOR=0` reads it in the `jb.py jev` command. The extension
+and the relay have no TypeSafe client.
 `TYPESAFE_BASE_URL` overrides the API origin; the default is
 `https://api.typesafe.ai`. The command removes the key from its own output
 if a response echoes it.
 
 Taking the snapshot is an ordinary relay command, so that page result still
-passes through the relay. The TypeSafe request is a separate call from this
-machine. Jev is given the page title, the URL, and each element's `ref`,
-tag, text, href, input type, disabled state, and whether it is in view.
-Coordinates are resolved locally after Jev chooses a `ref`. Jev takes text
-and JSON. A screenshot, a canvas control, or a meaning that is absent from
-the snapshot still needs another observation. Heuristic snapshot redaction
-still applies, and it still does not guarantee that every secret is removed:
-send a page only if you are willing to transmit its snapshot text to TypeSafe.
+passes through the relay. `--observation` can supply that result instead, and
+then this command does not take another snapshot. The TypeSafe request is a
+separate call. On the normal path the operator sends it with the TypeSafe
+client it keeps open. Jev is given the page title, the URL, and each
+element's `ref`, tag, text, href, input type, disabled state, and whether it
+is in view. Coordinates are not sent to Jev. Jev takes text and JSON. A
+screenshot, a canvas control, or a meaning that is absent from the snapshot
+still needs another observation. Heuristic snapshot redaction still applies,
+and it still does not guarantee that every secret is removed: send a page
+only if you are willing to transmit its snapshot text to TypeSafe.
 
 ```bash
 JUNO_JEV=1 python3 driver/jb.py jev target --tab 123456 --goal "Find the invoice download page"
 JUNO_JEV=1 python3 driver/jb.py jev target page --tab 123456 --goal "Find the invoice download page"
-JUNO_JEV=1 python3 driver/jb.py jev target --tab 123456 --goal "Find the invoice download page" --click
+JUNO_JEV=1 python3 driver/jb.py jev target --tab 123456 --goal "Find the invoice download page" --observation snapshot.json --click
 ```
 
 The goal is required and limited to 500 characters. Name one or more of
@@ -339,9 +352,9 @@ stops, so a completed request is not sent a second time.
 
 | Decision | What Jev chooses | What the code does with it |
 |---|---|---|
-| `target` | One snapshot ref (`e1`, `e2`, …) or `none` | Resolves the ref locally. With `--click`, rechecks the page and may click |
-| `page` | `search_results`, `login_required`, `validation_error`, `unexpected`, or `other` | Prints the label |
-| `step` | `observe`, `recover`, or `escalate` | Prints the label. `recover` does not name or run a recovery |
+| `target` | One snapshot ref (`e1`, `e2`, …) or `none` | With `--click`, submits that ref on this snapshot. The extension checks the saved node |
+| `page` | `search_results`, `login_required`, `validation_error`, `unexpected`, or `other` | Prints the label. `login_required`, `validation_error`, and `unexpected` block a click |
+| `step` | `observe`, `recover`, or `escalate` | Prints the label. With `--click`, each of these blocks the action. `recover` does not name or run a recovery |
 
 A snapshot lists at most 300 elements. The target question keeps at most
 254, in-view elements first, and always includes `none`. `omitted_elements`
@@ -356,18 +369,25 @@ about that same empty snapshot does call TypeSafe.
 
 `--click` is off unless you pass it, and it is valid only with `target`. A
 decision-only command prints the choice and exits 0, including when the
-choice is `none`. `--click` takes a fresh snapshot, requires the same URL,
-and requires exactly one element with the same tag, text, input type, href,
-and disabled state. It then sends a normal `click` at that element's fresh
-coordinates, so pause, the 30-second command timeout, the site allowlist,
-and `tabId` still apply. The click is refused when the choice is `none`,
-the confidence is missing or below `JUNO_JEV_MIN_CONFIDENCE` (default
-`0.8`), the element is disabled or outside the viewport, the page changed,
-or the fresh snapshot does not identify one matching element with
-coordinates. Refusing the click does not undo the charge for the request
-that already ran. `0.8` is a local starting threshold. Confidence describes
-how concentrated the model's probabilities are. It is not proof that the
-action is correct or permitted.
+choice is `none`. `--observation <file>` reuses a snapshot you already have.
+Without it, the command takes one snapshot. A file that lacks a `snap_` id,
+a URL, and an element list is refused before any model call.
+
+With `--click`, one workflow is submitted for that snapshot id and the chosen
+ref. The step sets `after.observe` to `snapshot`, so the same result carries
+the next observation. The extension checks the saved node before input. A
+stale snapshot is refused, and the command does not send a coordinate click
+or a second model call. `step` of `escalate`, `observe`, or `recover` does
+not act. `recover` still does not name or run a recovery. A page label of
+`login_required`, `validation_error`, or `unexpected` does not act.
+`search_results` and `other` do not block the click. The click is also
+refused when the choice is `none`, the confidence is missing or below
+`JUNO_JEV_MIN_CONFIDENCE` (default `0.8`), the element is disabled or outside
+the viewport, or the observation has no snapshot id. Pause, the 30-second
+command timeout, the site allowlist, and `tabId` still apply. Refusing the
+click does not undo the charge for the request that already ran. `0.8` is a
+local starting threshold. Confidence describes how concentrated the model's
+probabilities are. It is not proof that the action is correct or permitted.
 
 Juno has no measured Jev-versus-current-agent result. Compare both on the
 same browser tasks: successful completion, elapsed time, wrong actions, and

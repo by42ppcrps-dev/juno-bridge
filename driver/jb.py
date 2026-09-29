@@ -15,9 +15,12 @@ Setup:
                        # e.g. jb.py send navigate '{"url":"https://example.com"}'
                        # waits up to 60s for the result and prints it
                        # exits 1 if that result is a failure
-  jb.py jev target|page|step ... --tab <id> --goal <text> [--device name] [--click]
+  jb.py jev target|page|step ... --tab <id> --goal <text> [--device name]
+                       [--observation <file>] [--click]
                        # optional, off unless JUNO_JEV=1. A billed TypeSafe
                        # call. Does nothing to the browser unless --click.
+                       # --click submits that snapshot's ref. --observation
+                       # reuses a snapshot instead of taking one.
 
 Actions: ping, tabs, navigate, screenshot, snapshot, text, click, type, key,
          scroll, close, eval, workflow
@@ -26,7 +29,8 @@ Actions: ping, tabs, navigate, screenshot, snapshot, text, click, type, key,
   jb.py operator stop
 
 Normal commands go through that process so the HTTP client stays alive.
-JUNO_OPERATOR=0 uses one curl subprocess per request instead.
+An enabled Jev call uses a separate client in the same process.
+JUNO_OPERATOR=0 uses one curl subprocess per relay request instead.
 
 Security notes:
   - The passphrase is a bearer secret. The driver sends it only in an
@@ -376,10 +380,16 @@ def cmd_jev(args):
     except ValueError as e:
         die(str(e), 2)
 
-    snap = run_action("snapshot", {"tabId": opts["tab"]}, opts["device"])
-    if snap.get("ok") is not True:
-        return finish_result(snap)
-    data = snap.get("data") if isinstance(snap.get("data"), dict) else {}
+    if opts["observation"]:
+        try:
+            data = mod.read_observation(opts["observation"])
+        except ValueError as e:
+            die(str(e), 2)
+    else:
+        snap = run_action("snapshot", {"tabId": opts["tab"]}, opts["device"])
+        if snap.get("ok") is not True:
+            return finish_result(snap)
+        data = snap.get("data") if isinstance(snap.get("data"), dict) else {}
     prepared = mod.prepare(data, opts["kinds"], opts["goal"])
     if prepared["skip_model"]:
         report = mod.local_none(prepared, opts["goal"])
@@ -391,15 +401,22 @@ def cmd_jev(args):
             }
         return finish_result(report)
 
+    key = ""
     try:
-        key = mod.api_key()
-    except ValueError as e:
-        die(str(e), 2)
-    try:
-        response = mod.post_systemone(prepared["body"], key)
+        if operator_enabled():
+            response = operator_mod().systemone(prepared["body"])
+        else:
+            key = mod.api_key()
+            response = mod.post_systemone(prepared["body"], key)
         report = mod.interpret(response, prepared, opts["goal"])
+    except ValueError as e:
+        die(mod.scrub(str(e), key), 2)
     except mod.JevError as e:
         die(mod.scrub(str(e), key))
+    except operator_mod().OperatorError as e:
+        text = mod.scrub(str(e), key)
+        code = 2 if "TYPESAFE_API_KEY" in text or "no TypeSafe API key" in text else 1
+        die(text, code)
 
     if not opts["click"]:
         report["click"] = None
@@ -412,23 +429,41 @@ def cmd_jev(args):
         report["click"] = {"issued": False, "reason": refusal}
         return finish_jev(report, key)
 
-    fresh = run_action("snapshot", {"tabId": opts["tab"]}, opts["device"])
-    if fresh.get("ok") is not True:
+    handoff, why = mod.mutation_block(report.get("decisions"))
+    if handoff:
         report["ok"] = False
-        report["click"] = {"issued": False, "reason": "fresh snapshot failed", "result": fresh}
+        report["click"] = {"issued": False, "reason": why, "handoff": handoff}
         return finish_jev(report, key)
-    fresh_data = fresh.get("data") if isinstance(fresh.get("data"), dict) else {}
-    match, why = mod.revalidate(data.get("url") or "", target.get("element") or {}, fresh_data)
-    if match is None:
+
+    snapshot_id = data.get("snapshot") if isinstance(data, dict) else None
+    if not isinstance(snapshot_id, str) or mod.SNAPSHOT_ID_RE.fullmatch(snapshot_id) is None:
         report["ok"] = False
-        report["click"] = {"issued": False, "reason": why}
+        report["click"] = {
+            "issued": False,
+            "reason": "the observation has no snapshot id, so no action was issued",
+        }
         return finish_jev(report, key)
-    clicked = run_action("click", {
-        "tabId": opts["tab"],
-        "x": match["x"],
-        "y": match["y"],
-    }, opts["device"])
-    report["click"] = {"issued": True, "ref": match.get("ref"), "result": clicked}
+
+    element = target.get("element") if isinstance(target.get("element"), dict) else {}
+    clicked = run_action(
+        "workflow",
+        mod.bound_click(opts["tab"], snapshot_id, element),
+        opts["device"],
+    )
+    clicked_data = clicked.get("data") if isinstance(clicked.get("data"), dict) else {}
+    issued = clicked.get("ok") is True or clicked_data.get("dispatched") is True
+    click = {
+        "issued": issued,
+        "submitted": True,
+        "ref": element.get("ref"),
+        "snapshot": snapshot_id,
+        "result": clicked,
+    }
+    if isinstance(clicked_data.get("observation"), dict):
+        click["observation"] = clicked_data["observation"]
+    if not issued:
+        click["reason"] = clicked.get("error") or "the action was not issued"
+    report["click"] = click
     report["ok"] = clicked.get("ok") is True
     return finish_jev(report, key)
 
