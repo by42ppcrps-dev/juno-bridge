@@ -108,6 +108,14 @@ function debuggerUse(env) {
   };
 }
 
+function dropHold(env) {
+  vm.runInContext(
+    "globalThis.__junoHold = undefined; delete globalThis.__junoHold;",
+    env.page.realm,
+  );
+  assert.equal(vm.runInContext("globalThis.__junoHold == null", env.page.realm), true);
+}
+
 // Replaces the 30s command timer with a callback the test fires itself.
 function captureCommandTimeout(env) {
   const realSet = env.sandbox.setTimeout;
@@ -1715,7 +1723,7 @@ describe("extension", { concurrency: 1 }, () => {
     const snapshot = await takeSnapshot(env);
     assert.equal(invoices.getAttribute("data-juno-snap"), snapshot);
     assert.equal(invoices.getAttribute("data-juno-ref"), "e1");
-    delete env.page.realm.__junoHold;
+    dropHold(env);
     env.page.setNodes([
       labeledButton("Delete account", { x: 10, y: 20, width: 80, height: 20 }),
       invoices,
@@ -1740,7 +1748,7 @@ describe("extension", { concurrency: 1 }, () => {
     env.page.button.removeAttribute("data-juno-snap");
     env.page.button.removeAttribute("data-juno-ref");
     env.page.button.removeAttribute("data-juno-doc");
-    delete env.page.realm.__junoHold;
+    dropHold(env);
     const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
     const body = resultFor(env, cmd.id);
     assert.equal(body.ok, false, JSON.stringify(body));
@@ -1858,7 +1866,7 @@ describe("extension", { concurrency: 1 }, () => {
   test("element readiness restores a cleared snapshot before the click", async () => {
     const env = bootPage();
     const snapshot = await takeSnapshot(env);
-    delete env.page.realm.__junoHold;
+    dropHold(env);
     const cmd = command({
       action: "click",
       issued_at: env.now(),
