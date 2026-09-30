@@ -1,6 +1,7 @@
 """Operator checks. They do not contact a deployed relay."""
 
 import importlib.util
+import hashlib
 import json
 import os
 import socket
@@ -82,12 +83,20 @@ class OperatorTests(unittest.TestCase):
             "JUNO_BRIDGE_HTTP": os.environ.get("JUNO_BRIDGE_HTTP"),
             "JUNO_BRIDGE_PSK": os.environ.get("JUNO_BRIDGE_PSK"),
             "JUNO_OPERATOR_CHILD": os.environ.get("JUNO_OPERATOR_CHILD"),
+            "JUNO_JEV": os.environ.get("JUNO_JEV"),
+            "JUNO_JEV_CONFIG_DIR": os.environ.get("JUNO_JEV_CONFIG_DIR"),
+            "TYPESAFE_API_KEY": os.environ.get("TYPESAFE_API_KEY"),
+            "TYPESAFE_BASE_URL": os.environ.get("TYPESAFE_BASE_URL"),
         }
         os.environ["JUNO_OPERATOR_DIR"] = str(self.tmp)
         os.environ["JUNO_OPERATOR_SOCK"] = self.sock
         os.environ["JUNO_OPERATOR"] = "1"
         os.environ.pop("JUNO_BRIDGE_HTTP", None)
         os.environ.pop("JUNO_OPERATOR_CHILD", None)
+        os.environ.pop("JUNO_JEV", None)
+        os.environ.pop("JUNO_JEV_CONFIG_DIR", None)
+        os.environ.pop("TYPESAFE_API_KEY", None)
+        os.environ.pop("TYPESAFE_BASE_URL", None)
         os.environ["JUNO_BRIDGE_PSK"] = PSK
         (self.tmp / "config.json").write_text(
             json.dumps({"relay_url": "https://relay.example"}),
@@ -115,10 +124,12 @@ class OperatorTests(unittest.TestCase):
             child.unlink()
         self.tmp.rmdir()
 
-    def start(self, client):
+    def start(self, client, typesafe=None):
         self.stop_flag = threading.Event()
         ready = threading.Event()
         kwargs = {"client": client, "ready": ready, "stop": self.stop_flag}
+        if typesafe is not None:
+            kwargs["typesafe"] = typesafe
         self.thread = threading.Thread(
             target=self.op.serve,
             kwargs=kwargs,
@@ -305,11 +316,14 @@ class OperatorTests(unittest.TestCase):
         if not self.op.curl_library_path():
             self.skipTest("libcurl not installed")
         spawned = []
+        processes = []
         real_popen = self.op.subprocess.Popen
 
         def popen(args, **kwargs):
             spawned.append(args)
-            return real_popen(args, **kwargs)
+            process = real_popen(args, **kwargs)
+            processes.append(process)
+            return process
 
         try:
             with mock.patch.object(self.op.subprocess, "Popen", side_effect=popen):
@@ -321,6 +335,7 @@ class OperatorTests(unittest.TestCase):
             self.assertIn("operator", spawned[0])
             self.op.stop()
             self.assertFalse(self.op.ping_ok())
+            processes[0].wait(timeout=2)
         finally:
             try:
                 self.op.stop()
@@ -330,6 +345,267 @@ class OperatorTests(unittest.TestCase):
     def _bodies_with(self, client, marker):
         needle = marker.encode("utf-8")
         return [call for call in client.calls if call[3] and needle in call[3]]
+
+    def test_jev_is_live_opt_in_and_reuses_a_client_with_owner_key_rotation(self):
+        jev = self.op.jev_mod()
+        config = jev.config_mod()
+        secret = "typesafe-owner-key-one"
+        rotated = "typesafe-owner-key-two"
+        instances = []
+
+        class FakeTypeSafe:
+            def __init__(self):
+                self.posts = []
+                self.closed = False
+                instances.append(self)
+
+            def post(self, body, key, timeout=30):
+                self.posts.append((body, key, timeout))
+                return {"answers": {"target": {"choice": "none"}}}
+
+            def close(self):
+                self.closed = True
+
+        client = FakeClient()
+        seen = []
+        real = self.op.transact
+
+        def wrapped(message, timeout=60):
+            seen.append(json.dumps(message))
+            return real(message, timeout)
+
+        with mock.patch.object(jev, "TypeSafeSession", FakeTypeSafe):
+            token = self.start(client)
+            with mock.patch.object(self.op, "transact", side_effect=wrapped):
+                config.write_api_key(secret)
+                with self.assertRaisesRegex(self.op.OperatorError, "disabled"):
+                    self.op.systemone({"questions": {"target": {}}})
+                self.assertEqual(instances, [], "disabled Jev initialized a provider client")
+                config.set_enabled(True)
+                first = self.op.systemone({"questions": {"target": {}}})
+                second = self.op.systemone({"questions": {"page": {}}})
+                config.write_api_key(rotated)
+                third = self.op.systemone({"questions": {"rotated": {}}})
+                config.set_enabled(False)
+                with self.assertRaisesRegex(self.op.OperatorError, "disabled"):
+                    self.op.systemone({"questions": {"off": {}}})
+                # A per-call environment opt-in works without restarting the daemon.
+                os.environ["JUNO_JEV"] = " 1 "
+                fourth = self.op.systemone({"questions": {"override": {}}})
+                os.environ["JUNO_JEV"] = "0"
+                config.set_enabled(True)
+                with self.assertRaisesRegex(self.op.OperatorError, "disabled"):
+                    self.op.systemone({"questions": {"forced_off": {}}})
+                self.op.stop()
+            self.thread.join(2)
+            self.assertFalse(self.thread.is_alive())
+            self.thread = None
+        self.assertEqual([first, second, third, fourth], [first] * 4)
+        self.assertEqual(len(instances), 1)
+        self.assertEqual([item[1] for item in instances[0].posts], [secret, secret, rotated, rotated])
+        self.assertTrue(instances[0].closed)
+        self.assertEqual(client.calls, [])
+        for message in seen:
+            self.assertNotIn(secret, message)
+            self.assertNotIn(rotated, message)
+            self.assertNotIn('"authorization"', message)
+            self.assertNotIn('"api_key"', message)
+        paid_messages = [json.loads(message) for message in seen
+                         if json.loads(message).get("op") == "systemone_byok_v1"]
+        self.assertEqual(len(paid_messages), 7)
+        self.assertEqual([item["key_fingerprint"] for item in paid_messages], [
+            hashlib.sha256(secret.encode()).hexdigest(),
+            hashlib.sha256(secret.encode()).hexdigest(),
+            hashlib.sha256(secret.encode()).hexdigest(),
+            hashlib.sha256(rotated.encode()).hexdigest(),
+            hashlib.sha256(rotated.encode()).hexdigest(),
+            hashlib.sha256(rotated.encode()).hexdigest(),
+            hashlib.sha256(rotated.encode()).hexdigest(),
+        ])
+        self.assertTrue(all(item["typesafe_base_url"] == "https://api.typesafe.ai:443"
+                            for item in paid_messages))
+
+    def test_jev_rejects_a_changed_key_before_initializing_or_billing(self):
+        jev = self.op.jev_mod()
+        config = jev.config_mod()
+        owner_key, client_key = "typesafe-daemon-startup-key", "typesafe-new-cli-key"
+        config.write_api_key(owner_key)
+        config.set_enabled(True)
+        session = mock.Mock()
+        getter = mock.Mock(return_value=session)
+        result = self.op.handle_message({
+            "op": "systemone_byok_v1", "body": {},
+            "key_fingerprint": hashlib.sha256(client_key.encode()).hexdigest(),
+            "typesafe_base_url": "https://api.typesafe.ai:443",
+        }, FakeClient(), getter)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], self.op.TYPESAFE_CONTEXT_ERROR)
+        self.assertNotIn(owner_key, json.dumps(result))
+        self.assertNotIn(client_key, json.dumps(result))
+        getter.assert_not_called()
+        session.post.assert_not_called()
+
+    def test_jev_rejects_a_changed_endpoint_before_initializing_or_billing(self):
+        jev = self.op.jev_mod()
+        config = jev.config_mod()
+        key = "typesafe-endpoint-change-key"
+        config.write_api_key(key)
+        config.set_enabled(True)
+        session = mock.Mock()
+        getter = mock.Mock(return_value=session)
+        result = self.op.handle_message({
+            "op": "systemone_byok_v1", "body": {},
+            "key_fingerprint": hashlib.sha256(key.encode()).hexdigest(),
+            "typesafe_base_url": "https://local-stub.example:8443/test",
+        }, FakeClient(), getter)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], self.op.TYPESAFE_CONTEXT_ERROR)
+        self.assertNotIn(key, json.dumps(result))
+        self.assertNotIn("local-stub.example", json.dumps(result))
+        getter.assert_not_called()
+        session.post.assert_not_called()
+
+    def test_jev_versioned_calls_require_valid_configuration_metadata(self):
+        jev = self.op.jev_mod()
+        config = jev.config_mod()
+        config.write_api_key("typesafe-metadata-validation-key")
+        config.set_enabled(True)
+        getter = mock.Mock(side_effect=AssertionError("initialized TypeSafe"))
+        valid = {
+            "op": "systemone_byok_v1", "body": {},
+            "key_fingerprint": hashlib.sha256(config.api_key().encode()).hexdigest(),
+            "typesafe_base_url": "https://api.typesafe.ai:443",
+        }
+        cases = [{"op": "systemone_byok_v1", "body": {}},
+                 dict(valid, key_fingerprint="bad"),
+                 dict(valid, key_fingerprint=12),
+                 dict(valid, typesafe_base_url=12),
+                 dict(valid, typesafe_base_url="https://caller:secret@api.typesafe.ai")]
+        for message in cases:
+            with self.subTest(message=message):
+                result = self.op.handle_message(message, FakeClient(), getter)
+                self.assertFalse(result["ok"])
+                self.assertIn("no API call was made", result["error"])
+                self.assertNotIn("secret", result["error"])
+        getter.assert_not_called()
+
+    def test_jev_public_helper_rejects_older_daemons_without_replaying(self):
+        jev = self.op.jev_mod()
+        key = "typesafe-old-daemon-key"
+        jev.config_mod().write_api_key(key)
+        with mock.patch.object(self.op, "ensure"), \
+                mock.patch.object(self.op, "read_private", return_value="socket-token"), \
+                mock.patch.object(self.op, "transact", return_value={"ok": False, "error": "bad path"}) as rpc:
+            with self.assertRaisesRegex(self.op.OperatorError, "configuration changed.*No API call was made"):
+                self.op.systemone({"questions": {}})
+        rpc.assert_called_once()
+        message = rpc.call_args.args[0]
+        self.assertEqual(message["op"], "systemone_byok_v1")
+        self.assertEqual(message["key_fingerprint"], hashlib.sha256(key.encode()).hexdigest())
+        self.assertEqual(message["typesafe_base_url"], "https://api.typesafe.ai:443")
+        self.assertNotIn(key, json.dumps(message))
+
+    def test_jev_missing_key_and_socket_credentials_never_initialize_a_client(self):
+        jev = self.op.jev_mod()
+        jev.config_mod().set_enabled(True)
+        getter = mock.Mock(side_effect=AssertionError("initialized TypeSafe"))
+        missing = self.op.handle_message({"op": "systemone", "body": {}}, FakeClient(), getter)
+        self.assertFalse(missing["ok"])
+        self.assertIn("no TypeSafe API key", missing["error"])
+        for name in ("key", "api_key", "authorization"):
+            denied = self.op.handle_message({"op": "systemone", "body": {}, name: "caller-key"}, FakeClient(), getter)
+            self.assertFalse(denied["ok"])
+            self.assertIn("stays in the operator", denied["error"])
+        invalid = self.op.handle_message({"op": "systemone", "body": {}, "jev_enabled": "true"}, FakeClient(), getter)
+        self.assertFalse(invalid["ok"])
+        self.assertIn("boolean", invalid["error"])
+        getter.assert_not_called()
+
+    def test_jev_uncertain_transport_outcomes_are_not_retried_and_key_is_scrubbed(self):
+        jev = self.op.jev_mod()
+        config = jev.config_mod()
+        secret = "typesafe-failed-paid-request-key"
+        config.write_api_key(secret)
+        config.set_enabled(True)
+        session = mock.Mock()
+        session.post.side_effect = TimeoutError("uncertain outcome " + secret)
+        result = self.op.handle_message({"op": "systemone", "body": {}}, FakeClient(), lambda: session)
+        self.assertFalse(result["ok"])
+        self.assertNotIn(secret, result["error"])
+        self.assertIn("[redacted]", result["error"])
+        session.post.assert_called_once_with({}, secret, 30)
+
+    def test_jev_scrubs_echoed_keys_at_the_operator_socket_boundary(self):
+        jev = self.op.jev_mod()
+        config = jev.config_mod()
+        secret = "typesafe-echoed-owner-key"
+        config.write_api_key(secret)
+        config.set_enabled(True)
+        session = mock.Mock()
+        session.post.return_value = {
+            "answers": {"target": {"reason": "echo " + secret}},
+            "nested": [{secret: [secret, "ordinary text"]}],
+        }
+        token = self.start(FakeClient(), typesafe=session)
+        reply = self.op.transact({"token": token, "op": "systemone", "body": {}})
+        self.assertTrue(reply["ok"])
+        self.assertNotIn(secret, json.dumps(reply))
+        self.assertEqual(reply["response"]["answers"]["target"]["reason"], "echo [redacted]")
+        self.assertEqual(reply["response"]["nested"], [{"[redacted]": ["[redacted]", "ordinary text"]}])
+        self.assertEqual(session.post.return_value["nested"][0][secret][0], secret)
+
+    def test_a_second_operator_cannot_rotate_the_live_operators_token(self):
+        token = self.start(FakeClient())
+        ready = threading.Event()
+        loser = threading.Thread(target=self.op.serve, kwargs={"client": FakeClient(), "ready": ready}, daemon=True)
+        loser.start()
+        self.assertTrue(ready.wait(1))
+        loser.join(1)
+        self.assertFalse(loser.is_alive())
+        self.assertEqual(self.op.read_private(self.op.token_path()), token)
+        self.assertTrue(self.op.ping_ok())
+        self.assertEqual(stat.S_IMODE(self.op.lock_path().stat().st_mode), 0o600)
+
+    def test_concurrent_start_cannot_overwrite_a_token_before_first_bind(self):
+        began = threading.Event()
+        release = threading.Event()
+        original = self.op.write_private
+
+        def held(path, text):
+            original(path, text)
+            began.set()
+            if not release.wait(3):
+                raise AssertionError("first startup was not released")
+
+        self.stop_flag = threading.Event()
+        first_ready = threading.Event()
+        second_ready = threading.Event()
+        with mock.patch.object(self.op, "write_private", side_effect=held):
+            self.thread = threading.Thread(target=self.op.serve, kwargs={"client": FakeClient(), "ready": first_ready, "stop": self.stop_flag}, daemon=True)
+            self.thread.start()
+            self.assertTrue(began.wait(1))
+            token = self.op.read_private(self.op.token_path())
+            loser = threading.Thread(target=self.op.serve, kwargs={"client": FakeClient(), "ready": second_ready}, daemon=True)
+            loser.start()
+            try:
+                self.assertTrue(second_ready.wait(1))
+                loser.join(1)
+                self.assertFalse(loser.is_alive())
+                self.assertEqual(self.op.read_private(self.op.token_path()), token)
+            finally:
+                release.set()
+            self.assertTrue(first_ready.wait(1))
+        self.assertTrue(self.op.ping_ok())
+
+    def test_private_operator_files_reject_symlinks_without_modifying_targets(self):
+        target = self.tmp / "unrelated"
+        target.write_text("preserve", encoding="utf-8")
+        self.op.token_path().symlink_to(target)
+        with self.assertRaises(OSError):
+            self.op.write_private(self.op.token_path(), "new-token")
+        self.assertEqual(target.read_text(encoding="utf-8"), "preserve")
+        with self.assertRaises(OSError):
+            self.op.read_private(self.op.token_path())
 
     def test_a_slow_request_and_a_dropped_client_leave_the_operator_usable(self):
         started = threading.Event()

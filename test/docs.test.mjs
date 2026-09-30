@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 const root = new URL("../", import.meta.url);
@@ -78,19 +79,67 @@ test("contributing names the automated checks and the local wait", () => {
 });
 
 
-test("the public tree keeps third-party model integrations out", () => {
-  const files = [
-    "README.md",
-    "CONTRIBUTING.md",
-    "driver/jb.py",
-    "driver/juno_operator.py",
-    "extension/background.js",
-    "relay/worker.js",
-  ];
+test("public Jev docs require opt-in and the user's own key", () => {
+  const readme = read("README.md");
+  const contributing = read("CONTRIBUTING.md");
+  assert.match(readme, /Jev is off by default/);
+  assert.match(readme, /your own TypeSafe API key/);
+  assert.match(readme, /no bundled key, shared\s+account/);
+  for (const command of ["configure", "on", "off", "status"]) {
+    assert.ok(readme.includes("python3 driver/jb.py jev " + command), command);
+  }
+  assert.match(readme, /without echoing your API key/);
+  assert.match(readme, /jev-api-key/);
+  assert.match(readme, /0600/);
+  assert.match(readme, /JUNO_JEV=1/);
+  assert.match(readme, /JUNO_JEV=0/);
+  assert.match(readme, /TYPESAFE_API_KEY/);
+  assert.match(readme, /JUNO_JEV_CONFIG_DIR/);
+  assert.match(readme, /When Jev is off, decision commands stop before contacting the relay or\s+TypeSafe/);
+  assert.match(readme, /--observation/);
+  assert.match(readme, /--after-ready/);
+  assert.match(readme, /--click/);
+  assert.match(readme, /a model choice does not grant permission/);
+  assert.match(readme, /even with Jev off/);
+  assert.match(readme, /does not inherently shorten a deterministic relay API call/);
+  assert.match(readme, /no measured speedup/);
+  assert.match(readme, /no billed calls, live browser actions, or deployments/);
+  assert.match(contributing, /standard test suite must remain offline/);
+  assert.match(contributing, /tester.s own key/);
+});
+
+test("TypeSafe credentials and API calls stay out of the relay and extension", () => {
+  const files = ["extension", "relay"].flatMap((directory) =>
+    fs.readdirSync(new URL(directory + "/", root), { recursive: true })
+      .filter((path) => /\.(?:js|mjs|json|html)$/.test(path) && !/(?:^|\/)(?:node_modules|\.wrangler)(?:\/|$)/.test(path))
+      .map((path) => directory + "/" + path)
+  );
   for (const file of files) {
     const source = read(file);
-    assert.equal(/jev/i.test(source), false, file + " mentions jev");
-    assert.equal(/typesafe/i.test(source), false, file + " mentions typesafe");
-    assert.equal(source.includes("JUNO_JEV"), false, file + " mentions JUNO_JEV");
+    assert.equal(source.includes("TYPESAFE_API_KEY"), false, file + " accepts a TypeSafe key");
+    assert.equal(source.includes("api.typesafe.ai"), false, file + " calls TypeSafe");
+    assert.equal(source.includes("jev-api-key"), false, file + " reads a TypeSafe key file");
   }
+  const readme = read("README.md");
+  assert.match(readme, /key stays in the local driver\/operator/);
+  assert.match(readme, /never sent to the\s+relay, Chrome extension, or local Unix socket/);
+  assert.match(readme, /redaction is heuristic and cannot guarantee removal of every secret/);
+});
+
+test("gitignore protects local key and secret paths but permits sanitized examples", () => {
+  const ignored = [
+    ".env", "driver/.env.local", "relay/.dev.vars", "relay/.dev.vars.production",
+    "jev-api-key", "driver/jev-api-key", "driver/typesafe-key", "driver/operator.token",
+  ];
+  const examples = [".env.example", "driver/.env.local.example", "relay/.dev.vars.example", "jev-api-key.example"];
+  const result = spawnSync("git", ["check-ignore", "--no-index", "--stdin"], {
+    cwd: root,
+    input: [...ignored, ...examples].join("\n") + "\n",
+    encoding: "utf8",
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0, result.stderr);
+  const matched = new Set(result.stdout.trim().split("\n"));
+  for (const path of ignored) assert.ok(matched.has(path), path + " must be ignored");
+  for (const path of examples) assert.equal(matched.has(path), false, path + " should be allowed");
 });

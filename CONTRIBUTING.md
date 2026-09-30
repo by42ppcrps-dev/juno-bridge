@@ -55,9 +55,28 @@ a missing tab id, navigation off the authorized page, local queue delay,
 snapshot redaction and its limits, pairing and revocation, result ownership,
 reconnection, HTTP polling, result acknowledgement, duplicate request ids,
 bounded workflows, the operator process, and the driver's exit status.
+Optional Jev checks cover default-off behavior, configuration and override
+precedence, private key handling, observation reuse, and refusal of unsafe
+or stale clicks. Use fake keys and responses; these checks do not call
+TypeSafe, spend API credit, or run live browser actions.
 
 They do not load the extension in Chrome and they do not deploy a relay.
 Step 3 above is still required before a transport or browser change is merged.
+
+## Optional third-party decisions
+
+Jev is a public bring-your-own-key feature, off by default. Keep paid-call
+configuration in the local driver/operator. Do not add an embedded key,
+default account, or direct TypeSafe client to the relay or extension. The
+key must not travel on the local Unix socket or appear in logs, test fixtures,
+or public reports. Sanitized `.env.example` and `.dev.vars.example` files may
+show variable names, but must not contain a working credential.
+
+The standard test suite must remain offline. Any real TypeSafe integration
+check is opt-in, uses the tester's own key and authorized page data, and must
+report that it may incur charges. Separate connection reuse and browser
+workflow savings from semantic model choices when reporting performance;
+do not present old vendor benchmarks as a measurement of this project.
 
 ## Security
 

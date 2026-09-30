@@ -1,12 +1,13 @@
 """User-scoped operator process for Juno Bridge.
 
 The CLI talks to this process over a private Unix socket. The process owns
-the relay HTTP client and the admin passphrase. The passphrase is not sent
-on the socket. Certificate verification stays on, and redirects are not
-followed, so a bearer token is not sent to another host. One client
-disconnecting does not stop the process. Ping and stop are answered while a
-relay request is still running. Those requests stay on one worker so a
-libcurl handle is not shared across threads.
+the relay HTTP client, a separate TypeSafe client, and the admin passphrase.
+The passphrase and the TypeSafe key are not sent on the socket. Certificate
+verification stays on, and redirects are not followed, so a bearer token is
+not sent to another host. One client disconnecting does not stop the process.
+Ping and stop are answered while a relay or TypeSafe request is still running.
+Those requests stay on one worker so a libcurl handle is not shared across
+threads.
 
 Set JUNO_OPERATOR=0 or JUNO_BRIDGE_HTTP=curl to skip this process and use
 one curl subprocess per request instead.
@@ -14,6 +15,9 @@ one curl subprocess per request instead.
 
 import ctypes
 import ctypes.util
+import errno
+import fcntl
+import hashlib
 import hmac
 import importlib.util
 import json
@@ -32,6 +36,10 @@ CONNECT_TIMEOUT = 10
 # An idle client cannot sit on the accept path. Tests shorten this.
 READ_DEADLINE_S = 5
 WORK_QUEUE_MAX = 16
+TYPESAFE_CONTEXT_ERROR = (
+    "TypeSafe configuration changed; run jb.py operator stop and retry. "
+    "No API call was made."
+)
 
 # libcurl option numbers. VERIFYHOST 2 and VERIFYPEER 1 stay set on purpose.
 CURLOPT_TIMEOUT = 13
@@ -71,9 +79,10 @@ class OperatorError(Exception):
 
 
 def operator_dir():
-    raw = os.environ.get("JUNO_OPERATOR_DIR", "").strip()
-    if raw:
-        return Path(raw)
+    for name in ("JUNO_JEV_CONFIG_DIR", "JUNO_OPERATOR_DIR"):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            return Path(raw).expanduser()
     return Path.home() / ".config" / "juno-bridge"
 
 
@@ -88,6 +97,23 @@ def token_path():
     return operator_dir() / "operator.token"
 
 
+def lock_path():
+    return operator_dir() / "operator.lock"
+
+
+def _private_fd(path, flags):
+    """Open an owner-controlled regular file without following symlinks."""
+    fd = os.open(str(path), flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise OperatorError(f"{path} must be a regular file owned by you")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def config_path():
     return operator_dir() / "config.json"
 
@@ -98,19 +124,49 @@ def psk_path():
 
 def write_private(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = _private_fd(path, os.O_WRONLY | os.O_CREAT)
     try:
-        os.write(fd, text.encode("utf-8"))
+        os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as stream:
+            stream.write(text)
     finally:
         os.close(fd)
-    os.chmod(path, 0o600)
 
 
 def read_private(path):
-    mode = stat.S_IMODE(os.stat(path).st_mode)
-    if mode & 0o077:
-        raise OperatorError(f"{path} is too permissive (mode {oct(mode)})")
-    return Path(path).read_text(encoding="utf-8").strip()
+    fd = _private_fd(path, os.O_RDONLY)
+    try:
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        if mode & 0o077:
+            raise OperatorError(f"{path} is too permissive (mode {oct(mode)})")
+        with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as stream:
+            return stream.read().strip()
+    finally:
+        os.close(fd)
+
+
+def _owner_lock():
+    """Hold ownership before inspecting stale paths or rotating the socket token."""
+    directory = operator_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise OperatorError("operator directory must be owned by you and not a symlink")
+    os.chmod(directory, 0o700)
+    fd = _private_fd(lock_path(), os.O_RDWR | os.O_CREAT)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        if exc.errno in (errno.EAGAIN, errno.EACCES):
+            return None
+        raise
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def admin_psk():
@@ -281,13 +337,107 @@ def request_with_retry(client, method, url, headers, body, timeout):
     except TimeoutError:
         return client.request(method, url, headers, body, timeout)
 
-def handle_message(msg, client):
+
+_jev = None
+
+
+def jev_mod():
+    """Load the decision helper. A separate module name avoids the CLI's copy."""
+    global _jev
+    if _jev is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jev.py")
+        spec = importlib.util.spec_from_file_location("juno_jev_operator", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _jev = mod
+    return _jev
+
+
+def _scrub_provider_response(value, key):
+    """Keep credentials out of socket replies, even if a provider client echoes them."""
+    if isinstance(value, str):
+        return value.replace(key, "[redacted]") if key else value
+    if isinstance(value, list):
+        return [_scrub_provider_response(item, key) for item in value]
+    if isinstance(value, dict):
+        return {
+            _scrub_provider_response(name, key): _scrub_provider_response(item, key)
+            for name, item in value.items()
+        }
+    return value
+
+
+def _typesafe_context_url(jev, value):
+    """Canonicalize the validated API origin and base path, without credentials."""
+    host, port, path, _origin = jev._typesafe_target(value)
+    authority = "[" + host + "]" if ":" in host else host
+    return f"https://{authority}:{port}" + path[:-len("/v1/systemone")]
+
+
+def _handle_systemone(msg, typesafe_getter):
+    """One System One call. The key is read here, never accepted from the socket."""
+    if any(name in msg for name in ("key", "authorization", "api_key")):
+        return {"ok": False, "error": "the TypeSafe key stays in the operator"}
+    if typesafe_getter is None:
+        return {"ok": False, "error": "TypeSafe client is not available"}
+    body = msg.get("body")
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "TypeSafe body must be an object"}
+    try:
+        timeout = int(msg.get("timeout") or 30)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "bad timeout"}
+    key = ""
+    try:
+        jev = jev_mod()
+        if "jev_enabled" in msg and not isinstance(msg["jev_enabled"], bool):
+            return {"ok": False, "error": "jev_enabled must be a boolean"}
+        enabled = msg["jev_enabled"] if "jev_enabled" in msg else jev.enabled()
+        if not enabled:
+            return {"ok": False, "error": "Jev is disabled; enable it before requesting a decision"}
+        required = msg.get("op") == "systemone_byok_v1"
+        if required and any(name not in msg for name in ("key_fingerprint", "typesafe_base_url")):
+            return {"ok": False, "error": "TypeSafe caller configuration metadata is required; no API call was made"}
+        fingerprint = msg.get("key_fingerprint")
+        if "key_fingerprint" in msg and (
+                not isinstance(fingerprint, str) or len(fingerprint) != 64
+                or any(char not in "0123456789abcdefABCDEF" for char in fingerprint)):
+            return {"ok": False, "error": "invalid TypeSafe key fingerprint; no API call was made"}
+        if "typesafe_base_url" in msg:
+            if not isinstance(msg["typesafe_base_url"], str):
+                return {"ok": False, "error": "invalid TypeSafe API URL metadata; no API call was made"}
+            try:
+                expected_url = _typesafe_context_url(jev, msg["typesafe_base_url"])
+                owner_url = _typesafe_context_url(jev, jev._typesafe_base())
+            except (ValueError, jev.JevError):
+                return {"ok": False, "error": "invalid TypeSafe API URL metadata; no API call was made"}
+            if expected_url != owner_url:
+                return {"ok": False, "error": TYPESAFE_CONTEXT_ERROR}
+        key = jev.api_key()
+        if fingerprint is not None and not hmac.compare_digest(
+                fingerprint.lower(), hashlib.sha256(key.encode("utf-8")).hexdigest()):
+            return {"ok": False, "error": TYPESAFE_CONTEXT_ERROR}
+        typesafe = typesafe_getter()
+        # A paid request is sent once. An uncertain transport outcome is not retried.
+        response = typesafe.post(body, key, timeout)
+    except ValueError as exc:
+        return {"ok": False, "error": jev_mod().scrub(str(exc), key)[:300]}
+    except Exception as exc:
+        return {"ok": False, "error": jev_mod().scrub(str(exc), key)[:300]}
+    if not isinstance(response, dict):
+        return {"ok": False, "error": "TypeSafe returned a response that was not a JSON object"}
+    return {"ok": True, "response": _scrub_provider_response(response, key)}
+
+
+def handle_message(msg, client, typesafe_getter=None):
     if not isinstance(msg, dict):
         return {"ok": False, "error": "bad message"}
     if msg.get("op") == "stop":
         return {"ok": True, "stop": True}
     if msg.get("op") == "ping":
         return {"ok": True, "pong": True}
+    if msg.get("op") in ("systemone", "systemone_byok_v1"):
+        return _handle_systemone(msg, typesafe_getter)
     path = msg.get("path")
     if not isinstance(path, str) or not path.startswith("/") or "://" in path or "\n" in path:
         return {"ok": False, "error": "bad path"}
@@ -375,8 +525,8 @@ def _enqueue(work, gate, conn, msg):
     return "queued"
 
 
-def _worker_loop(work, client, gate):
-    """One thread owns the relay client."""
+def _worker_loop(work, client, typesafe_getter, gate):
+    """One thread owns the relay client and the TypeSafe client."""
     while True:
         item = work.get()
         if item is None:
@@ -389,7 +539,7 @@ def _worker_loop(work, client, gate):
                 _safe_send(conn, {"ok": False, "error": "operator is stopping"})
             else:
                 try:
-                    result = handle_message(msg, client)
+                    result = handle_message(msg, client, typesafe_getter)
                 except Exception:
                     result = {"ok": False, "error": "request failed"}
                 _safe_send(conn, result)
@@ -476,9 +626,27 @@ def _close_quietly(obj):
             pass
 
 
-def serve(client=None, ready=None, stop=None):
+def serve(client=None, ready=None, stop=None, typesafe=None):
+    owner = _owner_lock()
+    if owner is None:
+        if ready:
+            ready.set()
+        return 0
+    try:
+        return _serve_owned(client=client, ready=ready, stop=stop, typesafe=typesafe)
+    finally:
+        os.close(owner)
+
+
+def _serve_owned(client=None, ready=None, stop=None, typesafe=None):
     path = sock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        info = None
+    if info is not None and (not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid()):
+        raise OperatorError("operator socket must be an owned socket, not a symlink or another file")
     if socket_alive(path):
         if ready:
             ready.set()
@@ -492,10 +660,19 @@ def serve(client=None, ready=None, stop=None):
     write_private(token_path(), token)
     if client is None:
         client = LibcurlSession()
+    typesafe_box = [typesafe]
+
+    def typesafe_getter():
+        if typesafe_box[0] is None:
+            typesafe_box[0] = jev_mod().TypeSafeSession()
+        return typesafe_box[0]
+
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         srv.bind(str(path))
     except OSError:
+        _close_quietly(client)
+        _close_quietly(typesafe_box[0])
         srv.close()
         if ready:
             ready.set()
@@ -509,7 +686,7 @@ def serve(client=None, ready=None, stop=None):
     gate = _ServeGate()
     worker = threading.Thread(
         target=_worker_loop,
-        args=(work, client, gate),
+        args=(work, client, typesafe_getter, gate),
         name="juno-operator-worker",
         daemon=True,
     )
@@ -570,6 +747,7 @@ def serve(client=None, ready=None, stop=None):
                 continue
         worker.join()
         _close_quietly(client)
+        _close_quietly(typesafe_box[0])
     return 0
 
 
@@ -612,6 +790,8 @@ def ensure():
         raise OperatorError("operator is not running")
     env = os.environ.copy()
     env["JUNO_OPERATOR_CHILD"] = "1"
+    # Per-call opt-in is carried as a nonsecret boolean, never frozen in this daemon.
+    env.pop("JUNO_JEV", None)
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jb.py")
     subprocess.Popen(
         [sys.executable, here, "operator"],
@@ -639,6 +819,42 @@ def call(method, path, data, timeout):
     return res.get("status"), res.get("payload") if isinstance(res.get("payload"), dict) else {}
 
 
+def systemone(body, timeout=30):
+    """Send one System One request through the operator's TypeSafe client.
+
+    The operator reads its own API key. Nonsecret key and API-origin metadata
+    prevent a running daemon from using a different configuration silently.
+    """
+    jev = jev_mod()
+    key_fingerprint = hashlib.sha256(jev.api_key().encode("utf-8")).hexdigest()
+    try:
+        base_url = _typesafe_context_url(jev, jev._typesafe_base())
+    except (ValueError, jev.JevError) as exc:
+        raise OperatorError("invalid TypeSafe API URL configuration; no API call was made") from exc
+    ensure()
+    token = read_private(token_path())
+    message = {
+        "token": token,
+        # Older daemons reject this operation before a paid call rather than
+        # ignoring the configuration checks added by this protocol version.
+        "op": "systemone_byok_v1",
+        "body": body,
+        "timeout": int(timeout),
+        "key_fingerprint": key_fingerprint,
+        "typesafe_base_url": base_url,
+    }
+    if "JUNO_JEV" in os.environ:
+        message["jev_enabled"] = os.environ["JUNO_JEV"].strip() == "1"
+    res = transact(message, timeout=int(timeout) + CONNECT_TIMEOUT + 5)
+    if not res.get("ok"):
+        error = res.get("error") or "TypeSafe request failed"
+        if error in ("bad path", "bad_path", "bad op", "bad_op"):
+            error = TYPESAFE_CONTEXT_ERROR
+        raise OperatorError(error)
+    response = res.get("response")
+    if not isinstance(response, dict):
+        raise OperatorError("TypeSafe returned a response that was not a JSON object")
+    return response
 
 
 def stop():

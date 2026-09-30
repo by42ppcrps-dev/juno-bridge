@@ -79,7 +79,7 @@ machines. `jb.py` sends it in an `Authorization: Bearer` header over HTTPS.
 | `extension/` | Your Chrome (load unpacked) | WebSocket to the relay, HTTP polling fallback, commands via `chrome.debugger`, side panel (pause, connection, activity log), Options (pairing, allowlist) |
 | `relay/worker.js` | Cloudflare Worker + Durable Object (unlisted) | Admin API, device registration, per-device queues, result ownership |
 | `relay/wrangler.jsonc` | Your machine | Deploy config. `ADMIN_PSK_SHA256` is required |
-| `driver/jb.py`, `driver/juno_operator.py` | Operator's machine | CLI plus a user-scoped operator process on a private Unix socket. The process keeps one relay client. `JUNO_OPERATOR=0` uses one curl subprocess per relay request. |
+| `driver/jb.py`, `driver/juno_operator.py` | Operator's machine | CLI plus a user-scoped operator process on a private Unix socket. The process keeps one relay client and a separate TypeSafe client when optional Jev is used. `JUNO_OPERATOR=0` uses one curl subprocess per relay request. Jev is off by default and uses your own API key. |
 
 ## Fixes in 1.3.1
 
@@ -169,13 +169,19 @@ same id; the relay returns the existing command instead of starting another
 one. Two `send` calls are two ids and two actions.
 
 The normal path is a user-scoped operator process on a private Unix socket.
-It keeps one HTTP client for the relay.
+It keeps one HTTP client for the relay and a separate client for optional
+TypeSafe requests.
 Certificate verification stays on, and redirects are not followed.
 A health check is answered while one of those requests is still running, and
 a client that closes its socket does not stop the process.
 `JUNO_OPERATOR=0` or `JUNO_BRIDGE_HTTP=curl` is the curl compatibility path:
 one curl subprocess per relay request. Local native messaging is
 not in this release.
+
+Reusing the operator's relay connection avoids creating a new client for
+every command, even with Jev off. Jev serves a different purpose: semantic
+target or next-action selection that can reduce general-purpose model
+round trips. It does not inherently shorten a deterministic relay API call.
 
 ## Breaking changes in 1.3.0
 
@@ -273,7 +279,7 @@ current page is allowlisted. Every other action requires `tabId`.
 `send` waits up to 60 seconds, prints the device result as JSON on stdout,
 and exits 1 when `ok` is not true. With several paired browsers, commands go
 to the most recently paired one unless you pass a device id (from
-`devices`). `revoke <device-id>` unpairs one.
+`devices`). `revoke <device-id>` unpairs one. `jb.py send` does not call Jev.
 
 `snapshot` returns an id (`snap_` plus 32 hex digits) and gives each
 element a `ref` (`e1`, `e2`, …) in the order the page was walked. A ref
@@ -300,6 +306,120 @@ PageUp/PageDown, and Space.
 
 While a command runs against a tab, Chrome shows its debugging banner on
 that tab. New tabs open in the background.
+
+## Optional Jev decisions — bring your own key
+
+Jev is off by default. It can make a bounded semantic choice about one
+snapshot using your own TypeSafe API key. There is no bundled key, shared
+account, or free service supplied by this project. An enabled call sends
+snapshot text to TypeSafe and may bill your account, including a choice of
+`none` or a request whose result is refused by the browser safeguards.
+Check TypeSafe's current account pricing and model limits before enabling it.
+
+### Configure, enable, and disable
+
+```bash
+python3 driver/jb.py jev configure  # prompts without echoing your API key
+python3 driver/jb.py jev on
+python3 driver/jb.py jev status
+python3 driver/jb.py jev off
+```
+
+`configure` stores the key in `~/.config/juno-bridge/jev-api-key` with mode
+`0600`, readable only by its owner. It does not enable Jev, call TypeSafe, or
+bill your account. `on` requires a configured key and persists
+`jev_enabled: true` in that directory's `config.json`; `off` persists false.
+`status` reports the effective setting and whether a key is configured,
+without printing the key. These setup commands make no network requests.
+The aliases `enable` and `disable` also work.
+
+`JUNO_JEV=1` or `JUNO_JEV=0` overrides the persisted setting for that process.
+Without either override, an absent setting means off. `TYPESAFE_API_KEY`
+takes precedence over the private key file, so an existing secure environment
+setup works with `JUNO_JEV=1` as well. Avoid putting a key in command arguments
+or shell history. `JUNO_JEV_CONFIG_DIR` selects a different private config
+directory; otherwise `JUNO_OPERATOR_DIR` is used if set, then
+`~/.config/juno-bridge`. Keep it outside the repository.
+
+If an operator is already running when you update this driver or change
+`TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL`, or proxy environment settings, run
+`python3 driver/jb.py operator stop` before the next Jev command. The next
+command starts the operator with the new environment. The driver rejects a
+key or endpoint mismatch before making a paid request. Updating the private
+key file or saved on/off setting applies to the next request without a
+restart. A `JUNO_JEV` override is passed for each invocation.
+
+When Jev is off, decision commands stop before contacting the relay or
+TypeSafe. Turning it off prevents later requests; it cannot cancel billing
+for a request already sent.
+
+### Choose within the user's task
+
+Name one or more of `target`, `page`, and `step`, a tab, and a goal of at most
+500 characters. Questions on the same invocation share one TypeSafe request;
+they cannot see each other's answers. A later decision is another request.
+
+```bash
+python3 driver/jb.py jev target --tab 123456 --goal "Find the invoice download page"
+python3 driver/jb.py jev target page --tab 123456 --goal "Find the invoice download page"
+python3 driver/jb.py jev target --tab 123456 --goal "Find the invoice download page" --observation snapshot.json --click
+```
+
+Without `--observation`, the command takes one ordinary relay snapshot.
+With `--observation <file>`, it reuses the observation, a snapshot result,
+or a saved `data.observation` / `click.observation` wrapper. The object must
+include its `snap_` id, URL, and element list. This avoids taking another
+snapshot when you already have a suitable observation.
+
+| Decision | Choice | Effect |
+|---|---|---|
+| `target` | A snapshot ref (`e1`, `e2`, …) or `none` | Prints the choice; `--click` can submit the selected ref on that snapshot |
+| `page` | `search_results`, `login_required`, `validation_error`, `unexpected`, or `other` | Prints the label; login, validation, and unexpected-page labels block a click |
+| `step` | `proceed_with_selected_target`, `observe`, `recover`, or `escalate` | Only the proceed label permits continuing an explicitly requested click; the other labels do not act |
+
+`--click` is an explicit action request and requires `target`. Keep the goal
+within the user's authorized task; a model choice does not grant permission.
+The driver checks confidence (`JUNO_JEV_MIN_CONFIDENCE`, default `0.8`), the
+selected element, and the observation, then submits one workflow bound to
+that snapshot id and ref. The browser verifies the saved node before input.
+A stale or missing node is refused rather than replaced by a coordinate
+click. `none`, a disabled or off-screen target, missing confidence, and a
+blocking page or step decision do not click. Pause, the allowlist, `tabId`,
+and the command deadline still apply. Confidence is not proof of correctness.
+
+That workflow returns a new snapshot observation with its own id and node
+bindings, which can be reused for the next decision. `--after-ready <json>`
+adds one bounded readiness condition when a requested click needs the page
+to settle: `text`, `element_visible`, or `element_enabled`, with `timeoutMs`
+from 0 to 15000. Omitting it does not wait. For example:
+
+```bash
+python3 driver/jb.py jev target --tab 123456 --goal "Find the invoice download page" --observation snapshot.json --click --after-ready '{"type":"text","text":"Invoice","timeoutMs":5000}'
+```
+
+These are task-scoped choices and actions, not a background autonomous loop.
+Combining a decision, a bound action, and the returned observation can reduce
+extra model/relay round trips. There is no measured speedup or guaranteed
+reduction in task time claimed here. Compare completion, elapsed time, wrong
+actions, and general-purpose model calls on your own tasks with Jev on/off.
+
+### API key and snapshot privacy
+
+The TypeSafe key stays in the local driver/operator. It is never sent to the
+relay, Chrome extension, or local Unix socket and must not appear in logs,
+public issues, or repository files. The operator normally reads the key and
+uses its separate TypeSafe client; the compatibility path reads it locally
+for that command. Neither the extension nor the relay has a TypeSafe client.
+Private key files are checked for ownership and restrictive permissions.
+
+An enabled TypeSafe request sends the page title, URL, and element text and
+metadata from the snapshot to the configured API origin. The default origin
+is `https://api.typesafe.ai`; `TYPESAFE_BASE_URL` overrides it. Use an override
+only for a service you trust with both your key and the page data. Snapshot
+redaction is heuristic and cannot guarantee removal of every secret. A page
+result still passes through the relay when captured; its TypeSafe request is
+a separate transmission. Do not enable a decision for data you are unwilling
+to send there. `jb.py send` stays independent of this optional integration.
 
 ## Relay API
 
@@ -343,6 +463,13 @@ Automated checks (no Chrome, no deploy):
 node --test
 python3 -m unittest discover -s test -p 'test_*.py'
 ```
+
+`npm test` runs both suites. Jev checks use fake keys, observations, and
+responses: no billed calls, live browser actions, or deployments occur.
+Real-browser verification is still required by [CONTRIBUTING.md](CONTRIBUTING.md)
+before merging a browser or transport change. A live TypeSafe check is a
+separate opt-in check using the tester's own account; record its cost and
+exclude credentials and private page data from reports.
 
 ## License
 
