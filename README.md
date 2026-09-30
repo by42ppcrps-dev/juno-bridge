@@ -8,7 +8,7 @@ attach to the browser profile you use every day.
 The operator sends commands (navigate, snapshot, click, type, …). The relay
 pushes them to the extension over a WebSocket, and the extension runs them
 with `chrome.debugger`. Commands and results pass through the relay. This
-tree is extension v1.4.5.
+tree is extension v1.4.6.
 
 ## What the safeguards actually do
 
@@ -42,7 +42,13 @@ tree is extension v1.4.5.
 - **Allowlist.** Empty by default. Only `http` and `https` pages on domains
   you list can be acted on, and a domain covers its subdomains. `tabs` shows
   allowlisted tabs and only counts the rest.
-- **Activity log.** Actions are recorded locally, including failures.
+- **Permission changes** cancel active commands and clear queued work. Changing
+  the allowlist or eval permission invalidates the command's policy; reads
+  are discarded if the document or permissions changed while Chrome was
+  producing them. Input Chrome already accepted cannot be undone.
+- **Activity log.** Actions are recorded locally, including failures. A
+  result-delivery failure is shown separately from whether the action ran;
+  the action is not repeated to recover a lost delivery.
 - **Pairing.** Browsers join with single-use codes that expire after 10
   minutes. Revoking a device closes its live socket and rejects its later
   polls.
@@ -160,6 +166,42 @@ python3 driver/jb.py send workflow '{"tabId":123456,"snapshot":"snap_0123456789a
   still uses the starting snapshot. `--observation` reads that object, a
   snapshot result, or the saved `data.observation` / `click.observation`
   wrapper.
+
+## Fixes in 1.4.6
+
+- A device authenticates before the relay accepts its WebSocket. The
+  extension obtains a durable, one-use upgrade ticket that expires after
+  30 seconds and offers it as a WebSocket subprotocol. The device token
+  stays in the ticket request's POST body; neither token nor ticket is put
+  in the URL. Anonymous upgrades cannot occupy the relay's socket slots.
+  Older extensions and relays keep working through HTTP polling.
+- Poll replies, commands, and result receipts belong to the pairing and
+  policy that started them. Re-pairing, pausing, or changing permissions
+  discards stale work; an old result is never sent on a new device's socket.
+  Polling and result delivery have deadlines covering the response body.
+- Admin authentication happens before body reading. Request bodies,
+  readers, retained results, queues, registry records, sockets, and waiters
+  have explicit limits. Sizes count UTF-8 bytes. Periodic cleanup and
+  revocation remove expired or revoked state in bounded storage batches.
+- Results are durably stored before acknowledgment, including large
+  screenshots. The primary result and repeated `request_id` share one
+  chunked payload, so a relay restart or consuming the primary result does
+  not lose the repeated-request receipt. Command ownership, the queue, and
+  the idempotency receipt are committed together. A failed legacy import
+  remains incomplete and can be retried.
+
+The relay accepts ordinary JSON bodies up to 64 KiB and result POST bodies
+up to 10 MiB, with a 15-second read deadline. A stored result is at most
+8 MiB; larger accepted records become an explicit `result_too_large`
+failure. Primary and replay results share a 16 MiB retained-payload budget.
+At capacity, new requests fail explicitly instead of growing memory without
+bound. These limits use UTF-8 bytes. Anonymous WebSocket upgrades are rejected
+before acceptance; ordinary network flooding still requires platform-level
+rate limits or upstream protection.
+
+Upgrade the relay and reload the v1.4.6 extension to activate these fixes.
+The GitHub code and a running relay or already-loaded browser extension
+can be different versions.
 
 The result status is `completed`, `cancelled`, `interrupted`, `uncertain`,
 or `unobserved`. `uncertain` means some input may already have reached
@@ -437,8 +479,14 @@ a 64-character hex SHA-256.
 | `POST /admin/pair` · `GET /admin/ping` | Pairing code · health |
 | `POST /admin/bootstrap` | Disabled. Returns 410 `bootstrap_disabled` |
 
-Device routes (`/register`, `/poll`, `/result`, `/unregister`, `/ws`) carry
-the device token in the POST body or the first WebSocket message, never in
+Device HTTP routes (`/register`, `/poll`, `/result`, `/unregister`, and
+`/ws-ticket`) use POST bodies. `POST /ws-ticket` takes `{token}` and returns
+`{ticket, expires_in: 30}`. To upgrade `/ws`, offer the subprotocols
+`juno-bridge-v1` and `juno-ticket.<ticket>`; the relay returns only the public
+`juno-bridge-v1` protocol. The ticket is single-use, bound to the device and
+the issuing extension origin when present, and validated before a socket
+is accepted. After upgrading, send `{type: "hello", after, version}`; the
+socket's authenticated identity is already fixed. Credentials never go in
 the URL. `POST /result` and a WebSocket result are accepted only from the
 device the command was issued to.
 
