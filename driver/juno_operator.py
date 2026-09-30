@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import queue
+import select
 import socket
 import stat
 import subprocess
@@ -36,6 +37,8 @@ CONNECT_TIMEOUT = 10
 # An idle client cannot sit on the accept path. Tests shorten this.
 READ_DEADLINE_S = 5
 WORK_QUEUE_MAX = 16
+SOCKET_RESPONSE_GRACE_S = CONNECT_TIMEOUT + 5
+SOCKET_REPLY_RESERVE_S = 0.5
 TYPESAFE_CONTEXT_ERROR = (
     "TypeSafe configuration changed; run jb.py operator stop and retry. "
     "No API call was made."
@@ -330,12 +333,19 @@ class LibcurlSession:
             self.easy = None
 
 
-def request_with_retry(client, method, url, headers, body, timeout):
-    """One transport retry of the same bytes. Not a second browser command."""
+def request_with_retry(client, method, url, headers, body, timeout, retry=False):
+    """Retry only calls whose protocol can recover from an uncertain response."""
+    deadline = time.monotonic() + timeout
+    # /admin/run holds a response for at most 25s in the CLI. Leave budget
+    # for one same-id retry even if the first transport waits to its limit.
+    first_timeout = min(timeout, 30) if retry else timeout
     try:
-        return client.request(method, url, headers, body, timeout)
+        return client.request(method, url, headers, body, first_timeout)
     except TimeoutError:
-        return client.request(method, url, headers, body, timeout)
+        remaining = deadline - time.monotonic()
+        if not retry or remaining < 1:
+            raise
+        return client.request(method, url, headers, body, remaining)
 
 
 _jev = None
@@ -374,7 +384,7 @@ def _typesafe_context_url(jev, value):
     return f"https://{authority}:{port}" + path[:-len("/v1/systemone")]
 
 
-def _handle_systemone(msg, typesafe_getter):
+def _handle_systemone(msg, typesafe_getter, admission=None):
     """One System One call. The key is read here, never accepted from the socket."""
     if any(name in msg for name in ("key", "authorization", "api_key")):
         return {"ok": False, "error": "the TypeSafe key stays in the operator"}
@@ -389,13 +399,15 @@ def _handle_systemone(msg, typesafe_getter):
         return {"ok": False, "error": "bad timeout"}
     key = ""
     try:
+        if admission is not None and not admission():
+            return {"ok": False, "error": "Jev caller disconnected or timed out; no API call was made"}
         jev = jev_mod()
         if "jev_enabled" in msg and not isinstance(msg["jev_enabled"], bool):
             return {"ok": False, "error": "jev_enabled must be a boolean"}
         enabled = msg["jev_enabled"] if "jev_enabled" in msg else jev.enabled()
         if not enabled:
             return {"ok": False, "error": "Jev is disabled; enable it before requesting a decision"}
-        required = msg.get("op") == "systemone_byok_v1"
+        required = msg.get("op") in ("systemone_byok_v1", "systemone_byok_v2")
         if required and any(name not in msg for name in ("key_fingerprint", "typesafe_base_url")):
             return {"ok": False, "error": "TypeSafe caller configuration metadata is required; no API call was made"}
         fingerprint = msg.get("key_fingerprint")
@@ -417,9 +429,14 @@ def _handle_systemone(msg, typesafe_getter):
         if fingerprint is not None and not hmac.compare_digest(
                 fingerprint.lower(), hashlib.sha256(key.encode("utf-8")).hexdigest()):
             return {"ok": False, "error": TYPESAFE_CONTEXT_ERROR}
+        if admission is not None and not admission():
+            return {"ok": False, "error": "Jev caller disconnected or timed out; no API call was made"}
         typesafe = typesafe_getter()
+        budget = admission() if admission is not None else None
+        if admission is not None and not budget:
+            return {"ok": False, "error": "Jev caller disconnected or timed out; no API call was made"}
         # A paid request is sent once. An uncertain transport outcome is not retried.
-        response = typesafe.post(body, key, timeout)
+        response = typesafe.post(body, key, min(timeout, budget) if budget is not None else timeout)
     except ValueError as exc:
         return {"ok": False, "error": jev_mod().scrub(str(exc), key)[:300]}
     except Exception as exc:
@@ -429,16 +446,17 @@ def _handle_systemone(msg, typesafe_getter):
     return {"ok": True, "response": _scrub_provider_response(response, key)}
 
 
-def handle_message(msg, client, typesafe_getter=None):
+def handle_message(msg, client, typesafe_getter=None, admission=None):
     if not isinstance(msg, dict):
         return {"ok": False, "error": "bad message"}
     if msg.get("op") == "stop":
         return {"ok": True, "stop": True}
     if msg.get("op") == "ping":
         return {"ok": True, "pong": True}
-    if msg.get("op") in ("systemone", "systemone_byok_v1"):
-        return _handle_systemone(msg, typesafe_getter)
-    path = msg.get("path")
+    if msg.get("op") in ("systemone", "systemone_byok_v1", "systemone_byok_v2"):
+        return _handle_systemone(msg, typesafe_getter, admission)
+    relay_v1 = msg.get("op") == "relay_request_v1"
+    path = msg.get("route") if relay_v1 else msg.get("path")
     if not isinstance(path, str) or not path.startswith("/") or "://" in path or "\n" in path:
         return {"ok": False, "error": "bad path"}
     method = msg.get("method") if isinstance(msg.get("method"), str) else "GET"
@@ -450,7 +468,14 @@ def handle_message(msg, client, typesafe_getter=None):
             body = json.dumps(msg["data"]).encode("utf-8")
             headers.append("Content-Type: application/json")
         timeout = int(msg.get("timeout") or 30)
-        status, raw = request_with_retry(client, method, url, headers, body, timeout)
+        route = path.split("?", 1)[0]
+        retry = (method.upper() == "GET" and route != "/admin/result") or (
+            relay_v1 and msg.get("retry_safe") is True
+            and method.upper() == "POST" and route == "/admin/run"
+            and isinstance(msg.get("data"), dict)
+            and isinstance(msg["data"].get("request_id"), str)
+        )
+        status, raw = request_with_retry(client, method, url, headers, body, timeout, retry=retry)
     except TimeoutError:
         return {"ok": False, "error": "request failed: timed out"}
     except OperatorError as exc:
@@ -519,10 +544,29 @@ def _enqueue(work, gate, conn, msg):
         if gate.closing:
             return "closing"
         try:
-            work.put_nowait((conn, msg))
+            deadline = None
+            if msg.get("op") in ("systemone", "systemone_byok_v1", "systemone_byok_v2"):
+                try:
+                    timeout = int(msg.get("timeout") or 30)
+                except (TypeError, ValueError):
+                    timeout = 0
+                deadline = time.monotonic() + max(0, timeout) + SOCKET_RESPONSE_GRACE_S
+            work.put_nowait((conn, msg, deadline))
         except queue.Full:
             return "full"
     return "queued"
+
+
+def _caller_budget(conn, deadline):
+    """Return seconds left for queued Jev, without reading its socket frame."""
+    remaining = deadline - time.monotonic() - SOCKET_REPLY_RESERVE_S
+    if remaining <= 0:
+        return 0
+    try:
+        readable, _, _ = select.select([conn], [], [], 0)
+        return remaining if not readable or conn.recv(1, socket.MSG_PEEK) != b"" else 0
+    except (OSError, ValueError):
+        return 0
 
 
 def _worker_loop(work, client, typesafe_getter, gate):
@@ -531,7 +575,7 @@ def _worker_loop(work, client, typesafe_getter, gate):
         item = work.get()
         if item is None:
             return
-        conn, msg = item
+        conn, msg, deadline = item
         try:
             with gate.lock:
                 closing = gate.closing
@@ -539,7 +583,8 @@ def _worker_loop(work, client, typesafe_getter, gate):
                 _safe_send(conn, {"ok": False, "error": "operator is stopping"})
             else:
                 try:
-                    result = handle_message(msg, client, typesafe_getter)
+                    admission = (lambda: _caller_budget(conn, deadline)) if deadline is not None else None
+                    result = handle_message(msg, client, typesafe_getter, admission)
                 except Exception:
                     result = {"ok": False, "error": "request failed"}
                 _safe_send(conn, result)
@@ -761,6 +806,8 @@ def transact(message, timeout=60):
         conn.connect(str(sock_path()))
         conn.sendall(payload)
         line = _recv_line(conn)
+    except TimeoutError as exc:
+        raise OperatorError("operator socket timed out; request outcome is uncertain") from exc
     finally:
         conn.close()
     if not line:
@@ -807,14 +854,19 @@ def ensure():
     raise OperatorError("operator did not start")
 
 
-def call(method, path, data, timeout):
+def call(method, path, data, timeout, retry_safe=False):
     ensure()
     token = read_private(token_path())
-    message = {"token": token, "method": method, "path": path, "timeout": int(timeout)}
+    # An older daemon sees no `path` and rejects this versioned RPC before
+    # sending any relay request with its former unconditional retry policy.
+    message = {"token": token, "op": "relay_request_v1", "method": method,
+               "route": path, "timeout": int(timeout), "retry_safe": retry_safe}
     if data is not None:
         message["data"] = data
-    res = transact(message, timeout=int(timeout) + CONNECT_TIMEOUT + 5)
+    res = transact(message, timeout=int(timeout) + SOCKET_RESPONSE_GRACE_S)
     if not res.get("ok"):
+        if res.get("error") == "bad path":
+            raise OperatorError("operator is outdated; run jb.py operator stop and retry. No relay request was made")
         raise OperatorError(res.get("error") or "request failed")
     return res.get("status"), res.get("payload") if isinstance(res.get("payload"), dict) else {}
 
@@ -837,7 +889,7 @@ def systemone(body, timeout=30):
         "token": token,
         # Older daemons reject this operation before a paid call rather than
         # ignoring the configuration checks added by this protocol version.
-        "op": "systemone_byok_v1",
+        "op": "systemone_byok_v2",
         "body": body,
         "timeout": int(timeout),
         "key_fingerprint": key_fingerprint,
@@ -845,11 +897,11 @@ def systemone(body, timeout=30):
     }
     if "JUNO_JEV" in os.environ:
         message["jev_enabled"] = os.environ["JUNO_JEV"].strip() == "1"
-    res = transact(message, timeout=int(timeout) + CONNECT_TIMEOUT + 5)
+    res = transact(message, timeout=int(timeout) + SOCKET_RESPONSE_GRACE_S)
     if not res.get("ok"):
         error = res.get("error") or "TypeSafe request failed"
         if error in ("bad path", "bad_path", "bad op", "bad_op"):
-            error = TYPESAFE_CONTEXT_ERROR
+            error = "operator is outdated; run jb.py operator stop and retry. No API call was made"
         raise OperatorError(error)
     response = res.get("response")
     if not isinstance(response, dict):

@@ -80,6 +80,10 @@ const TEXT_CAP = 100000;
 const MAX_RESULT_BYTES = 8 * 1024 * 1024;
 const RESULT_TIMEOUT_MS = 10000;
 const RESULT_RETRY_MS = 1000;
+// A verified relay upload slot can remain occupied until its 15s body-read
+// deadline. Give a 429 enough time to clear without holding the command queue
+// longer than one action timeout overall.
+const RESULT_429_BUDGET_MS = 20000;
 const POLL_TIMEOUT_MS = 10000;
 
 // Puppeteer-style key definitions. A `text` makes CDP emit a real keypress,
@@ -351,7 +355,7 @@ async function cdp(auth, method, params = {}, opts = {}) {
   try {
     const result = await chrome.debugger.sendCommand({ tabId: auth.tabId }, method, params);
     await assertPermissions(auth.state, auth.control || auth.epoch);
-    if (!opts.dispatch) {
+    if (!opts.dispatch || opts.verifyOutput) {
       // A capture or evaluation can finish after navigation, including a
       // same-URL reload. Discard its output before any caller can publish it.
       await assertStillAuthorized(auth);
@@ -676,10 +680,12 @@ async function cmdNavigate(params, state, ctx, epoch) {
     // have landed during it. Recheck before the navigation is issued.
     await assertPermissions(state, epoch);
     assertActive(epoch);
+    if (epoch && typeof epoch === "object") epoch.dispatched = true;
     tab = await chrome.tabs.update(again.id, { url });
   } else {
     await assertPermissions(state, epoch);
     assertActive(epoch);
+    if (epoch && typeof epoch === "object") epoch.dispatched = true;
     tab = await chrome.tabs.create({ url, active: false });
   }
   await assertPermissions(state, epoch);
@@ -1050,8 +1056,9 @@ async function collectAfter(auth, after, retainSnapshotNow) {
   return { observe: "text", observed: true, ...page, redaction: "none" };
 }
 
-async function clickAt(auth, x, y) {
+async function clickAt(auth, x, y, beforePress) {
   await cdp(auth, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y }, { dispatch: true });
+  if (beforePress) await beforePress();
   const base = { x, y, button: "left", clickCount: 1 };
   await cdp(auth, "Input.dispatchMouseEvent", { ...base, type: "mousePressed" }, { dispatch: true });
   await cdp(auth, "Input.dispatchMouseEvent", { ...base, type: "mouseReleased" }, { dispatch: true });
@@ -1094,7 +1101,12 @@ function resolveRefExpression(ref, snapshotId) {
     const text = ((isField ? "" : el.innerText) || value || (el.getAttribute && (el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("title"))) || "").trim().replace(/\\s+/g, " ").slice(0, 80);
     const x = Math.round(r.x + r.width / 2), y = Math.round(r.y + r.height / 2);
     const vw = window.innerWidth, vh = window.innerHeight;
-    return { ok: true, tag, text, x, y, disabled: !!el.disabled, inView: x >= 0 && y >= 0 && x < vw && y < vh && r.width > 0 && r.height > 0 };
+    const hit = document.elementFromPoint(x, y);
+    const interactive = hit && typeof hit.closest === "function"
+      ? hit.closest('a,button,input,select,textarea,[role="button"],[role="link"],[role="checkbox"],[role="textbox"],[role="menuitem"],[role="tab"],[contenteditable="true"]')
+      : null;
+    const hittable = hit === el || !!(hit && el.contains(hit) && interactive === el);
+    return { ok: true, tag, text, x, y, disabled: !!el.disabled, inView: x >= 0 && y >= 0 && x < vw && y < vh && r.width > 0 && r.height > 0, hittable };
   })()`;
 }
 
@@ -1289,8 +1301,24 @@ async function runStep(auth, step, ctx, retainSnapshotNow) {
     }
     if (found.disabled) throw new Error("workflow: element " + step.ref + " is disabled");
     if (found.inView !== true) throw new Error("workflow: element " + step.ref + " is outside the viewport");
+    if (found.hittable !== true) throw new Error("workflow: element " + step.ref + " is obscured");
     ctx.target += ` @${found.x},${found.y}`;
-    await clickAt(auth, found.x, found.y);
+    await clickAt(auth, found.x, found.y, async () => {
+      // Mouse movement can open menus or overlays. Refuse the press if it
+      // changed the point's target, even when the saved node still exists.
+      const fresh = await evaluate(auth, resolveRefExpression(step.ref, auth.snapshot));
+      if (fresh && fresh.stale) throw new Error("workflow: snapshot is stale");
+      if (!fresh || fresh.ok !== true || fresh.x !== found.x || fresh.y !== found.y ||
+          fresh.disabled || fresh.inView !== true || fresh.hittable !== true) {
+        throw new Error("workflow: element " + step.ref + " changed or is obscured");
+      }
+      if (step.expect && (
+        (step.expect.tag !== undefined && step.expect.tag !== fresh.tag) ||
+        (Object.prototype.hasOwnProperty.call(step.expect, "text") && step.expect.text !== fresh.text)
+      )) {
+        throw new Error("workflow: element " + step.ref + " did not match");
+      }
+    });
     const observation = step.after ? await collectAfter(auth, step.after, retainSnapshotNow) : null;
     return { result: { ref: step.ref, x: found.x, y: found.y }, observation };
   }
@@ -1448,6 +1476,7 @@ async function cmdClose(params, state, ctx, epoch) {
   const auth = await authorizeTab(params, state, ctx, "close", epoch);
   await assertStillAuthorized(auth);
   assertActive(epoch);
+  if (epoch && typeof epoch === "object") epoch.dispatched = true;
   await chrome.tabs.remove(auth.tabId);
   await assertPermissions(state, epoch);
   return { tabId: auth.tabId, closed: true };
@@ -1458,7 +1487,7 @@ async function cmdEval(params, state, ctx, epoch) {
   const auth = await authorizeTab(params, state, ctx, "eval", epoch);
   const { js } = params;
   if (typeof js !== "string" || !js) throw new Error("eval: missing js");
-  const value = await withDebugger(auth, () => evaluate(auth, js));
+  const value = await withDebugger(auth, () => evaluate(auth, js, { dispatch: true, verifyOutput: true }));
   return { tabId: auth.tabId, value: value ?? null };
 }
 
@@ -1541,13 +1570,21 @@ async function postResult(deviceToken, id, outcome) {
   if (new TextEncoder().encode(body).byteLength > MAX_RESULT_BYTES) {
     body = JSON.stringify({ token: deviceToken, id, ok: false, data: null, error: "result too large to relay" });
   }
-  // Retrying delivery never retries the browser action. Successful receipts
-  // require the complete body; a stalled result cannot hold the queue forever.
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // Retrying delivery never retries the browser action. The per-request and
+  // whole-delivery deadlines bound a stalled result. Only 429 gets an extended
+  // window: two occupied relay upload slots can take 15s to release.
+  const deliveryDeadline = Date.now() + CMD_TIMEOUT_MS;
+  let rateLimitDeadline = null;
+  let otherFailures = 0;
+  for (;;) {
+    const remaining = Math.min(RESULT_TIMEOUT_MS,
+      (rateLimitDeadline === null ? deliveryDeadline : Math.min(deliveryDeadline, rateLimitDeadline)) - Date.now());
+    if (remaining <= 0) return false;
+    let rateLimited = false;
     try {
-      const response = await withRequestDeadline(RESULT_TIMEOUT_MS, async (signal) => {
+      const response = await withRequestDeadline(remaining, async (signal) => {
         const res = await fetch(JUNO_RELAY_URL + "/result", {
-          method: "POST", headers: { "content-type": "application/json" }, body, signal,
+          method: "POST", headers: { "content-type": "application/json", "x-juno-device-token": deviceToken }, body, signal,
         });
         const receipt = res.ok ? await res.json() : null;
         return { res, receipt };
@@ -1555,12 +1592,20 @@ async function postResult(deviceToken, id, outcome) {
       if (response.res.ok && response.receipt && response.receipt.ok === true) return true;
       if (response.res.status >= 400 && response.res.status < 500 &&
           response.res.status !== 408 && response.res.status !== 429) return false;
+      rateLimited = response.res.status === 429;
     } catch {
-      /* fall through to the one bounded delivery retry */
+      /* fall through to the bounded delivery retry */
     }
-    if (attempt === 0) await sleep(RESULT_RETRY_MS);
+    if (rateLimited) {
+      if (rateLimitDeadline === null) rateLimitDeadline = Date.now() + RESULT_429_BUDGET_MS;
+    } else if (++otherFailures >= 2) {
+      return false;
+    }
+    const waitBudget = (rateLimitDeadline === null ? deliveryDeadline
+      : Math.min(deliveryDeadline, rateLimitDeadline)) - Date.now();
+    if (waitBudget <= 0) return false;
+    await sleep(Math.min(RESULT_RETRY_MS, waitBudget));
   }
-  return false;
 }
 
 // Bind both send and receipt to this exact socket and device. A late result
@@ -1911,40 +1956,68 @@ function applyEnabled(enabled) {
   if (!enabled) releaseAllDebuggers().catch(() => {});
   lastRelayState = null;
   closeSocket(enabled ? "resumed" : "paused");
+  wakePolicyRetry();
   if (typeof JUNO_TEST === "undefined" || !JUNO_TEST) kick();
 }
 
 /* ---------- main loop ---------- */
 
 let running = false;
+let restartRequested = false;
+let wakeRetry = null;
+
+function retryAfter(ms, epoch) {
+  if (epoch !== controlEpoch) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      if (wakeRetry === finish) wakeRetry = null;
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    wakeRetry = finish;
+  });
+}
+
+function wakePolicyRetry() {
+  if (wakeRetry) wakeRetry();
+}
 
 async function loop() {
   if (running) return;
   running = true;
   try {
     let pollUntil = 0; // while in the future, use HTTP polling instead of the socket
+    let loopEpoch = controlEpoch;
     // eslint-disable-next-line no-constant-condition
     while (true) {
+      if (loopEpoch !== controlEpoch) {
+        loopEpoch = controlEpoch;
+        failStreak = 0;
+        pollUntil = 0;
+      }
       const state = await getState();
+      if (loopEpoch !== controlEpoch) continue;
       acceptingCommands = !!state.enabled && !!state.deviceToken;
       if (!state.enabled || !state.deviceToken) break; // go dormant; restarted on toggle/register
 
       if (Date.now() >= pollUntil) {
         const s = await runSocket(state.deviceToken, state.cursor);
+        if (loopEpoch !== controlEpoch) continue;
         if (s.welcomed) {
-          await sleep(500); // closed after a good session: reconnect promptly
+          await retryAfter(500, loopEpoch); // closed after a good session: reconnect promptly
           continue;
         }
         if (s.rejected) {
           // Token revoked or relay wiped: keep backing off until the user re-pairs.
           await setRelayState("rejected");
           failStreak++;
-          await sleep(pollDelayMs());
+          await retryAfter(pollDelayMs(), loopEpoch);
           continue;
         }
         if (s.opened) {
           failStreak++; // connected but never welcomed: relay trouble
-          await sleep(pollDelayMs());
+          await retryAfter(pollDelayMs(), loopEpoch);
           continue;
         }
         pollUntil = Date.now() + HTTP_FALLBACK_MS; // socket unavailable: poll for a while
@@ -1953,20 +2026,30 @@ async function loop() {
       let worked = false;
       try {
         worked = await pollOnce();
+        if (loopEpoch !== controlEpoch) continue;
         failStreak = 0;
       } catch {
         // Nothing — not storage, not the network, not a handler bug — is
         // allowed to kill the loop. Back off and try again next tick.
         failStreak++;
       }
-      if (!worked) await sleep(pollDelayMs());
+      if (!worked) await retryAfter(pollDelayMs(), loopEpoch);
     }
   } finally {
     running = false;
+    if (restartRequested) {
+      restartRequested = false;
+      loop();
+    }
   }
 }
 
 function kick() {
+  wakePolicyRetry();
+  if (running) {
+    restartRequested = true;
+    return;
+  }
   loop();
 }
 
@@ -1981,6 +2064,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     releaseAllDebuggers().catch(() => {});
     lastRelayState = null;
     closeSocket("state change");
+    wakePolicyRetry();
     if (typeof JUNO_TEST === "undefined" || !JUNO_TEST) kick();
   }
 });
@@ -1994,6 +2078,8 @@ if (typeof JUNO_TEST !== "undefined" && JUNO_TEST) {
     cursorKey,
     pollOnce,
     runSocket,
+    loop,
+    kick,
     sendResult,
     handleSocketMessage,
     commandAgeMs,

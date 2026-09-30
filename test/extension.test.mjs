@@ -606,6 +606,12 @@ function pageButton(rects) {
         right: rect.x + rect.width,
       };
     },
+    contains(node) {
+      return node === this || !!(this.children && this.children.includes(node));
+    },
+    closest() {
+      return this;
+    },
   };
 }
 
@@ -618,6 +624,18 @@ function bootPage(extra = {}) {
     document: {
       title: "Results",
       body: { innerText: extra.bodyText || "Results for invoices" },
+      elementFromPoint(x, y) {
+        // Later nodes paint over earlier ones. Peeking at the last measured
+        // rectangle avoids consuming the mock's scripted movement sequence.
+        for (const el of [...nodes].reverse()) {
+          if (!el || el.isConnected === false) continue;
+          const r = el._rects
+            ? el._rects[Math.min(Math.max(el._n - 1, 0), el._rects.length - 1)]
+            : el.getBoundingClientRect();
+          if (x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height) return el;
+        }
+        return null;
+      },
       querySelectorAll(selector) {
         const sel = String(selector || "");
         if (sel === "[data-juno-snap]") {
@@ -2466,6 +2484,230 @@ describe("extension", { concurrency: 1 }, () => {
   });
 });
 
+describe("browser dispatch boundaries", () => {
+  test("re-pair wakes a rejected socket's old-token retry wait", async () => {
+    const env = boot();
+    const tickets = [];
+    env.fetchControl.fn = (url, body) => {
+      assert.ok(url.endsWith("/ws-ticket"));
+      tickets.push(body.token);
+      return { ok: false, status: 401, json: async () => ({}) };
+    };
+    const pending = env.juno.loop();
+    try {
+      await until(() => tickets.length === 1 && env.store.relayStatus?.state === "rejected");
+      await tick(); // let the first loop enter its backoff wait
+      const nextToken = "ef".repeat(32);
+      await env.chrome.storage.local.set({ deviceToken: nextToken });
+      env.juno.kick(); // production storage listener calls kick
+      await until(() => tickets.includes(nextToken));
+      assert.deepEqual(tickets.slice(0, 2), ["ab".repeat(32), nextToken]);
+    } finally {
+      await env.chrome.storage.local.set({ enabled: false });
+      await pending;
+    }
+  });
+
+  test("pause and resume wake a rejected socket's retry wait", async () => {
+    const env = boot();
+    let tickets = 0;
+    env.fetchControl.fn = (url) => {
+      assert.ok(url.endsWith("/ws-ticket"));
+      tickets += 1;
+      return { ok: false, status: 401, json: async () => ({}) };
+    };
+    const pending = env.juno.loop();
+    try {
+      await until(() => tickets === 1 && env.store.relayStatus?.state === "rejected");
+      await tick();
+      await env.chrome.storage.local.set({ enabled: false });
+      env.juno.kick();
+      await env.chrome.storage.local.set({ enabled: true });
+      env.juno.kick();
+      await until(() => tickets >= 2);
+    } finally {
+      await env.chrome.storage.local.set({ enabled: false });
+      env.juno.kick();
+      await pending;
+    }
+  });
+
+  for (const action of ["new navigation", "reused navigation", "close", "eval"]) {
+    for (const interruption of ["pause", "timeout"]) {
+      test(`${action} reports ${interruption} after Chrome accepts the action as uncertain`, async () => {
+        const env = boot();
+        if (action !== "new navigation") env.addTab(7, "https://example.com/page");
+        if (action === "eval") await env.chrome.storage.local.set({ allowEval: true });
+        const timers = captureCommandTimeout(env);
+        let accepted = 0;
+        let release;
+        const intercept = (value) => {
+          accepted += 1;
+          if (interruption === "pause") {
+            void env.chrome.storage.local.set({ enabled: false });
+            return value;
+          }
+          return new Promise((resolve) => { release = () => resolve(value); });
+        };
+        if (action === "new navigation") {
+          const original = env.chrome.tabs.create.bind(env.chrome.tabs);
+          env.chrome.tabs.create = (props) => intercept(original(props));
+        } else if (action === "reused navigation") {
+          const original = env.chrome.tabs.update.bind(env.chrome.tabs);
+          env.chrome.tabs.update = (id, props) => intercept(original(id, props));
+        } else if (action === "close") {
+          const original = env.chrome.tabs.remove.bind(env.chrome.tabs);
+          env.chrome.tabs.remove = (id) => intercept(original(id));
+        } else {
+          const original = env.chrome.debugger.sendCommand.bind(env.chrome.debugger);
+          env.chrome.debugger.sendCommand = (target, method, params) => {
+            if (method === "Runtime.evaluate" && params.expression === "window.effect = 1") {
+              return intercept(Promise.resolve({ result: { value: 1 } }));
+            }
+            return original(target, method, params);
+          };
+        }
+        const kind = action.includes("navigation") ? "navigate" : action;
+        const params = action === "new navigation" ? { url: "https://example.com/next" }
+          : action === "reused navigation" ? { tabId: 7, url: "https://example.com/next" }
+          : action === "close" ? { tabId: 7 } : { tabId: 7, js: "window.effect = 1" };
+        const cmd = command({ action: kind, issued_at: env.now(), params });
+        const pending = env.juno.schedule(cmd, env.now());
+        await until(() => accepted === 1);
+        if (interruption === "timeout") timers.fire();
+        await pending;
+        const body = resultFor(env, cmd.id);
+        assert.equal(body.ok, false, JSON.stringify(body));
+        assert.equal(body.data.status, "uncertain");
+        assert.equal(body.data.dispatched, true);
+        assert.match(body.error, interruption === "pause" ? /cancelled/ : /command timed out/);
+        if (action === "new navigation") assert.equal(env.created.length, 1);
+        if (action === "reused navigation") assert.equal(env.tabs.get(7).url, "https://example.com/next");
+        if (action === "close") assert.equal(env.tabs.has(7), false);
+        if (release) release();
+      });
+    }
+  }
+
+  test("HTTP result delivery authenticates before the relay reads the body", async () => {
+    const env = boot();
+    let headers;
+    env.fetchControl.fn = (url, body, opts) => {
+      assert.ok(url.endsWith("/result"));
+      assert.equal(body.token, env.store.deviceToken);
+      headers = opts.headers;
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    };
+    assert.equal(await env.juno.sendResult(env.store.deviceToken, command().id, { ok: true }), true);
+    assert.equal(headers["x-juno-device-token"], env.store.deviceToken);
+  });
+
+  test("eval still discards its result if the document changes during execution", async () => {
+    const env = boot({
+      async sendCommand({ method, params, tabs }) {
+        if (method === "Runtime.evaluate" && params.expression === "window.location.reload()") {
+          tabs.get(7).timeOrigin = 5000;
+          return { result: { value: "PRIVATE-EVAL" } };
+        }
+      },
+    });
+    env.addTab(7, "https://example.com/page");
+    await env.chrome.storage.local.set({ allowEval: true });
+    const cmd = command({ action: "eval", issued_at: env.now(),
+      params: { tabId: 7, js: "window.location.reload()" } });
+    await env.juno.schedule(cmd, env.now());
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false);
+    assert.equal(body.data.status, "uncertain");
+    assert.equal(body.data.dispatched, true);
+    assert.equal(JSON.stringify(body).includes("PRIVATE-EVAL"), false);
+  });
+});
+
+describe("bound click hit testing", () => {
+  test("a descendant at the click point remains a valid hit", async () => {
+    const target = labeledButton("Invoices", FILTER_RECT);
+    const child = { tagName: "SPAN", isConnected: true, closest() { return target; } };
+    target.children = [child];
+    const env = bootPage({ button: target, nodes: [target] });
+    env.page.realm.document.elementFromPoint = () => child;
+    const snapshot = await takeSnapshot(env);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    assert.equal(resultFor(env, cmd.id).ok, true, JSON.stringify(resultFor(env, cmd.id)));
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+  });
+
+  test("a new interactive descendant cannot intercept a bound click", async () => {
+    const target = labeledButton("Invoices", FILTER_RECT);
+    const child = { tagName: "BUTTON", isConnected: true, closest() { return this; } };
+    target.children = [child];
+    const env = bootPage({ button: target, nodes: [target] });
+    const snapshot = await takeSnapshot(env);
+    env.page.realm.document.elementFromPoint = () => child;
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /obscured/);
+    assert.deepEqual(mouseTypes(env), []);
+  });
+
+  test("an overlay inserted after capture blocks a wrong-target click", async () => {
+    const target = labeledButton("Invoices", FILTER_RECT);
+    const env = bootPage({ button: target, nodes: [target] });
+    const snapshot = await takeSnapshot(env);
+    const overlay = labeledButton("Delete account", FILTER_RECT);
+    env.page.setNodes([target, overlay]);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /element e1 is obscured/);
+    assert.equal(body.data.dispatched, false);
+    assert.deepEqual(mouseTypes(env), []);
+  });
+
+  test("an iframe overlay raised on mouse move blocks the press", async () => {
+    const target = labeledButton("Invoices", FILTER_RECT);
+    const overlay = labeledButton("", FILTER_RECT);
+    overlay.tagName = "IFRAME";
+    const env = bootPage({
+      button: target,
+      nodes: [target],
+      onCommand({ method, params }, page) {
+        if (method === "Input.dispatchMouseEvent" && params.type === "mouseMoved") {
+          page.setNodes([target, overlay]);
+        }
+      },
+    });
+    const snapshot = await takeSnapshot(env);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1" }], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /changed or is obscured/);
+    assert.deepEqual(mouseTypes(env), ["mouseMoved"]);
+  });
+
+  test("hover changing an expected label blocks the press", async () => {
+    const target = labeledButton("Invoices", FILTER_RECT);
+    const env = bootPage({
+      button: target,
+      nodes: [target],
+      onCommand({ method, params }) {
+        if (method === "Input.dispatchMouseEvent" && params.type === "mouseMoved") {
+          target.innerText = "Delete account";
+        }
+      },
+    });
+    const snapshot = await takeSnapshot(env);
+    const cmd = await runWorkflow(env, [
+      { op: "click", ref: "e1", expect: { tag: "button", text: "Invoices" } },
+    ], snapshot);
+    const body = resultFor(env, cmd.id);
+    assert.equal(body.ok, false, JSON.stringify(body));
+    assert.match(body.error, /element e1 did not match/);
+    assert.deepEqual(mouseTypes(env), ["mouseMoved"]);
+  });
+});
+
 
 describe("device-scoped cursor regressions", { concurrency: 1 }, () => {
   test("a delayed old-device save cannot overwrite Options pairing or new-device progress", async () => {
@@ -2902,16 +3144,50 @@ describe("extension audit regressions", { concurrency: 1 }, () => {
     assert.equal(posts, 3);
   });
 
+  test("HTTP result delivery outlasts a 15s occupied upload slot after 429", async () => {
+    const env = boot({ timeouts: { RESULT_RETRY_MS: 1 } });
+    const started = env.now();
+    let posts = 0;
+    env.fetchControl.fn = () => {
+      posts += 1;
+      env.setClock(started + posts * 1000);
+      return { ok: posts > 16, status: posts > 16 ? 200 : 429,
+        json: async () => ({ ok: true }) };
+    };
+    assert.equal(await env.juno.sendResult(env.store.deviceToken, command().id, { ok: true }), true);
+    assert.equal(posts, 17);
+  });
+
+  test("persistent 429 ends at the delivery deadline", async () => {
+    const env = boot({ timeouts: { RESULT_RETRY_MS: 1 } });
+    const started = env.now();
+    let posts = 0;
+    env.fetchControl.fn = () => {
+      posts += 1;
+      env.setClock(started + posts * 5000);
+      return { ok: false, status: 429 };
+    };
+    assert.equal(await env.juno.sendResult(env.store.deviceToken, command().id, { ok: true }), false);
+    assert.ok(posts >= 4 && posts <= 6, `unexpected retry count: ${posts}`);
+    assert.ok(env.now() - started <= env.juno.CMD_TIMEOUT_MS);
+  });
+
   test("old-pairing results use the original token over HTTP and never the new socket", async () => {
     const env = boot();
     const oldToken = env.store.deviceToken;
     await env.chrome.storage.local.set({ deviceToken: "ef".repeat(32) });
+    let headerToken;
+    env.fetchControl.fn = (_url, _body, opts) => {
+      headerToken = opts.headers["x-juno-device-token"];
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    };
     const ws = { readyState: 1, sent: [], send(data) { this.sent.push(data); }, close() {} };
     env.juno.attachSocket(ws, env.store.deviceToken);
     const id = command().id;
     await env.juno.sendResult(oldToken, id, { ok: true, data: {} });
     assert.equal(ws.sent.length, 0);
     assert.equal(resultFor(env, id).token, oldToken);
+    assert.equal(headerToken, oldToken);
   });
 
   for (const receipt of ["result_ack", "result_rejected"]) {

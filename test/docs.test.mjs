@@ -10,7 +10,7 @@ const read = (path) => fs.readFileSync(new URL(path, root), "utf8");
 
 test("manifest identifies the experimental preview", () => {
   const manifest = JSON.parse(read("extension/manifest.json"));
-  assert.equal(manifest.version, "1.4.6");
+  assert.equal(manifest.version, "1.4.7");
   assert.ok(manifest.description.length <= 132, manifest.description);
   assert.match(manifest.description, /Experimental preview/);
   assert.match(manifest.description, /cannot undo one already sent to Chrome/);

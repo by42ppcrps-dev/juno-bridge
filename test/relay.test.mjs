@@ -772,12 +772,16 @@ describe("relay", { concurrency: 1 }, () => {
     assert.equal(poll.status, 204);
   });
 
-  test("ping and the socket welcome advertise idempotency and workflow", async () => {
+  test("ping, device list and socket welcome advertise idempotency and workflow", async () => {
     const { hub, ctx } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
     const ping = await read(await hub.fetch(admin("/admin/ping")));
     assert.equal(ping.status, 200);
     assert.deepEqual(ping.data.capabilities, ["idempotency", "workflow"]);
     const { token } = await pairAndRegister(hub, "A");
+    const listed = await read(await hub.fetch(admin("/admin/devices")));
+    assert.equal(listed.status, 200);
+    assert.equal(listed.data.default, token.slice(0, 8));
+    assert.deepEqual(listed.data.capabilities, ["idempotency", "workflow"]);
     const opened = await read(await hub.fetch(await authWsReq(hub, token)));
     assert.equal(opened.status, 101);
     const server = ctx.sockets.at(-1);
@@ -862,9 +866,151 @@ describe("relay audit regressions", { concurrency: 1 }, () => {
       const first = hub.fetch(streamingRequest("/result", unfinished));
       assert.equal((await hub.fetch(post("/result", { token, id, ok: true }))).status, 429);
       assert.deepEqual(await read(await first), { status: 408, data: { error: "body_timeout" } });
-      assert.equal(hub.bodyReaders, 0); assert.equal(hub.resultBodyReaders, 0);
+      assert.equal(hub.bodyReaders, 0); assert.equal(hub.resultBodyReaders, 0); assert.equal(hub.legacyResultBodyReaders, 0);
       assert.equal((await hub.fetch(post("/result", { token, id, ok: true }))).status, 200);
     } finally { globalThis.setTimeout = originalTimeout; }
+  });
+
+  test("anonymous slow uploads cannot starve verified HTTP or WebSocket results", async () => {
+    const env = { ADMIN_PSK_SHA256: await sha256(PASSPHRASE) };
+    const { hub, ctx } = await bootHub(env);
+    env.HUB = { idFromName() { return "juno-bridge"; }, get() { return hub; } };
+    const { token } = await pairAndRegister(hub, "A");
+    const httpId = await enqueue(hub, token, "req_protected_http");
+    const socketId = await enqueue(hub, token, "req_protected_socket");
+    assert.equal((await worker.fetch(await authWsReq(hub, token), env)).status, 101);
+    const server = ctx.sockets.at(-1);
+    await hub.webSocketMessage(server, JSON.stringify({ type: "hello", after: 0 }));
+
+    let resultController;
+    const slowResult = new ReadableStream({ start(controller) { resultController = controller; } });
+    const stalledResult = worker.fetch(streamingRequest("/result", slowResult), env);
+    const pollControllers = [];
+    const stalledPolls = Array.from({ length: 8 }, () => {
+      const stream = new ReadableStream({ start(controller) { pollControllers.push(controller); } });
+      return worker.fetch(streamingRequest("/poll", stream), env);
+    });
+    const started = Date.now();
+    while ((hub.legacyResultBodyReaders !== 1 || hub.bodyReaders !== 8) && Date.now() - started < 1000) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(hub.legacyResultBodyReaders, 1);
+    assert.equal(hub.bodyReaders, 8);
+    assert.equal(hub.postRequests, 8);
+    assert.equal(hub.resultBodyReaders, 0);
+
+    const preflight = await worker.fetch(new Request("https://relay.example/result", {
+      method: "OPTIONS", headers: { origin: EXTENSION_ORIGIN },
+    }), env);
+    assert.match(preflight.headers.get("access-control-allow-headers"), /x-juno-device-token/);
+    const invalid = {
+      url: "https://relay.example/result", method: "POST",
+      headers: new Headers({ "x-juno-device-token": "f".repeat(64) }),
+      get body() { throw new Error("read invalid token body"); },
+    };
+    assert.deepEqual(await read(await worker.fetch(invalid, env)), { status: 403, data: { error: "unknown_device" } });
+
+    let verifiedController;
+    const verifiedStream = new ReadableStream({ start(controller) { verifiedController = controller; } });
+    const verifiedRequest = streamingRequest("/result", verifiedStream);
+    verifiedRequest.headers.set("x-juno-device-token", token);
+    verifiedRequest.headers.set("origin", EXTENSION_ORIGIN);
+    const stalledVerified = worker.fetch(verifiedRequest, env);
+    while (hub.resultBodyReaders !== 1 && Date.now() - started < 1000) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(hub.resultBodyReaders, 1);
+    await hub.webSocketMessage(server, JSON.stringify({ type: "result", id: socketId, ok: true }));
+    assert.equal(server.closed, null);
+    assert.ok(server.sent.some((message) => {
+      const parsed = JSON.parse(message);
+      return parsed.type === "result_ack" && parsed.id === socketId;
+    }));
+    assert.equal(hub.owners.get(socketId).done, true);
+    verifiedController.close();
+    assert.deepEqual(await read(await stalledVerified), { status: 401, data: { error: "missing_device_token" } });
+    assert.equal(hub.resultBodyReaders, 0);
+
+    const completed = post("/result", { token, id: httpId, ok: true, data: { protected: true } });
+    completed.headers.set("x-juno-device-token", token);
+    completed.headers.set("origin", EXTENSION_ORIGIN);
+    assert.deepEqual(await read(await worker.fetch(completed, env)), { status: 200, data: { ok: true } });
+    assert.equal(hub.owners.get(httpId).done, true);
+    assert.equal(hub.resultBodyReaders, 0);
+    assert.equal(hub.legacyResultBodyReaders, 1);
+    resultController.close();
+    for (const controller of pollControllers) controller.close();
+    assert.deepEqual(await read(await stalledResult), { status: 401, data: { error: "missing_device_token" } });
+    for (const response of await Promise.all(stalledPolls)) {
+      assert.deepEqual(await read(response), { status: 401, data: { error: "missing_device_token" } });
+    }
+    assert.equal(hub.legacyResultBodyReaders, 0);
+    assert.equal(hub.bodyReaders, 0);
+    assert.equal(hub.postRequests, 0);
+    assert.equal(hub.resultCommitters, 0);
+  });
+
+  test("a result header must match the body token", async () => {
+    const { hub } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const { token: first } = await pairAndRegister(hub, "A");
+    const { token: second } = await pairAndRegister(hub, "B");
+    const id = await enqueue(hub, second, "req_header_mismatch");
+    const request = post("/result", { token: second, id, ok: true });
+    request.headers.set("x-juno-device-token", first);
+    assert.deepEqual(await read(await hub.fetch(request)), { status: 403, data: { error: "token_mismatch" } });
+    assert.equal(hub.owners.get(id).done, false);
+    assert.equal(hub.resultBodyReaders, 0);
+    assert.equal((await hub.fetch(post("/result", { token: second, id, ok: true }))).status, 200);
+  });
+
+  test("one paired device's stalled result upload does not block another device", async () => {
+    const { hub, ctx } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const { token: first } = await pairAndRegister(hub, "A");
+    const { token: second } = await pairAndRegister(hub, "B");
+    const { token: third } = await pairAndRegister(hub, "C");
+    const secondId = await enqueue(hub, second, "req_device_b_result");
+    const thirdId = await enqueue(hub, third, "req_device_c_result");
+    const startUpload = (token) => {
+      let controller;
+      const stream = new ReadableStream({ start(value) { controller = value; } });
+      const request = streamingRequest("/result", stream);
+      request.headers.set("x-juno-device-token", token);
+      return { controller, response: hub.fetch(request) };
+    };
+    const slowFirst = startUpload(first);
+    assert.equal(hub.resultBodyReaders, 1);
+    const result = post("/result", { token: second, id: secondId, ok: true });
+    result.headers.set("x-juno-device-token", second);
+    assert.deepEqual(await read(await hub.fetch(result)), { status: 200, data: { ok: true } });
+    assert.equal(hub.owners.get(secondId).done, true);
+    assert.equal(hub.resultBodyReaders, 1);
+
+    const duplicateFirst = post("/result", { token: first, id: secondId, ok: true });
+    duplicateFirst.headers.set("x-juno-device-token", first);
+    assert.deepEqual(await read(await hub.fetch(duplicateFirst)), { status: 429, data: { error: "too_many_body_readers" } });
+    const slowSecond = startUpload(second);
+    assert.equal(hub.resultBodyReaders, 2);
+    assert.deepEqual([...hub.resultBodyReaderTokens].sort(), [first, second].sort());
+    // A third verified upload gets a retryable 429; the socket path remains available.
+    const limitedThird = post("/result", { token: third, id: thirdId, ok: true });
+    limitedThird.headers.set("x-juno-device-token", third);
+    assert.deepEqual(await read(await hub.fetch(limitedThird)), { status: 429, data: { error: "too_many_body_readers" } });
+    await hub.fetch(await authWsReq(hub, third));
+    const server = ctx.sockets.at(-1);
+    await hub.webSocketMessage(server, JSON.stringify({ type: "hello", after: 0 }));
+    await hub.webSocketMessage(server, JSON.stringify({ type: "result", id: thirdId, ok: true }));
+    assert.equal(server.closed, null);
+    assert.ok(server.sent.some((message) => {
+      const parsed = JSON.parse(message);
+      return parsed.type === "result_ack" && parsed.id === thirdId;
+    }));
+    slowFirst.controller.close();
+    slowSecond.controller.close();
+    assert.deepEqual(await read(await slowFirst.response), { status: 401, data: { error: "missing_device_token" } });
+    assert.deepEqual(await read(await slowSecond.response), { status: 401, data: { error: "missing_device_token" } });
+    assert.equal(hub.resultBodyReaders, 0);
+    assert.equal(hub.resultBodyReaderTokens.size, 0);
+    assert.equal(hub.resultCommitters, 0);
   });
 
   test("failed enqueue transaction creates neither ownership nor an idempotency receipt", async () => {
@@ -1078,15 +1224,15 @@ describe("relay audit regressions", { concurrency: 1 }, () => {
     assert.equal(polled.status, 200);
     await hub.fetch(await authWsReq(hub, token)); const server = ctx.sockets[0];
     await hub.webSocketMessage(server, JSON.stringify({ type: "hello", after: 0 }));
-    // Simulate an admitted HTTP upload while another result arrives by socket.
-    hub.resultBodyReaders = 1;
+    // A busy commit slot defers another result; an incomplete HTTP body does not.
+    hub.resultCommitters = 1;
     await hub.webSocketMessage(server, JSON.stringify({ type: "result", id: polled.data.cmd.id, ok: true }));
     assert.deepEqual(server.closed, { code: 1013, reason: "result_busy" });
     assert.equal(hub.owners.get(polled.data.cmd.id).done, false);
-    hub.resultBodyReaders = 0;
+    hub.resultCommitters = 0;
     assert.equal((await hub.fetch(post("/result", { token, id: polled.data.cmd.id, ok: true }))).status, 200);
     assert.equal((await read(await pendingRun)).data.result.ok, true);
-    assert.equal(hub.postRequests, 0); assert.equal(hub.resultBodyReaders, 0);
+    assert.equal(hub.postRequests, 0); assert.equal(hub.resultBodyReaders, 0); assert.equal(hub.resultCommitters, 0);
   });
 
   test("stream concurrency is bounded and every completion, cancellation or read failure releases capacity", async () => {

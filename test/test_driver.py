@@ -45,8 +45,11 @@ class DriverTests(unittest.TestCase):
         else:
             os.environ["JUNO_OPERATOR"] = self._operator_env
 
-    def respond(self, responses):
+    def respond(self, responses, devices=None, devices_status=200):
         queue = list(responses)
+        if devices is None:
+            devices = {"default": "a1b2c3d4", "devices": [{"id": "a1b2c3d4"}],
+                       "capabilities": ["idempotency", "workflow"]}
 
         def run(args, **_kwargs):
             cfg_path = args[args.index("--config") + 1]
@@ -60,9 +63,12 @@ class DriverTests(unittest.TestCase):
                     with open(data_path, encoding="utf-8") as bf:
                         body = json.load(bf)
             self.curl_bodies.append(body)
-            if not queue:
-                raise AssertionError("unexpected curl call")
-            status, payload = queue.pop(0)
+            if 'url = "https://relay.example/admin/devices"' in text:
+                status, payload = devices_status, devices
+            else:
+                if not queue:
+                    raise AssertionError("unexpected curl call")
+                status, payload = queue.pop(0)
             proc = mock.Mock()
             proc.returncode = 0
             proc.stdout = json.dumps(payload) + "\nHTTPSTATUS:%d" % status
@@ -83,7 +89,9 @@ class DriverTests(unittest.TestCase):
             code = jb.main(["jb.py", "send", "click", '{"tabId":7,"x":1,"y":2}'])
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out.getvalue()), result)
-        self.assertIn("/admin/run", self.curl_configs[0])
+        self.assertIn("/admin/devices", self.curl_configs[0])
+        self.assertIn("/admin/run", self.curl_configs[1])
+        self.assertEqual(self.curl_bodies[1]["device"], "a1b2c3d4")
 
     def test_send_success_exits_zero(self):
         result = {"ok": True, "data": {"version": "1.3.0"}}
@@ -99,17 +107,109 @@ class DriverTests(unittest.TestCase):
 
     def test_polled_failure_exits_nonzero(self):
         result = {"ok": False, "error": "boom"}
+        cmd_id = "cmd_" + "ef" * 8
         self.respond([
-            (200, {"ok": True, "pending": True, "id": "cmd_" + "ef" * 8}),
-            (200, {"pending": False, "result": result}),
+            (200, {"ok": True, "pending": True, "id": cmd_id}),
+            (200, {"ok": True, "duplicate": True, "pending": False, "id": cmd_id, "result": result}),
         ])
         out = io.StringIO()
         with mock.patch("sys.stdout", out):
             code = jb.main(["jb.py", "send", "ping", "{}"])
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(out.getvalue()), result)
-        self.assertEqual(len(self.curl_configs), 2)
-        self.assertIn("/admin/result", self.curl_configs[1])
+        self.assertEqual(len(self.curl_configs), 3)
+        self.assertIn("/admin/run", self.curl_configs[2])
+        posted = [body for body in self.curl_bodies if body is not None]
+        self.assertEqual(posted[0]["request_id"], posted[1]["request_id"])
+        self.assertEqual([body["wait"] for body in posted], [25, 20])
+
+    def test_pending_run_recovers_a_result_by_replaying_the_same_request_id(self):
+        cmd_id = "cmd_" + "ab" * 8
+        result = {"ok": True, "data": {"clicked": True}}
+        # The relay's duplicate response retains the result even if a
+        # separate /admin/result read already consumed its primary receipt.
+        self.respond([
+            (200, {"ok": True, "pending": True, "id": cmd_id}),
+            (200, {"ok": True, "duplicate": True, "pending": False, "id": cmd_id, "result": result}),
+        ])
+        self.assertEqual(jb.run_action("click", {"tabId": 1, "ref": "r1"}), result)
+        self.assertEqual(len(self.curl_configs), 3)
+        posted = [body for body in self.curl_bodies if body is not None]
+        self.assertEqual(posted[0]["request_id"], posted[1]["request_id"])
+        self.assertEqual([body["device"] for body in posted], ["a1b2c3d4", "a1b2c3d4"])
+        self.assertTrue(all("/admin/result" not in cfg for cfg in self.curl_configs))
+
+    def test_pending_run_rejects_an_unconfirmed_replay(self):
+        cmd_id = "cmd_" + "ab" * 8
+        self.respond([
+            (200, {"ok": True, "pending": True, "id": cmd_id}),
+            (200, {"ok": True, "pending": False, "id": "cmd_" + "cd" * 8,
+                   "result": {"ok": True}}),
+        ])
+        with self.assertRaises(SystemExit):
+            jb.run_action("click", {"tabId": 1, "ref": "r1"})
+        posted = [body for body in self.curl_bodies if body is not None]
+        self.assertEqual(posted[0]["request_id"], posted[1]["request_id"])
+
+    def test_default_target_stays_bound_when_another_browser_pairs_before_replay(self):
+        newest = {"id": "a1b2c3d4"}
+        seen = []
+        cmd_id = "cmd_" + "ab" * 8
+        result = {"ok": True, "data": {"browser": "A"}}
+
+        def request(method, path, data=None, **kwargs):
+            seen.append((method, path, data, kwargs))
+            if path == "/admin/devices":
+                return {"default": newest["id"], "devices": [{"id": newest["id"]}],
+                        "capabilities": ["idempotency"]}
+            self.assertEqual(path, "/admin/run")
+            self.assertEqual(data["device"], "a1b2c3d4")
+            if len(seen) == 2:
+                newest["id"] = "b1c2d3e4"  # a new pairing becomes the relay default
+                return {"ok": True, "pending": True, "id": cmd_id}
+            return {"ok": True, "duplicate": True, "pending": False,
+                    "id": cmd_id, "result": result}
+
+        with mock.patch.object(jb, "relay_request", side_effect=request):
+            self.assertEqual(jb.run_action("click", {"tabId": 1}), result)
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(seen[1][2]["request_id"], seen[2][2]["request_id"])
+        self.assertTrue(seen[1][3]["retry_safe"])
+        self.assertTrue(seen[2][3]["retry_safe"])
+
+    def test_legacy_relay_without_idempotency_uses_one_enqueue_and_get(self):
+        cmd_id = "cmd_" + "ab" * 8
+        self.respond([
+            (200, {"ok": True, "id": cmd_id}),
+            (200, {"pending": False, "result": {"ok": True}}),
+        ], devices={"default": "a1b2c3d4", "devices": [{"id": "a1b2c3d4"}]})
+        self.assertEqual(jb.run_action("ping", {}), {"ok": True})
+        self.assertEqual(len(self.curl_configs), 3)
+        self.assertIn("/admin/cmd", self.curl_configs[1])
+        self.assertIn("/admin/result?id=" + cmd_id, self.curl_configs[2])
+        self.assertEqual(self.curl_bodies[1]["device"], "a1b2c3d4")
+        self.assertTrue(all("/admin/run" not in cfg for cfg in self.curl_configs))
+
+    def test_v1_relay_without_devices_endpoint_keeps_one_legacy_command(self):
+        cmd_id = "cmd_" + "ab" * 8
+        self.respond([
+            (200, {"ok": True, "id": cmd_id}),
+            (200, {"pending": False, "result": {"ok": True}}),
+        ], devices={"error": "not_found"}, devices_status=404)
+        self.assertEqual(jb.run_action("ping", {}), {"ok": True})
+        self.assertEqual(len(self.curl_configs), 3)
+        self.assertIn("/admin/devices", self.curl_configs[0])
+        self.assertIn("/admin/cmd", self.curl_configs[1])
+        self.assertIn("/admin/result?id=" + cmd_id, self.curl_configs[2])
+        self.assertEqual(self.curl_bodies[1]["device"], "default")
+
+    def test_missing_or_ambiguous_default_fails_before_browser_command(self):
+        self.respond([], devices={"default": "a1b2c3d4", "devices": [{"id": "b1c2d3e4"}],
+                                  "capabilities": ["idempotency"]})
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
+            jb.run_action("click", {"tabId": 1})
+        self.assertEqual(len(self.curl_configs), 1)
+        self.assertIsNone(self.curl_bodies[0])
 
     def test_bootstrap_prints_the_hash_and_does_not_call_the_relay(self):
         def run(*_args, **_kwargs):
@@ -162,11 +262,11 @@ class DriverTests(unittest.TestCase):
         self.assertNotEqual(posted[0]["request_id"], posted[2]["request_id"])
         self.assertRegex(posted[0]["request_id"], r"^req_[0-9a-f]{16}$")
         self.assertRegex(posted[2]["request_id"], r"^req_[0-9a-f]{16}$")
-        self.assertIn("/admin/run", self.curl_configs[0])
-        self.assertIn("/admin/cmd", self.curl_configs[1])
-        self.assertIn("/admin/result?id=" + cmd_id, self.curl_configs[2])
-        self.assertIn("/admin/run", self.curl_configs[3])
-        self.assertIsNone(self.curl_bodies[2])
+        self.assertIn("/admin/run", self.curl_configs[1])
+        self.assertIn("/admin/cmd", self.curl_configs[2])
+        self.assertIn("/admin/result?id=" + cmd_id, self.curl_configs[3])
+        self.assertIn("/admin/run", self.curl_configs[5])
+        self.assertIsNone(self.curl_bodies[3])
         self.assertNotIn(self.psk, json.dumps(posted[0]))
         self.assertEqual(posted[0]["action"], "click")
         self.assertEqual(posted[1]["action"], "click")

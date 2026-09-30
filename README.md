@@ -8,7 +8,7 @@ attach to the browser profile you use every day.
 The operator sends commands (navigate, snapshot, click, type, …). The relay
 pushes them to the extension over a WebSocket, and the extension runs them
 with `chrome.debugger`. Commands and results pass through the relay. This
-tree is extension v1.4.6.
+tree is extension v1.4.7.
 
 ## What the safeguards actually do
 
@@ -51,7 +51,8 @@ tree is extension v1.4.6.
   the action is not repeated to recover a lost delivery.
 - **Pairing.** Browsers join with single-use codes that expire after 10
   minutes. Revoking a device closes its live socket and rejects its later
-  polls.
+  polls. If Register and Unregister overlap, the later choice wins. Re-pairing
+  reports a failed old-device revocation with a command to revoke it manually.
 - **Result ownership.** The relay remembers which device a command was issued
   to. That record survives delivery acknowledgement and lasts until the
   result is accepted or it expires (10 minutes). Another device cannot submit
@@ -59,7 +60,10 @@ tree is extension v1.4.6.
   `{ok: true, duplicate: true}` and does not replace it.
 - **Result delivery.** A WebSocket `send` is not enough. The extension waits
   for `{type: "result_ack"}`. On timeout it posts the result to `POST /result`.
-  `{type: "result_rejected"}` is final and is not posted again.
+  `{type: "result_rejected"}` is final and is not posted again. The extension
+  in this source tree also authenticates HTTP results with a device-token header
+  before uploading its body, so an unfinished anonymous upload cannot occupy
+  their result-upload slot.
 
 ## Privacy
 
@@ -116,8 +120,11 @@ and `wait`. A click, or an element readiness condition, requires the
 snapshot id returned by `snapshot`. The extension resolves those refs
 against that capture's browser node ids. If the document changed, a newer
 snapshot replaced that id, or the node can no longer be resolved, the
-workflow refuses the reference instead of clicking a different element. A `snapshot` step inside a workflow is only a view of the live
-page and does not retarget the authorized refs. The extension keeps one debugger attachment for that list and
+workflow refuses the reference instead of clicking a different element. A
+bound click also checks that the captured element is at the click point
+immediately before input; a page change after that check can still make a
+coordinate click uncertain. A `snapshot` step inside a workflow is only a
+view of the live page and does not retarget the authorized refs. The extension keeps one debugger attachment for that list and
 releases it when the workflow finishes or is interrupted. A workflow holds the debugger until that workflow finishes, then releases it.
 Pause, the allowlist, and the page check still run on every step.
 No model call runs inside the workflow.
@@ -202,23 +209,45 @@ bound. These limits use UTF-8 bytes. Anonymous WebSocket upgrades are rejected
 before acceptance; ordinary network flooding still requires platform-level
 rate limits or upstream protection.
 
-Upgrade the relay and reload the v1.4.6 extension to activate these fixes.
-The GitHub code and a running relay or already-loaded browser extension
-can be different versions.
+The extension in this source tree sends `x-juno-device-token` on
+`POST /result` in addition to the token in the JSON body. The relay validates
+the header before reading the body and requires it to match the body token.
+Verified uploads have one reader per device, with two readers total to bound
+memory use. A third simultaneous upload gets a retryable 429. Older body-only
+clients use a separate bounded upload slot; an unfinished legacy upload can
+delay another legacy upload, but cannot occupy a verified device's slot or a
+WebSocket result commit. The relay must be updated before the new header path
+takes effect.
+
+These source changes do not alter a deployed relay or an already-loaded
+browser extension. Deploy the relay and reload the extension after verification.
 
 The result status is `completed`, `cancelled`, `interrupted`, `uncertain`,
 or `unobserved`. `uncertain` means some input may already have reached
-Chrome. A timed-out command is not sent again. `jb.py` sends a `request_id`
+Chrome, including navigation, close, or enabled `eval`. A timed-out command
+is not sent again. `jb.py` sends a `request_id`
 with each action. The operator repeats a timed-out HTTP request with that
 same id; the relay returns the existing command instead of starting another
-one. Two `send` calls are two ids and two actions.
+one. While waiting for a current relay, the driver also reuses that id to
+recover the result after an interrupted response. Two `send` calls are two
+ids and two actions. Before sending a command, the driver fixes the selected
+device when `/admin/devices` is available and checks whether the relay
+advertises idempotency. Older relays use one command POST and consuming result
+reads; an interrupted result response on that path can still have an uncertain
+outcome.
 
 The normal path is a user-scoped operator process on a private Unix socket.
 It keeps one HTTP client for the relay and a separate client for optional
-TypeSafe requests.
+TypeSafe requests. A queued Jev call whose caller disconnects or times out
+before admission is refused before a paid request is sent; once TypeSafe has
+accepted a request, disconnecting cannot undo it.
 Certificate verification stays on, and redirects are not followed.
 A health check is answered while one of those requests is still running, and
 a client that closes its socket does not stop the process.
+After updating the operator source, run `python3 driver/jb.py operator stop`
+once if the old process is still running. The next CLI request starts the new
+process; until then, the updated CLI refuses relay and Jev calls to the old
+process before they are sent.
 `JUNO_OPERATOR=0` or `JUNO_BRIDGE_HTTP=curl` is the curl compatibility path:
 one curl subprocess per relay request. Local native messaging is
 not in this release.
@@ -483,7 +512,9 @@ a 64-character hex SHA-256.
 | `POST /admin/bootstrap` | Disabled. Returns 410 `bootstrap_disabled` |
 
 Device HTTP routes (`/register`, `/poll`, `/result`, `/unregister`, and
-`/ws-ticket`) use POST bodies. `POST /ws-ticket` takes `{token}` and returns
+`/ws-ticket`) use POST bodies. The extension in this source tree also sends
+`x-juno-device-token` with the same token as the result body.
+`POST /ws-ticket` takes `{token}` and returns
 `{ticket, expires_in: 30}`. To upgrade `/ws`, offer the subprotocols
 `juno-bridge-v1` and `juno-ticket.<ticket>`; the relay returns only the public
 `juno-bridge-v1` protocol. The ticket is single-use, bound to the device and

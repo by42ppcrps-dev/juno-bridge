@@ -48,6 +48,44 @@ async function revokeOnRelay(token) {
   }
 }
 
+// Options can be open in more than one tab. Serialize the short storage
+// updates across those tabs; leave the relay requests outside the lock so
+// Unregister can invalidate a Register whose network response is delayed.
+let localPairingQueue = Promise.resolve();
+let pagePairingAction = 0;
+function withPairingLock(fn) {
+  if (typeof navigator !== "undefined" && navigator.locks?.request) {
+    return navigator.locks.request("juno-bridge-options-pairing", fn);
+  }
+  // Older browsers still serialize clicks from this Options page.
+  const result = localPairingQueue.then(fn, fn);
+  localPairingQueue = result.catch(() => {});
+  return result;
+}
+
+async function beginPairingIntent() {
+  return withPairingLock(async () => {
+    const { pairingIntent, deviceToken } = await chrome.storage.local.get({
+      pairingIntent: 0, deviceToken: null,
+    });
+    const intent = pairingIntent + 1;
+    await chrome.storage.local.set({ pairingIntent: intent });
+    return { intent, oldToken: deviceToken };
+  });
+}
+
+function statusIfCurrent(intent, message, cls) {
+  return withPairingLock(async () => {
+    const state = await chrome.storage.local.get({ pairingIntent: 0 });
+    if (state.pairingIntent === intent) setStatus(message, cls);
+  });
+}
+
+function revokeHelp(token) {
+  const id = token.slice(0, 8);
+  return `Ask your Juno operator to run python3 driver/jb.py revoke ${id} (device ${id}…).`;
+}
+
 async function refresh() {
   const s = await chrome.storage.local.get({
     deviceToken: null, deviceName: "", allowlist: [], allowEval: false,
@@ -72,43 +110,77 @@ registerBtn.addEventListener("click", async () => {
     setStatus("Enter the pairing code your Juno operator gave you.", "err");
     return;
   }
+  const action = ++pagePairingAction;
   setStatus("Registering…");
   registerBtn.disabled = true;
+  let intent = null;
   try {
-    const { deviceToken: oldToken } = await chrome.storage.local.get({ deviceToken: null });
+    const started = await beginPairingIntent();
+    intent = started.intent;
     const name = deviceNameInput.value.trim().slice(0, 60) || "My Chrome";
     const data = await postRelay("/register", { code, name });
     if (!data.device_token) throw new Error("relay sent no device token");
-    await chrome.storage.local.set({
-      // Publish the token and its progress together. Old-device saves use a
-      // separate item and cannot overwrite this pairing's initial cursor.
-      deviceToken: data.device_token, [`cursor:${data.device_token}`]: 0,
-      deviceName: name, enabled: true, relayStatus: null,
-    });
-    if (oldToken && oldToken !== data.device_token) await revokeOnRelay(oldToken);
     codeInput.value = "";
-    setStatus("Registered. The bridge is active — open the side panel to see it work.", "ok");
+    const published = await withPairingLock(async () => {
+      const state = await chrome.storage.local.get({ pairingIntent: 0 });
+      if (state.pairingIntent !== intent) return false;
+      await chrome.storage.local.set({
+        // Publish the token and its progress together. Old-device saves use a
+        // separate item and cannot overwrite this pairing's initial cursor.
+        deviceToken: data.device_token, [`cursor:${data.device_token}`]: 0,
+        deviceName: name, enabled: true, relayStatus: null,
+      });
+      return true;
+    });
+    if (!published) {
+      const revoked = await revokeOnRelay(data.device_token);
+      if (!revoked) {
+        setStatus(`Registration was cancelled, but its new token could not be revoked. ${revokeHelp(data.device_token)}`, "err");
+      } else if (pagePairingAction === action) {
+        setStatus("Registration cancelled; its new token was revoked.", "ok");
+      }
+    } else {
+      const oldToken = started.oldToken;
+      const revoked = !oldToken || oldToken === data.device_token || await revokeOnRelay(oldToken);
+      if (!revoked) {
+        setStatus(`Registered, but the previous device could not be revoked. ${revokeHelp(oldToken)}`, "err");
+      } else {
+        await statusIfCurrent(intent, "Registered. The bridge is active — open the side panel to see it work.", "ok");
+      }
+    }
   } catch (e) {
-    setStatus("Registration failed: " + e.message, "err");
+    if (intent === null) setStatus("Registration failed: " + e.message, "err");
+    else await statusIfCurrent(intent, "Registration failed: " + e.message, "err");
   } finally {
     registerBtn.disabled = false;
   }
-  refresh();
+  await refresh();
 });
 
 unregisterBtn.addEventListener("click", async () => {
-  const { deviceToken } = await chrome.storage.local.get({ deviceToken: null });
-  // Stop polling first, then revoke; the local token goes either way.
-  await chrome.storage.local.set({ enabled: false });
-  const revoked = deviceToken ? await revokeOnRelay(deviceToken) : true;
-  await chrome.storage.local.remove(["deviceToken", "deviceName", "cursor", "legacyCursorToken", "relayStatus"]);
-  setStatus(
-    revoked
-      ? "Unregistered and revoked on the relay. The extension no longer talks to it."
-      : "Unregistered locally, but the relay couldn't be reached to revoke the token — ask your Juno operator to revoke this device.",
-    revoked ? "ok" : "err"
-  );
-  refresh();
+  ++pagePairingAction;
+  unregisterBtn.disabled = true;
+  try {
+    const { deviceToken, intent } = await withPairingLock(async () => {
+      const state = await chrome.storage.local.get({ pairingIntent: 0, deviceToken: null });
+      const nextIntent = state.pairingIntent + 1;
+      // Stop polling and invalidate pending registrations before relay I/O.
+      await chrome.storage.local.set({ pairingIntent: nextIntent, enabled: false });
+      await chrome.storage.local.remove(["deviceToken", "deviceName", "cursor", "legacyCursorToken", "relayStatus"]);
+      return { deviceToken: state.deviceToken, intent: nextIntent };
+    });
+    const revoked = deviceToken ? await revokeOnRelay(deviceToken) : true;
+    if (!revoked) {
+      setStatus(`Unregistered locally, but the relay could not revoke the device. ${revokeHelp(deviceToken)}`, "err");
+    } else {
+      await statusIfCurrent(intent, "Unregistered and revoked on the relay. The extension no longer talks to it.", "ok");
+    }
+  } catch (e) {
+    setStatus("Unregistration failed: " + e.message, "err");
+  } finally {
+    unregisterBtn.disabled = false;
+  }
+  await refresh();
 });
 
 saveBtn.addEventListener("click", async () => {

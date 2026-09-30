@@ -193,8 +193,10 @@ class OperatorTests(unittest.TestCase):
             return 200, b'{"ok":true,"n":1}'
 
         res = self.op.handle_message({
+            "op": "relay_request_v1",
             "method": "POST",
-            "path": "/admin/run",
+            "route": "/admin/run",
+            "retry_safe": True,
             "data": {"request_id": "req_timeout1", "action": "click"},
             "timeout": 5,
         }, FakeClient(respond))
@@ -203,6 +205,84 @@ class OperatorTests(unittest.TestCase):
         self.assertEqual(len(bodies), 2)
         self.assertEqual(bodies[0], bodies[1])
         self.assertIn(b"req_timeout1", bodies[0])
+
+    def test_retry_budget_keeps_a_second_same_id_attempt_after_full_first_timeout(self):
+        clock = [100.0]
+        observed = []
+
+        def respond(_method, _url, _headers, body, timeout):
+            observed.append((body, timeout))
+            if len(observed) == 1:
+                clock[0] += timeout
+                raise TimeoutError("first transport waited to its limit")
+            return 200, b'{"ok":true}'
+
+        with mock.patch.object(self.op.time, "monotonic", side_effect=lambda: clock[0]):
+            result = self.op.handle_message({
+                "op": "relay_request_v1", "method": "POST", "route": "/admin/run",
+                "retry_safe": True, "timeout": 60,
+                "data": {"request_id": "req_budget_01", "action": "click"},
+            }, FakeClient(respond))
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(observed), 2)
+        self.assertEqual([timeout for _, timeout in observed], [30, 30])
+        self.assertEqual(observed[0][0], observed[1][0])
+
+    def test_pairing_and_consuming_result_are_not_retried_after_timeout(self):
+        for method, path, data in (
+            ("POST", "/admin/pair", {}),
+            ("POST", "/admin/cmd", {"request_id": "req_legacy_cmd", "action": "click"}),
+            ("GET", "/admin/result?id=cmd_" + "ab" * 8, None),
+        ):
+            with self.subTest(path=path):
+                client = FakeClient(lambda *_args: (_ for _ in ()).throw(TimeoutError("lost reply")))
+                result = self.op.handle_message({
+                    "method": method, "path": path, "data": data, "timeout": 5,
+                }, client)
+                self.assertFalse(result["ok"])
+                self.assertIn("timed out", result["error"])
+                self.assertEqual(len(client.calls), 1)
+
+    def test_versioned_relay_rpc_fails_closed_on_an_older_daemon(self):
+        def old_daemon(message, timeout=60):
+            self.assertEqual(message["op"], "relay_request_v1")
+            self.assertNotIn("path", message)
+            self.assertEqual(message["route"], "/admin/run")
+            self.assertTrue(message["retry_safe"])
+            # Old handler ignores unknown ops and rejects a missing `path`.
+            return {"ok": False, "error": "bad path"}
+
+        with mock.patch.object(self.op, "ensure"), \
+                mock.patch.object(self.op, "read_private", return_value="socket-token"), \
+                mock.patch.object(self.op, "transact", side_effect=old_daemon):
+            with self.assertRaisesRegex(self.op.OperatorError, "operator is outdated.*No relay request was made"):
+                self.op.call("POST", "/admin/run", {"request_id": "req_old_daemon"}, 60,
+                             retry_safe=True)
+
+    def test_socket_timeout_is_a_clear_operator_error(self):
+        held = threading.Event()
+        release = threading.Event()
+
+        def responder(*_args):
+            held.set()
+            self.assertTrue(release.wait(3))
+            return 200, b'{"ok":true}'
+
+        client = FakeClient(responder)
+        token = self.start(client)
+        try:
+            with self.assertRaisesRegex(self.op.OperatorError, "socket timed out.*outcome is uncertain"):
+                self.op.transact({
+                    "token": token, "method": "POST", "path": "/admin/run",
+                    "data": {"request_id": "req_socket_timeout", "action": "ping"},
+                }, timeout=0.1)
+            self.assertTrue(held.is_set())
+        finally:
+            release.set()
+        deadline = time.monotonic() + 2
+        while not client.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(client.calls), 1)
 
     def test_http_and_socket_errors_are_not_retried(self):
         once = {"n": 0}
@@ -411,7 +491,7 @@ class OperatorTests(unittest.TestCase):
             self.assertNotIn('"authorization"', message)
             self.assertNotIn('"api_key"', message)
         paid_messages = [json.loads(message) for message in seen
-                         if json.loads(message).get("op") == "systemone_byok_v1"]
+                         if json.loads(message).get("op") == "systemone_byok_v2"]
         self.assertEqual(len(paid_messages), 7)
         self.assertEqual([item["key_fingerprint"] for item in paid_messages], [
             hashlib.sha256(secret.encode()).hexdigest(),
@@ -496,11 +576,11 @@ class OperatorTests(unittest.TestCase):
         with mock.patch.object(self.op, "ensure"), \
                 mock.patch.object(self.op, "read_private", return_value="socket-token"), \
                 mock.patch.object(self.op, "transact", return_value={"ok": False, "error": "bad path"}) as rpc:
-            with self.assertRaisesRegex(self.op.OperatorError, "configuration changed.*No API call was made"):
+            with self.assertRaisesRegex(self.op.OperatorError, "operator is outdated.*No API call was made"):
                 self.op.systemone({"questions": {}})
         rpc.assert_called_once()
         message = rpc.call_args.args[0]
-        self.assertEqual(message["op"], "systemone_byok_v1")
+        self.assertEqual(message["op"], "systemone_byok_v2")
         self.assertEqual(message["key_fingerprint"], hashlib.sha256(key.encode()).hexdigest())
         self.assertEqual(message["typesafe_base_url"], "https://api.typesafe.ai:443")
         self.assertNotIn(key, json.dumps(message))
@@ -534,6 +614,73 @@ class OperatorTests(unittest.TestCase):
         self.assertNotIn(secret, result["error"])
         self.assertIn("[redacted]", result["error"])
         session.post.assert_called_once_with({}, secret, 30)
+
+    def test_queued_jev_caller_disconnect_or_expiry_prevents_paid_post(self):
+        jev = self.op.jev_mod()
+        key = "typesafe-queued-work-key"
+        jev.config_mod().write_api_key(key)
+        jev.config_mod().set_enabled(True)
+        message = {
+            "op": "systemone_byok_v2", "body": {"questions": {}}, "timeout": 30,
+            "key_fingerprint": hashlib.sha256(key.encode()).hexdigest(),
+            "typesafe_base_url": "https://api.typesafe.ai:443",
+        }
+        for abandoned in ("disconnected", "expired"):
+            with self.subTest(abandoned=abandoned):
+                server, caller = socket.socketpair()
+                session = mock.Mock()
+                getter = mock.Mock(return_value=session)
+                work = self.op.queue.Queue()
+                deadline = time.monotonic() + 30
+                if abandoned == "disconnected":
+                    caller.close()
+                else:
+                    deadline = time.monotonic() - 1
+                work.put((server, message, deadline))
+                work.put(None)
+                try:
+                    self.op._worker_loop(work, FakeClient(), getter, self.op._ServeGate())
+                    getter.assert_not_called()
+                    session.post.assert_not_called()
+                    if abandoned == "expired":
+                        caller.settimeout(1)
+                        reply = json.loads(caller.recv(4096))
+                        self.assertFalse(reply["ok"])
+                        self.assertIn("no API call was made", reply["error"])
+                finally:
+                    caller.close()
+
+    def test_jev_checks_caller_again_after_client_initialization(self):
+        jev = self.op.jev_mod()
+        key = "typesafe-client-init-key"
+        jev.config_mod().write_api_key(key)
+        jev.config_mod().set_enabled(True)
+        session = mock.Mock()
+        admission = mock.Mock(side_effect=[True, True, False])
+        result = self.op.handle_message({
+            "op": "systemone_byok_v1", "body": {},
+            "key_fingerprint": hashlib.sha256(key.encode()).hexdigest(),
+            "typesafe_base_url": "https://api.typesafe.ai:443",
+        }, FakeClient(), lambda: session, admission=admission)
+        self.assertFalse(result["ok"])
+        self.assertIn("no API call was made", result["error"])
+        session.post.assert_not_called()
+
+    def test_queued_jev_caps_provider_deadline_to_caller_budget(self):
+        jev = self.op.jev_mod()
+        key = "typesafe-budget-key"
+        jev.config_mod().write_api_key(key)
+        jev.config_mod().set_enabled(True)
+        session = mock.Mock()
+        session.post.return_value = {"answers": {}}
+        admission = mock.Mock(side_effect=[35, 35, 4])
+        result = self.op.handle_message({
+            "op": "systemone_byok_v1", "body": {}, "timeout": 30,
+            "key_fingerprint": hashlib.sha256(key.encode()).hexdigest(),
+            "typesafe_base_url": "https://api.typesafe.ai:443",
+        }, FakeClient(), lambda: session, admission=admission)
+        self.assertTrue(result["ok"])
+        session.post.assert_called_once_with({}, key, 4)
 
     def test_jev_scrubs_echoed_keys_at_the_operator_socket_boundary(self):
         jev = self.op.jev_mod()

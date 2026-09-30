@@ -46,6 +46,11 @@ class FakeRelayClient:
         self.closed = False
 
     def request(self, method, url, headers, body, timeout):
+        if method == "GET" and url == "https://relay.invalid/admin/devices":
+            return 200, json.dumps({
+                "default": "a1b2c3d4", "devices": [{"id": "a1b2c3d4"}],
+                "capabilities": ["idempotency", "workflow"],
+            }).encode("utf-8")
         if method != "POST" or url != "https://relay.invalid/admin/run":
             raise AssertionError("unexpected relay request")
         command = json.loads(body)

@@ -69,6 +69,9 @@ const BODY_MAX = 64 * 1024;
 const RESULT_BODY_MAX = 10 * 1024 * 1024;
 const BODY_TIMEOUT_MS = 15_000;
 const BODY_READERS_MAX = 8;
+// Unlike ordinary 64 KiB POSTs, each result can buffer 10 MiB before parsing.
+// A third paired device may receive a retryable 429 while both slots are held.
+const RESULT_BODY_READERS_MAX = 2;
 const WS_MESSAGE_MAX = 900 * 1024;
 const WAITERS_MAX = 256;
 const RESULT_STREAMS_MAX = 16;
@@ -147,7 +150,7 @@ function corsHeaders(path, origin) {
   if (!origin || !origin.startsWith("chrome-extension://")) return {};
   return {
     "access-control-allow-origin": origin,
-    "access-control-allow-headers": "content-type",
+    "access-control-allow-headers": "content-type, x-juno-device-token",
     "access-control-allow-methods": "POST, OPTIONS",
     vary: "origin",
   };
@@ -299,7 +302,10 @@ export class BridgeHub {
     this.waiterCount = 0;
     this.bodyReaders = 0;
     this.postRequests = 0;
-    this.resultBodyReaders = 0;
+    this.resultBodyReaders = 0; // verified-token HTTP uploads, globally bounded
+    this.resultBodyReaderTokens = new Set(); // one in-flight upload per device
+    this.legacyResultBodyReaders = 0; // body-only clients cannot occupy the verified slot
+    this.resultCommitters = 0; // parsed HTTP and WebSocket results share one commit slot
     this.resultStreams = 0;
     this.resultPins = new Map(); // active, deadline-bounded streams defer TTL deletion
     // The runtime answers the extension's keepalive without waking the hub.
@@ -790,13 +796,13 @@ export class BridgeHub {
       const seq = msg.seq; msg = null;
       await this.ack(att.token, seq);
     } else if (msg.type === "result" && typeof msg.id === "string" && CMD_ID_RE.test(msg.id)) {
-      // HTTP and socket result commits share one large-payload admission slot.
-      // Close rather than issuing a final rejection: the client can use HTTP.
-      if (this.resultBodyReaders >= 1) { try { ws.close(1013, "result_busy"); } catch { /* closing */ } return; }
-      this.resultBodyReaders++;
+      // A half-open HTTP body cannot block socket completion. Parsed results
+      // still share one bounded commit slot; the client can retry over HTTP.
+      if (this.resultCommitters >= 1) { try { ws.close(1013, "result_busy"); } catch { /* closing */ } return; }
+      this.resultCommitters++;
       let verdict;
       try { verdict = await this.acceptResult(att.token, msg.id, msg); }
-      finally { this.resultBodyReaders--; }
+      finally { this.resultCommitters--; }
       try {
         ws.send(JSON.stringify(verdict.ok
           ? { type: "result_ack", id: msg.id }
@@ -826,14 +832,29 @@ export class BridgeHub {
     const origin = req.headers.get("origin");
     const resultBody = path === "/result" && req.method === "POST";
     const ordinaryPost = req.method === "POST" && !resultBody;
-    if (resultBody && this.resultBodyReaders >= 1) return jsonResponse({ error: "too_many_body_readers" }, 429, corsHeaders(path, req.headers.get("origin")));
+    const hasResultHeader = resultBody && req.headers.has("x-juno-device-token");
+    const resultToken = hasResultHeader ? req.headers.get("x-juno-device-token") : null;
+    // The device token remains in the body for older clients. A valid token
+    // header lets current clients use a protected upload slot before the body
+    // is read; an anonymous stalled body can only occupy the legacy slot.
+    if (hasResultHeader && (!TOKEN_RE.test(resultToken) || !this.devices.has(resultToken))) {
+      return jsonResponse({ error: "unknown_device" }, 403, corsHeaders(path, origin));
+    }
+    if (resultBody && (hasResultHeader
+      ? this.resultBodyReaders >= RESULT_BODY_READERS_MAX || this.resultBodyReaderTokens.has(resultToken)
+      : this.legacyResultBodyReaders >= 1)) {
+      return jsonResponse({ error: "too_many_body_readers" }, 429, corsHeaders(path, origin));
+    }
     if (ordinaryPost && this.postRequests >= BODY_READERS_MAX) return jsonResponse({ error: "too_many_body_readers" }, 429, corsHeaders(path, req.headers.get("origin")));
-    if (resultBody) this.resultBodyReaders++;
+    if (resultBody) {
+      if (hasResultHeader) { this.resultBodyReaders++; this.resultBodyReaderTokens.add(resultToken); }
+      else this.legacyResultBodyReaders++;
+    }
     if (ordinaryPost) this.postRequests++;
     let admittedPost = ordinaryPost;
     const releasePost = () => { if (admittedPost) { admittedPost = false; this.postRequests--; } };
     try {
-      const work = this.handle(req, releasePost);
+      const work = this.handle(req, releasePost, resultToken);
       req = null;
       return await work;
     } catch (e) {
@@ -841,12 +862,15 @@ export class BridgeHub {
       console.error("juno-bridge hub: request failed");
       return jsonResponse({ error: "server_error" }, 500, corsHeaders(path, origin));
     } finally {
-      if (resultBody) this.resultBodyReaders--;
+      if (resultBody) {
+        if (hasResultHeader) { this.resultBodyReaders--; this.resultBodyReaderTokens.delete(resultToken); }
+        else this.legacyResultBodyReaders--;
+      }
       releasePost();
     }
   }
 
-  async handle(req, releasePost = () => {}) {
+  async handle(req, releasePost = () => {}, resultToken = null) {
     const url = new URL(req.url);
     const path = url.pathname;
     const origin = req.headers.get("origin");
@@ -908,13 +932,17 @@ export class BridgeHub {
     if (DEVICE_PATHS.has(path) && origin && !origin.startsWith("chrome-extension://")) return json({ error: "forbidden_origin" }, 403);
     let body = {};
     if (req.method === "POST") {
-      if (this.bodyReaders >= BODY_READERS_MAX) return json({ error: "too_many_body_readers" }, 429);
-      this.bodyReaders++;
+      // /result has separate bounded upload slots. Ordinary anonymous POSTs
+      // must not exhaust the reader cap used by a verified result upload.
+      const ordinaryBody = path !== "/result";
+      if (ordinaryBody && this.bodyReaders >= BODY_READERS_MAX) return json({ error: "too_many_body_readers" }, 429);
+      if (ordinaryBody) this.bodyReaders++;
       try { body = await readJsonBody(req, path === "/result" ? RESULT_BODY_MAX : BODY_MAX); }
-      finally { this.bodyReaders--; }
+      finally { if (ordinaryBody) this.bodyReaders--; }
     }
 
-    // Token accepted ONLY from the POST body — never from the query string.
+    // Device routes use the POST body token. /result additionally accepts a
+    // matching header token for admission before its potentially slow body.
     const requireDevice = () => {
       const tok = typeof body.token === "string" ? body.token : null;
       if (!tok) return { err: json({ error: "missing_device_token" }, 401) };
@@ -1017,7 +1045,7 @@ export class BridgeHub {
           pending: this.pending(t).length,
         };
       });
-      return json({ ok: true, devices, default: this.order.length ? this.order[this.order.length - 1].slice(0, 8) : null });
+      return json({ ok: true, devices, default: this.order.length ? this.order[this.order.length - 1].slice(0, 8) : null, capabilities: CAPABILITIES });
     }
 
     // ---- admin: revoke a device (lost laptop, stale pairing) ----
@@ -1080,10 +1108,15 @@ export class BridgeHub {
     if (path === "/result" && req.method === "POST") {
       const d = requireDevice();
       if (d.err) return d.err;
+      if (resultToken && d.token !== resultToken) return json({ error: "token_mismatch" }, 403);
       const id = body.id;
       if (!id) return json({ error: "missing_id" }, 400);
       if (typeof id !== "string" || !CMD_ID_RE.test(id)) return json({ error: "bad_id" }, 400);
-      const verdict = await this.acceptResult(d.token, id, body);
+      if (this.resultCommitters >= 1) return json({ error: "result_busy" }, 429);
+      this.resultCommitters++;
+      let verdict;
+      try { verdict = await this.acceptResult(d.token, id, body); }
+      finally { this.resultCommitters--; }
       if (!verdict.ok) return json({ error: verdict.error }, verdict.status);
       return json(verdict.duplicate ? { ok: true, duplicate: true } : { ok: true });
     }

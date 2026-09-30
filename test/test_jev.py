@@ -847,15 +847,17 @@ class JevTests(unittest.TestCase):
             json.dump({"relay_url": "https://relay.example"}, handle)
         result = {"ok": True, "data": {"version": "1.3.0"}}
 
-        def run(_args, **_kwargs):
+        def run(args, **_kwargs):
+            with open(args[args.index("--config") + 1], encoding="utf-8") as handle:
+                is_devices = "/admin/devices" in handle.read()
             proc = mock.Mock()
             proc.returncode = 0
-            proc.stdout = json.dumps({
-                "ok": True,
-                "pending": False,
-                "id": "cmd_" + "ab" * 8,
-                "result": result,
-            }) + "\nHTTPSTATUS:200"
+            payload = ({"default": "a1b2c3d4", "devices": [{"id": "a1b2c3d4"}],
+                        "capabilities": ["idempotency"]} if is_devices else {
+                            "ok": True, "pending": False,
+                            "id": "cmd_" + "ab" * 8, "result": result,
+                        })
+            proc.stdout = json.dumps(payload) + "\nHTTPSTATUS:200"
             proc.stderr = ""
             return proc
 

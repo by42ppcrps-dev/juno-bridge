@@ -128,7 +128,7 @@ def interpret_relay(status, payload, tolerate):
     return payload
 
 
-def relay_request(method, path, data=None, timeout=30, tolerate=()):
+def relay_request(method, path, data=None, timeout=30, tolerate=(), retry_safe=False):
     """Send one relay request. The operator process is the normal path.
 
     curl is the compatibility path (JUNO_OPERATOR=0 or JUNO_BRIDGE_HTTP=curl).
@@ -138,7 +138,7 @@ def relay_request(method, path, data=None, timeout=30, tolerate=()):
     """
     if operator_enabled():
         try:
-            status, payload = operator_mod().call(method, path, data, timeout)
+            status, payload = operator_mod().call(method, path, data, timeout, retry_safe=retry_safe)
         except operator_mod().OperatorError as exc:
             die(f"request failed: {exc}")
         return interpret_relay(status, payload, tolerate)
@@ -287,37 +287,67 @@ def run_action(action, params, device="default"):
     request_id is new for each call. A transport retry inside the operator
     reuses this same id; it does not enqueue a second browser command.
     """
+    listing = relay_request("GET", "/admin/devices", tolerate=(404,))
+    unlisted_legacy = listing.get("_status") == 404
+    capabilities = listing.get("capabilities")
+    idempotent = (not unlisted_legacy and isinstance(capabilities, list)
+                  and "idempotency" in capabilities)
+    if not unlisted_legacy and (not device or device == "default"):
+        selected = listing.get("default")
+        entries = listing.get("devices")
+        if (not isinstance(selected, str) or len(selected) != 8
+                or any(char not in "0123456789abcdef" for char in selected)
+                or not isinstance(entries, list)
+                or sum(isinstance(item, dict) and item.get("id") == selected
+                       for item in entries) != 1):
+            die("relay did not return a unique default device id; no action was issued")
+        device = selected
     cmd = {
         "device": device,
         "action": action,
         "params": params,
         "request_id": "req_" + secrets.token_hex(8),
     }
-    deadline = time.time() + 60
+    deadline = time.monotonic() + 75
 
-    # Fast path: enqueue and wait for the result in one request. The relay
-    # answers the moment the browser reports back.
-    res = relay_request("POST", "/admin/run", dict(cmd, wait=25), timeout=40, tolerate=(404,))
-    if res.get("_status") == 404:
-        # Relay predates /admin/run: enqueue, then poll for the result.
+    # Older relays may accept request_id but lack idempotency. Use one POST
+    # and consuming result reads until the relay advertises safe replay.
+    legacy = not idempotent
+    if legacy:
         res = relay_request("POST", "/admin/cmd", cmd)
-    elif not res.get("pending"):
-        result = res.get("result")
-        if not isinstance(result, dict):
-            die("relay returned no result")
-        return result
+    else:
+        res = relay_request("POST", "/admin/run", dict(cmd, wait=25), timeout=60,
+                            tolerate=(404,), retry_safe=True)
+        if res.get("_status") == 404:
+            legacy = True
+            res = relay_request("POST", "/admin/cmd", cmd)
+        elif not res.get("pending"):
+            result = res.get("result")
+            if not isinstance(result, dict):
+                die("relay returned no result")
+            return result
 
     cmd_id = res["id"]
-    while time.time() < deadline:
-        started = time.time()
-        # Current relays hold this request until the result lands (up to 20s).
-        r = relay_request("GET", f"/admin/result?id={cmd_id}&wait=20", timeout=35)
+    while time.monotonic() < deadline:
+        started = time.monotonic()
+        if legacy:
+            r = relay_request("GET", f"/admin/result?id={cmd_id}&wait=20",
+                              timeout=min(35, max(1, deadline - time.monotonic())))
+        else:
+            # A result GET consumes its receipt. If its reply is interrupted,
+            # repeating the GET can wait forever. Repeating this request_id on
+            # current relays returns the original command and retained result.
+            r = relay_request("POST", "/admin/run", dict(cmd, wait=20),
+                              timeout=min(35, max(1, deadline - time.monotonic())),
+                              retry_safe=True)
+            if r.get("id") != cmd_id:
+                die("relay did not confirm command replay; outcome is uncertain")
         if not r.get("pending"):
             result = r.get("result")
             if not isinstance(result, dict):
                 die("relay returned no result")
             return result
-        if time.time() - started < 1:
+        if time.monotonic() - started < 1:
             time.sleep(2.0)  # older relay answered at once: don't hammer it
     die(f"timeout waiting for device (id {cmd_id})")
 
