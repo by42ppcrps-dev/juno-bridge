@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+import stat
 from pathlib import Path
 from unittest import mock
 
@@ -95,6 +96,7 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.getvalue()), result)
 
+
     def test_polled_failure_exits_nonzero(self):
         result = {"ok": False, "error": "boom"}
         self.respond([
@@ -169,6 +171,114 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(posted[0]["action"], "click")
         self.assertEqual(posted[1]["action"], "click")
         self.assertNotIn("wait", posted[1])
+
+
+class JevSettingsTests(unittest.TestCase):
+    """Exercise the user-facing toggle with isolated settings and no API calls."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"JUNO_JEV_CONFIG_DIR": self.tmp.name}, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mod = jb.jev_mod()
+        self.config = self.mod.config_mod()
+        for obj, name in ((jb, "run_action"), (self.mod, "post_systemone")):
+            patcher = mock.patch.object(obj, name, side_effect=AssertionError("unexpected network/action"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def invoke(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            result = jb.main(["jb.py", "jev", *args])
+        return result, out.getvalue(), err.getvalue()
+
+    def test_status_is_off_and_has_no_key_by_default(self):
+        code, output, _ = self.invoke("status")
+        report = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertFalse(report["enabled"])
+        self.assertFalse(report["key_present"])
+
+    def test_hidden_configure_then_on_and_off_preserve_the_users_settings(self):
+        secret = "test-only-user-key-not-a-real-credential"
+        self.config.update_settings({"relay_url": "https://relay.example", "custom": "keep"})
+        with mock.patch.object(jb.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(jb.getpass, "getpass", return_value=secret) as prompt:
+            code, output, _ = self.invoke("configure")
+        self.assertEqual(code, 0)
+        prompt.assert_called_once()
+        self.assertNotIn(secret, output)
+        self.assertFalse(self.config.enabled())
+        self.assertEqual(stat.S_IMODE(self.config.key_path().stat().st_mode), 0o600)
+        self.assertNotIn(secret, self.config.config_path().read_text())
+        code, output, _ = self.invoke("on")
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(output)["enabled"])
+        self.assertNotIn(secret, output)
+        self.assertEqual(self.config.settings()["custom"], "keep")
+        self.invoke("off")
+        self.assertFalse(self.config.enabled())
+        self.assertEqual(self.config.settings()["relay_url"], "https://relay.example")
+
+    def test_on_without_own_key_fails_before_enabling(self):
+        with self.assertRaises(SystemExit) as raised, mock.patch("sys.stderr", io.StringIO()):
+            self.invoke("on")
+        self.assertEqual(raised.exception.code, 2)
+        self.assertFalse(self.config.enabled())
+
+    def test_noninteractive_configure_cannot_echo_a_key(self):
+        with mock.patch.object(jb.sys.stdin, "isatty", return_value=False), \
+                mock.patch.object(jb.getpass, "getpass") as prompt, \
+                self.assertRaises(SystemExit) as raised:
+            self.invoke("configure")
+        self.assertEqual(raised.exception.code, 2)
+        prompt.assert_not_called()
+        self.assertFalse(self.config.key_path().exists())
+
+    def test_api_key_is_not_accepted_as_a_command_line_argument(self):
+        secret = "test-only-key-not-for-argv"
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err), \
+                self.assertRaises(SystemExit) as raised:
+            jb.main(["jb.py", "jev", "configure", secret])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertNotIn(secret, out.getvalue() + err.getvalue())
+        self.assertFalse(self.config.key_path().exists())
+
+    def test_jev_report_redacts_escaped_keys_before_json_serialization(self):
+        secret = 'test-only-key-"-\\-not-real'
+        report = {"ok": True, "goal": secret, "nested": [{secret: "echo " + secret}]}
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            self.assertEqual(jb.finish_jev(report, secret), 0)
+        rendered = json.loads(out.getvalue())
+        self.assertEqual(rendered["goal"], "[redacted]")
+        self.assertEqual(rendered["nested"], [{"[redacted]": "echo [redacted]"}])
+        self.assertNotIn(secret, str(rendered))
+
+    def test_env_override_is_reported_when_the_saved_toggle_is_changed(self):
+        self.config.write_api_key("test-only-own-key")
+        os.environ["JUNO_JEV"] = "1"
+        _, output, err = self.invoke("off")
+        report = json.loads(output)
+        self.assertFalse(report["persisted_enabled"])
+        self.assertTrue(report["enabled"])
+        self.assertIn("overrides the saved toggle", err)
+
+    def test_relay_init_preserves_jev_preference_and_private_config_mode(self):
+        path = self.config.config_path()
+        self.config.update_settings({"jev_enabled": True, "custom": "keep"})
+        with mock.patch.object(jb, "CONFIG_FILE", str(path)), mock.patch("sys.stdout", io.StringIO()):
+            jb.main(["jb.py", "init", "https://another-relay.example"])
+        saved = self.config.settings()
+        self.assertTrue(saved["jev_enabled"])
+        self.assertEqual(saved["custom"], "keep")
+        self.assertEqual(saved["relay_url"], "https://another-relay.example")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
 
 
 if __name__ == "__main__":

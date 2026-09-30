@@ -15,6 +15,16 @@ Setup:
                        # e.g. jb.py send navigate '{"url":"https://example.com"}'
                        # waits up to 60s for the result and prints it
                        # exits 1 if that result is a failure
+  jb.py jev configure  # hidden prompt for YOUR TypeSafe API key; local mode-0600 file
+  jb.py jev on|off|status
+                       # saved opt-in toggle; off by default, enabled calls are billed
+  jb.py jev target|page|step ... --tab <id> --goal <text> [--device name]
+                       [--observation <file>] [--after-ready <json>] [--click]
+                       # optional, off until enabled. A billed TypeSafe
+                       # call. Does nothing to the browser unless --click.
+                       # --click submits that snapshot's ref. --observation
+                       # reuses a snapshot instead of taking one.
+                       # --after-ready adds one bounded condition to that click.
 
 Actions: ping, tabs, navigate, screenshot, snapshot, text, click, type, key,
          scroll, close, eval, workflow
@@ -24,6 +34,7 @@ Actions: ping, tabs, navigate, screenshot, snapshot, text, click, type, key,
 
 Normal commands go through that process so the HTTP client stays alive.
 A client that closes its socket does not stop the process.
+An enabled Jev call uses a separate client in the same process.
 JUNO_OPERATOR=0 uses one curl subprocess per relay request instead.
 
 Security notes:
@@ -36,6 +47,7 @@ Security notes:
   - `bootstrap` does not contact the relay and cannot claim one. Set
     ADMIN_PSK_SHA256 before the relay is reachable.
 """
+import getpass
 import hashlib
 import importlib.util
 import json
@@ -46,8 +58,13 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 
-CONFIG_DIR = os.path.expanduser("~/.config/juno-bridge")
+CONFIG_DIR = os.path.expanduser(
+    os.environ.get("JUNO_JEV_CONFIG_DIR", "").strip()
+    or os.environ.get("JUNO_OPERATOR_DIR", "").strip()
+    or "~/.config/juno-bridge"
+)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 PSK_FILE = os.path.join(CONFIG_DIR, "psk")
 PSK_ENV = "JUNO_BRIDGE_PSK"
@@ -204,9 +221,14 @@ def relay_request_curl(method, path, data=None, timeout=30, tolerate=()):
 def cmd_init(args):
     if not args:
         die("usage: jb.py init <relay-url>", 2)
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump({"relay_url": args[0].rstrip("/")}, f, indent=2)
+    if len(args) != 1 or not args[0].startswith("https://"):
+        die("usage: jb.py init <https-relay-url>", 2)
+    try:
+        jev_mod().config_mod().update_settings(
+            {"relay_url": args[0].rstrip("/")}, path=Path(CONFIG_FILE)
+        )
+    except (OSError, ValueError) as exc:
+        die(str(exc), 2)
     print("relay set to", args[0].rstrip("/"))
 
 
@@ -329,6 +351,7 @@ def cmd_send(args):
     return finish_result(run_action(action, params, device))
 
 
+_jev = None
 _operator = None
 
 
@@ -346,6 +369,169 @@ def operator_mod():
     return _operator
 
 
+def jev_mod():
+    """Load the optional decision helper. It does not contact TypeSafe itself."""
+    global _jev
+    if _jev is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jev.py")
+        spec = importlib.util.spec_from_file_location("juno_jev", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _jev = mod
+    return _jev
+
+
+def cmd_jev_setting(mod, args):
+    """Manage the local opt-in/key without contacting Chrome or TypeSafe."""
+    action = args[0]
+    if len(args) != 1:
+        die("usage: jb.py jev configure|on|off|status", 2)
+    config = mod.config_mod()
+    try:
+        if action == "configure":
+            if not sys.stdin.isatty():
+                die("jev configure needs an interactive terminal for a hidden key prompt. "
+                    "Alternatively set TYPESAFE_API_KEY in your own environment.", 2)
+            key = getpass.getpass("Your TypeSafe API key (hidden): ")
+            config.write_api_key(key)
+            print(f"Your key was saved privately to {config.key_path()}. "
+                  "No API call was made. Use 'jb.py jev on' to opt in.")
+            return 0
+        if action in ("on", "enable"):
+            # Verify the user's key locally before enabling paid requests.
+            mod.api_key()
+            config.set_enabled(True)
+        elif action in ("off", "disable"):
+            config.set_enabled(False)
+        report = config.status()
+        print(json.dumps(report, indent=2))
+        if action != "status" and report["override"] is not None:
+            print("JUNO_JEV overrides the saved toggle; unset it to use the saved setting.",
+                  file=sys.stderr)
+        return 0
+    except (OSError, ValueError) as exc:
+        die(str(exc), 2)
+    except (EOFError, KeyboardInterrupt):
+        die("Jev key setup cancelled; no API call was made", 2)
+
+
+def cmd_jev(args):
+    """Optional billed page decisions, using the user's own API key."""
+    mod = jev_mod()
+    if args and args[0] in ("configure", "on", "off", "status", "enable", "disable"):
+        return cmd_jev_setting(mod, args)
+    try:
+        is_enabled = mod.enabled()
+    except ValueError as exc:
+        die(str(exc), 2)
+    if not is_enabled:
+        print(mod.OFF_MESSAGE, file=sys.stderr)
+        return 2
+    try:
+        opts = mod.parse_args(args)
+    except ValueError as e:
+        die(str(e), 2)
+    try:
+        gate = mod.min_confidence() if opts["click"] else None
+        # Missing or insecure credentials fail before requesting any page data.
+        key = mod.api_key()
+    except ValueError as e:
+        die(str(e), 2)
+
+    if opts["observation"]:
+        try:
+            data = mod.read_observation(opts["observation"])
+        except ValueError as e:
+            die(str(e), 2)
+    else:
+        snap = run_action("snapshot", {"tabId": opts["tab"]}, opts["device"])
+        if snap.get("ok") is not True:
+            return finish_result(snap)
+        data = snap.get("data") if isinstance(snap.get("data"), dict) else {}
+    prepared = mod.prepare(data, opts["kinds"], opts["goal"])
+    if prepared["skip_model"]:
+        report = mod.local_none(prepared, opts["goal"])
+        if opts["click"]:
+            report["ok"] = False
+            report["click"] = {
+                "issued": False,
+                "reason": "the snapshot listed no elements, so no click was issued",
+            }
+        return finish_jev(report, key)
+
+    try:
+        if operator_enabled():
+            response = operator_mod().systemone(prepared["body"])
+        else:
+            response = mod.post_systemone(prepared["body"], key)
+        report = mod.interpret(response, prepared, opts["goal"])
+    except ValueError as e:
+        die(mod.scrub(str(e), key), 2)
+    except mod.JevError as e:
+        die(mod.scrub(str(e), key))
+    except operator_mod().OperatorError as e:
+        text = mod.scrub(str(e), key)
+        code = 2 if "TYPESAFE_API_KEY" in text or "no TypeSafe API key" in text else 1
+        die(text, code)
+
+    if not opts["click"]:
+        report["click"] = None
+        return finish_jev(report, key)
+
+    target = report["decisions"].get("target") or {}
+    refusal = mod.click_refusal(target, gate)
+    if refusal:
+        report["ok"] = False
+        report["click"] = {"issued": False, "reason": refusal}
+        return finish_jev(report, key)
+
+    handoff, why = mod.mutation_block(report.get("decisions"))
+    if handoff:
+        report["ok"] = False
+        report["click"] = {"issued": False, "reason": why, "handoff": handoff}
+        return finish_jev(report, key)
+
+    snapshot_id = data.get("snapshot") if isinstance(data, dict) else None
+    if not isinstance(snapshot_id, str) or mod.SNAPSHOT_ID_RE.fullmatch(snapshot_id) is None:
+        report["ok"] = False
+        report["click"] = {
+            "issued": False,
+            "reason": "the observation has no snapshot id, so no action was issued",
+        }
+        return finish_jev(report, key)
+
+    element = target.get("element") if isinstance(target.get("element"), dict) else {}
+    clicked = run_action(
+        "workflow",
+        mod.bound_click(opts["tab"], snapshot_id, element, opts.get("ready")),
+        opts["device"],
+    )
+    clicked_data = clicked.get("data") if isinstance(clicked.get("data"), dict) else {}
+    issued = clicked.get("ok") is True or clicked_data.get("dispatched") is True
+    click = {
+        "issued": issued,
+        "submitted": True,
+        "ref": element.get("ref"),
+        "snapshot": snapshot_id,
+        "result": clicked,
+    }
+    if isinstance(clicked_data.get("observation"), dict):
+        click["observation"] = clicked_data["observation"]
+    if not issued:
+        click["reason"] = clicked.get("error") or "the action was not issued"
+    report["click"] = click
+    report["ok"] = clicked.get("ok") is True
+    return finish_jev(report, key)
+
+
+def finish_jev(report, key=""):
+    """Print a Jev report. The key is removed if a response echoed it."""
+    text = json.dumps(jev_mod().scrub_value(report, key), indent=2)
+    print(text)
+    if isinstance(report, dict) and report.get("ok") is True:
+        return 0
+    return 1
+
 
 def main(argv):
     if len(argv) < 2:
@@ -353,7 +539,7 @@ def main(argv):
         return 2
     cmds = {"init": cmd_init, "bootstrap": cmd_bootstrap, "pair": cmd_pair,
             "ping": cmd_ping, "devices": cmd_devices, "revoke": cmd_revoke,
-            "send": cmd_send, "operator": cmd_operator}
+            "send": cmd_send, "operator": cmd_operator, "jev": cmd_jev}
     fn = cmds.get(argv[1])
     if not fn:
         die(f"unknown command: {argv[1]}", 2)

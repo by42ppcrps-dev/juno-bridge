@@ -1,5 +1,19 @@
 # Local operator config — never commit credentials
 driver/config.json
+jev-api-key
+typesafe-key
+psk
+operator.token
+
+# Local environment/Worker secrets at any directory depth
+.env*
+.dev.vars*
+# Sanitized examples are source; never put a real credential in them.
+!.env.example
+!.env.*.example
+!.dev.vars.example
+!.dev.vars.*.example
+!jev-api-key.example
 
 # Wrangler build/cache output
 .wrangler/
