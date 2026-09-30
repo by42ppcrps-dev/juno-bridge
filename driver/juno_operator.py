@@ -1,13 +1,12 @@
 """User-scoped operator process for Juno Bridge.
 
 The CLI talks to this process over a private Unix socket. The process owns
-the relay HTTP client, a separate TypeSafe client, and the admin passphrase.
-The passphrase and the TypeSafe key are not sent on the socket. Certificate
-verification stays on, and redirects are not followed, so a bearer token is
-not sent to another host. One client disconnecting does not stop the process.
-Ping and stop are answered while a relay or TypeSafe request is still running.
-Those requests stay on one worker so a libcurl handle is not shared across
-threads.
+the relay HTTP client and the admin passphrase. The passphrase is not sent
+on the socket. Certificate verification stays on, and redirects are not
+followed, so a bearer token is not sent to another host. One client
+disconnecting does not stop the process. Ping and stop are answered while a
+relay request is still running. Those requests stay on one worker so a
+libcurl handle is not shared across threads.
 
 Set JUNO_OPERATOR=0 or JUNO_BRIDGE_HTTP=curl to skip this process and use
 one curl subprocess per request instead.
@@ -282,59 +281,13 @@ def request_with_retry(client, method, url, headers, body, timeout):
     except TimeoutError:
         return client.request(method, url, headers, body, timeout)
 
-
-_jev = None
-
-
-def jev_mod():
-    """Load the decision helper. A separate module name avoids the CLI's copy."""
-    global _jev
-    if _jev is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jev.py")
-        spec = importlib.util.spec_from_file_location("juno_jev_operator", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _jev = mod
-    return _jev
-
-
-def _handle_systemone(msg, typesafe_getter):
-    """One System One call. The key is read here, never accepted from the socket."""
-    if any(name in msg for name in ("key", "authorization", "api_key")):
-        return {"ok": False, "error": "the TypeSafe key stays in the operator"}
-    if typesafe_getter is None:
-        return {"ok": False, "error": "TypeSafe client is not available"}
-    body = msg.get("body")
-    if not isinstance(body, dict):
-        return {"ok": False, "error": "TypeSafe body must be an object"}
-    try:
-        timeout = int(msg.get("timeout") or 30)
-    except (TypeError, ValueError):
-        return {"ok": False, "error": "bad timeout"}
-    key = ""
-    try:
-        typesafe = typesafe_getter()
-        jev = jev_mod()
-        key = jev.api_key()
-        response = typesafe.post(body, key, timeout)
-    except ValueError as exc:
-        return {"ok": False, "error": jev_mod().scrub(str(exc), key)[:300]}
-    except Exception as exc:
-        return {"ok": False, "error": jev_mod().scrub(str(exc), key)[:300]}
-    if not isinstance(response, dict):
-        return {"ok": False, "error": "TypeSafe returned a response that was not a JSON object"}
-    return {"ok": True, "response": response}
-
-
-def handle_message(msg, client, typesafe_getter=None):
+def handle_message(msg, client):
     if not isinstance(msg, dict):
         return {"ok": False, "error": "bad message"}
     if msg.get("op") == "stop":
         return {"ok": True, "stop": True}
     if msg.get("op") == "ping":
         return {"ok": True, "pong": True}
-    if msg.get("op") == "systemone":
-        return _handle_systemone(msg, typesafe_getter)
     path = msg.get("path")
     if not isinstance(path, str) or not path.startswith("/") or "://" in path or "\n" in path:
         return {"ok": False, "error": "bad path"}
@@ -422,8 +375,8 @@ def _enqueue(work, gate, conn, msg):
     return "queued"
 
 
-def _worker_loop(work, client, typesafe_getter, gate):
-    """One thread owns the relay client and the TypeSafe client."""
+def _worker_loop(work, client, gate):
+    """One thread owns the relay client."""
     while True:
         item = work.get()
         if item is None:
@@ -436,7 +389,7 @@ def _worker_loop(work, client, typesafe_getter, gate):
                 _safe_send(conn, {"ok": False, "error": "operator is stopping"})
             else:
                 try:
-                    result = handle_message(msg, client, typesafe_getter)
+                    result = handle_message(msg, client)
                 except Exception:
                     result = {"ok": False, "error": "request failed"}
                 _safe_send(conn, result)
@@ -523,7 +476,7 @@ def _close_quietly(obj):
             pass
 
 
-def serve(client=None, ready=None, stop=None, typesafe=None):
+def serve(client=None, ready=None, stop=None):
     path = sock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if socket_alive(path):
@@ -539,18 +492,10 @@ def serve(client=None, ready=None, stop=None, typesafe=None):
     write_private(token_path(), token)
     if client is None:
         client = LibcurlSession()
-    typesafe_box = [typesafe]
-
-    def typesafe_getter():
-        if typesafe_box[0] is None:
-            typesafe_box[0] = jev_mod().TypeSafeSession()
-        return typesafe_box[0]
-
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         srv.bind(str(path))
     except OSError:
-        _close_quietly(typesafe_box[0])
         srv.close()
         if ready:
             ready.set()
@@ -564,7 +509,7 @@ def serve(client=None, ready=None, stop=None, typesafe=None):
     gate = _ServeGate()
     worker = threading.Thread(
         target=_worker_loop,
-        args=(work, client, typesafe_getter, gate),
+        args=(work, client, gate),
         name="juno-operator-worker",
         daemon=True,
     )
@@ -625,7 +570,6 @@ def serve(client=None, ready=None, stop=None, typesafe=None):
                 continue
         worker.join()
         _close_quietly(client)
-        _close_quietly(typesafe_box[0])
     return 0
 
 
@@ -695,26 +639,6 @@ def call(method, path, data, timeout):
     return res.get("status"), res.get("payload") if isinstance(res.get("payload"), dict) else {}
 
 
-def systemone(body, timeout=30):
-    """Send one System One request through the operator's TypeSafe client.
-
-    The API key stays in this process. The socket message carries the body only.
-    """
-    ensure()
-    token = read_private(token_path())
-    message = {
-        "token": token,
-        "op": "systemone",
-        "body": body,
-        "timeout": int(timeout),
-    }
-    res = transact(message, timeout=int(timeout) + CONNECT_TIMEOUT + 5)
-    if not res.get("ok"):
-        raise OperatorError(res.get("error") or "TypeSafe request failed")
-    response = res.get("response")
-    if not isinstance(response, dict):
-        raise OperatorError("TypeSafe returned a response that was not a JSON object")
-    return response
 
 
 def stop():

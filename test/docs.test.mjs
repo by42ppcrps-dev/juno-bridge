@@ -35,13 +35,7 @@ test("readme states the safeguards the code actually provides", () => {
   assert.match(readme, /Fewer round trips in 1\.4\.0/);
   assert.match(readme, /`snap_` plus 32 hex digits/);
   assert.match(readme, /Fixes in 1\.4\.3/);
-  assert.match(readme, /Fixes in 1\.4\.4/);
   assert.match(readme, /Fixes in 1\.4\.5/);
-  assert.match(readme, /proceed_with_selected_target/);
-  assert.match(readme, /--after-ready/);
-  assert.match(readme, /element_visible/);
-  assert.match(readme, /element_enabled/);
-  assert.match(readme, /timeoutMs/);
   assert.match(readme, /1 to 10/);
   assert.match(readme, /one debugger attachment/);
   assert.match(readme, /holds the debugger until that workflow finishes/);
@@ -53,7 +47,6 @@ test("readme states the safeguards the code actually provides", () => {
   assert.match(readme, /Certificate verification stays on/);
   assert.match(readme, /`wait` is a\s+maximum/);
   assert.match(readme, /native messaging/);
-  assert.match(readme, /`jb\.py send` does not call Jev/);
   assert.match(readme, /completed`, `cancelled`, `interrupted`, `uncertain`,\s+or `unobserved`/);
   assert.equal(/never leaves your machines/i.test(readme), false);
   assert.equal(/commands stop instantly/i.test(readme), false);
@@ -79,26 +72,25 @@ test("contributing names the automated checks and the local wait", () => {
   assert.match(contributing, /test_\*\.py/);
   assert.match(contributing, /waiting locally/);
   assert.match(contributing, /do not load the extension in Chrome/);
-  assert.match(contributing, /do not call TypeSafe/);
   assert.match(contributing, /duplicate request ids/);
   assert.match(contributing, /workflows/);
   assert.match(contributing, /operator/);
 });
 
-test("readme documents that Jev is optional and billed", () => {
-  const readme = read("README.md");
-  assert.match(readme, /off until you set `JUNO_JEV=1`/);
-  assert.match(readme, /\$0\.042 per million input tokens/);
-  assert.match(readme, /https:\/\/docs\.typesafe\.ai\/models/);
-  assert.match(readme, /api\.typesafe\.ai/);
-  assert.match(readme, /not an\s+invoice/);
-  assert.match(readme, /TYPESAFE_API_KEY/);
-  assert.match(readme, /billed: false/);
-  assert.match(readme, /JUNO_JEV_MIN_CONFIDENCE/);
-  const extension = read("extension/background.js");
-  const relay = read("relay/worker.js");
-  for (const source of [extension, relay]) {
-    assert.equal(source.includes("api.typesafe.ai"), false);
-    assert.equal(source.includes("TYPESAFE_API_KEY"), false);
+
+test("the public tree keeps third-party model integrations out", () => {
+  const files = [
+    "README.md",
+    "CONTRIBUTING.md",
+    "driver/jb.py",
+    "driver/juno_operator.py",
+    "extension/background.js",
+    "relay/worker.js",
+  ];
+  for (const file of files) {
+    const source = read(file);
+    assert.equal(/jev/i.test(source), false, file + " mentions jev");
+    assert.equal(/typesafe/i.test(source), false, file + " mentions typesafe");
+    assert.equal(source.includes("JUNO_JEV"), false, file + " mentions JUNO_JEV");
   }
 });

@@ -56,7 +56,7 @@ snapshot redaction and its limits, pairing and revocation, result ownership,
 reconnection, HTTP polling, result acknowledgement, duplicate request ids,
 bounded workflows, the operator process, and the driver's exit status.
 
-They do not load the extension in Chrome, they do not deploy a relay, and the Jev checks do not call TypeSafe.
+They do not load the extension in Chrome and they do not deploy a relay.
 Step 3 above is still required before a transport or browser change is merged.
 
 ## Security

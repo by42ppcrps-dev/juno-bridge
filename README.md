@@ -79,7 +79,7 @@ machines. `jb.py` sends it in an `Authorization: Bearer` header over HTTPS.
 | `extension/` | Your Chrome (load unpacked) | WebSocket to the relay, HTTP polling fallback, commands via `chrome.debugger`, side panel (pause, connection, activity log), Options (pairing, allowlist) |
 | `relay/worker.js` | Cloudflare Worker + Durable Object (unlisted) | Admin API, device registration, per-device queues, result ownership |
 | `relay/wrangler.jsonc` | Your machine | Deploy config. `ADMIN_PSK_SHA256` is required |
-| `driver/jb.py`, `driver/juno_operator.py` | Operator's machine | CLI plus a user-scoped operator process on a private Unix socket. The process keeps one relay client and, when Jev runs, a separate TypeSafe client. `JUNO_OPERATOR=0` uses one curl subprocess per relay request. Optional `jev` stays off until `JUNO_JEV=1`; each enabled call is billed by TypeSafe |
+| `driver/jb.py`, `driver/juno_operator.py` | Operator's machine | CLI plus a user-scoped operator process on a private Unix socket. The process keeps one relay client. `JUNO_OPERATOR=0` uses one curl subprocess per relay request. |
 
 ## Fixes in 1.3.1
 
@@ -147,19 +147,11 @@ python3 driver/jb.py send workflow '{"tabId":123456,"snapshot":"snap_0123456789a
 - The extension binding has to be present every time a snapshot id is used.
   A page that still holds the id is not accepted when the binding is gone.
 
-## Fixes in 1.4.4
-
-- An optional `jb.py jev --click` reuses an observation or takes one snapshot,
-  makes one TypeSafe request, and submits a workflow bound to that snapshot
-  id and ref. The workflow returns the next observation. `escalate`,
-  `observe`, and `recover` do not act, and neither do `login_required`,
-  `validation_error`, or `unexpected`. `jb.py send` does not call Jev.
-
 ## Fixes in 1.4.5
 
-- The operator answers a health check while a relay or TypeSafe request is
+- The operator answers a health check while a relay request is
   still running. A client that disconnects, including a write to a closed
-  socket, does not stop the process. Relay and TypeSafe calls stay on one
+  socket, does not stop the process. Relay calls stay on one
   worker, so they do not share a connection handle. A request that already
   left is not sent again because the caller went away.
 - The observation after an action or workflow is a new snapshot: its own
@@ -168,11 +160,6 @@ python3 driver/jb.py send workflow '{"tabId":123456,"snapshot":"snap_0123456789a
   still uses the starting snapshot. `--observation` reads that object, a
   snapshot result, or the saved `data.observation` / `click.observation`
   wrapper.
-- `jb.py jev --click` accepts `--after-ready` for one bounded condition.
-  Omitting it does not wait.
-- `step` may be `proceed_with_selected_target`. That label does not block
-  `--click` by itself. Confidence, the saved node, pause, and the allowlist
-  still apply. `observe`, `recover`, and `escalate` still do not act.
 
 The result status is `completed`, `cancelled`, `interrupted`, `uncertain`,
 or `unobserved`. `uncertain` means some input may already have reached
@@ -182,13 +169,12 @@ same id; the relay returns the existing command instead of starting another
 one. Two `send` calls are two ids and two actions.
 
 The normal path is a user-scoped operator process on a private Unix socket.
-It keeps one HTTP client for the relay and a separate client for TypeSafe.
+It keeps one HTTP client for the relay.
 Certificate verification stays on, and redirects are not followed.
 A health check is answered while one of those requests is still running, and
 a client that closes its socket does not stop the process.
 `JUNO_OPERATOR=0` or `JUNO_BRIDGE_HTTP=curl` is the curl compatibility path:
-one curl subprocess per relay request, and `jb.py jev` reads the TypeSafe key
-in that command. `jb.py send` does not call Jev. Local native messaging is
+one curl subprocess per relay request. Local native messaging is
 not in this release.
 
 ## Breaking changes in 1.3.0
@@ -287,7 +273,7 @@ current page is allowlisted. Every other action requires `tabId`.
 `send` waits up to 60 seconds, prints the device result as JSON on stdout,
 and exits 1 when `ok` is not true. With several paired browsers, commands go
 to the most recently paired one unless you pass a device id (from
-`devices`). `revoke <device-id>` unpairs one. `send` does not call Jev.
+`devices`). `revoke <device-id>` unpairs one.
 
 `snapshot` returns an id (`snap_` plus 32 hex digits) and gives each
 element a `ref` (`e1`, `e2`, …) in the order the page was walked. A ref
@@ -314,114 +300,6 @@ PageUp/PageDown, and Space.
 
 While a command runs against a tab, Chrome shows its debugging banner on
 that tab. New tabs open in the background.
-
-## Optional Jev decisions
-
-`jb.py jev` can ask TypeSafe's Jev model for a bounded choice about one
-snapshot. It is off until you set `JUNO_JEV=1`. Leave that unset and the
-command exits 2, prints why, and does not contact the relay or TypeSafe.
-
-Turning it on spends money. An enabled command that posts to
-`https://api.typesafe.ai/v1/systemone` is charged to `TYPESAFE_API_KEY`.
-That includes a choice of `none`, and it includes a request that then
-refuses to click. The published price for Jev 1.13 (`jev-1.13.0`) is
-**$0.042 per million input tokens** ($42 per billion). Output tokens are
-free. `jev-latest` is an alias for the current Jev release; as of this
-writing it points at Jev 1.13. The command prints `usage.input_tokens`,
-`usage.output_tokens`, and `estimated_usd` (input tokens / 1,000,000 ×
-0.042, rounded to 6 decimal places). That figure is an estimate, not an
-invoice. The bill is whatever TypeSafe charges the key. The models page
-also lists 250,000 tokens per second, 1,200 requests per minute, 64k tokens
-per request, and 32k tokens for `state` plus the longest question. Confirm
-the current price and limits at <https://docs.typesafe.ai/models> before
-relying on them. Set `TYPESAFE_DEFAULT_MODEL=jev-1.13.0` to pin that model
-id instead of the alias.
-
-The key is read from `TYPESAFE_API_KEY`, or from
-`~/.config/juno-bridge/typesafe-key` when that file is mode `0600`. On the
-normal path the operator process reads it and does not put it on the Unix
-socket. `JUNO_OPERATOR=0` reads it in the `jb.py jev` command. The extension
-and the relay have no TypeSafe client.
-`TYPESAFE_BASE_URL` overrides the API origin; the default is
-`https://api.typesafe.ai`. The command removes the key from its own output
-if a response echoes it.
-
-Taking the snapshot is an ordinary relay command, so that page result still
-passes through the relay. `--observation` can supply that result instead, and
-then this command does not take another snapshot. The TypeSafe request is a
-separate call. On the normal path the operator sends it with the TypeSafe
-client it keeps open. Jev is given the page title, the URL, and each
-element's `ref`, tag, text, href, input type, disabled state, and whether it
-is in view. Coordinates are not sent to Jev. Jev takes text and JSON. A
-screenshot, a canvas control, or a meaning that is absent from the snapshot
-still needs another observation. Heuristic snapshot redaction still applies,
-and it still does not guarantee that every secret is removed: send a page
-only if you are willing to transmit its snapshot text to TypeSafe.
-
-```bash
-JUNO_JEV=1 python3 driver/jb.py jev target --tab 123456 --goal "Find the invoice download page"
-JUNO_JEV=1 python3 driver/jb.py jev target page --tab 123456 --goal "Find the invoice download page"
-JUNO_JEV=1 python3 driver/jb.py jev target --tab 123456 --goal "Find the invoice download page" --observation snapshot.json --click
-```
-
-The goal is required and limited to 500 characters. Name one or more of
-`target`, `page`, and `step`. Questions named on the same command share one
-billed request, and they cannot see each other's answers. A later decision,
-including one that depends on a click, is another billed request. Pass the
-observation the action returned as `--observation` when you already have it.
-A 429 or 529 response is retried once. Any other HTTP error
-stops, so a completed request is not sent a second time.
-
-| Decision | What Jev chooses | What the code does with it |
-|---|---|---|
-| `target` | One snapshot ref (`e1`, `e2`, …) or `none` | With `--click`, submits that ref on this snapshot. The extension checks the saved node |
-| `page` | `search_results`, `login_required`, `validation_error`, `unexpected`, or `other` | Prints the label. `login_required`, `validation_error`, and `unexpected` block a click |
-| `step` | `proceed_with_selected_target`, `observe`, `recover`, or `escalate` | Prints the label. With `--click`, only `proceed_with_selected_target` can continue, and it still has to pass the target checks. The model does not grant permission. `recover` does not name or run a recovery |
-
-A snapshot lists at most 300 elements. The target question keeps at most
-254, in-view elements first, and always includes `none`. `omitted_elements`
-counts what was left out. These three questions are proposed uses. They are
-not a measured Juno benchmark.
-
-Exact checks stay in code: whether an element exists, whether a URL matches,
-whether a deadline expired, and whether a recorded operation succeeded. An
-empty `target`-only snapshot returns `none` with `billed: false` and does
-not call TypeSafe, and it does not need an API key. Asking `page` or `step`
-about that same empty snapshot does call TypeSafe.
-
-`--click` is off unless you pass it, and it is valid only with `target`. A
-decision-only command prints the choice and exits 0, including when the
-choice is `none`. `--observation <file>` reuses a snapshot you already have: the observation
-object, a snapshot result, or the `data.observation` / `click.observation`
-wrapper from a saved result. Without it, the command takes one snapshot. A
-file that lacks a `snap_` id, a URL, and an element list is refused before
-any model call.
-
-With `--click`, one workflow is submitted for that snapshot id and the chosen
-ref. The step sets `after.observe` to `snapshot`. The observation in that
-result is a new snapshot id, with its own node bindings, and it can be passed
-back as `--observation`. It is not the id the click used. `--after-ready`
-adds one bounded readiness condition (`text`, `element_visible`, or
-`element_enabled`, with `timeoutMs` from 0 to 15000) when the task needs the
-page to settle; omitting it does not wait. The extension checks the saved
-node before input. A stale snapshot is refused, and the command does not send
-a coordinate click or a second model call. `step` of
-`proceed_with_selected_target` does not block the click. `escalate`,
-`observe`, and `recover` do not act. `recover` still does not name or run a
-recovery. A page label of `login_required`, `validation_error`, or
-`unexpected` does not act. `search_results` and `other` do not block the
-click. The click is also refused when the choice is `none`, the confidence
-is missing or below `JUNO_JEV_MIN_CONFIDENCE` (default `0.8`), the element is
-disabled or outside the viewport, or the observation has no snapshot id.
-Pause, the 30-second command timeout, the site allowlist, and `tabId` still
-apply. The model does not grant permission. Refusing the click does not undo
-the charge for the request that already ran. `0.8` is a local starting
-threshold. Confidence describes how concentrated the model's probabilities
-are. It is not proof that the action is correct or permitted.
-
-Juno has no measured Jev-versus-current-agent result. Compare both on the
-same browser tasks: successful completion, elapsed time, wrong actions, and
-larger-model calls avoided.
 
 ## Relay API
 

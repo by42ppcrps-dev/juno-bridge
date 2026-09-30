@@ -115,12 +115,10 @@ class OperatorTests(unittest.TestCase):
             child.unlink()
         self.tmp.rmdir()
 
-    def start(self, client, typesafe=None):
+    def start(self, client):
         self.stop_flag = threading.Event()
         ready = threading.Event()
         kwargs = {"client": client, "ready": ready, "stop": self.stop_flag}
-        if typesafe is not None:
-            kwargs["typesafe"] = typesafe
         self.thread = threading.Thread(
             target=self.op.serve,
             kwargs=kwargs,
@@ -329,135 +327,44 @@ class OperatorTests(unittest.TestCase):
             except self.op.OperatorError:
                 pass
 
-    def test_systemone_reuses_one_client_and_keeps_the_key_off_the_socket(self):
-        secret = "typesafe-test-key-not-real"
-        saved = os.environ.get("TYPESAFE_API_KEY")
-        os.environ["TYPESAFE_API_KEY"] = secret
-
-        class FakeTypeSafe:
-            def __init__(self):
-                self.posts = []
-                self.closed = False
-
-            def post(self, body, key, timeout=30):
-                self.posts.append((body, key, timeout))
-                return {"answers": {"target": {"choice": "none"}}}
-
-            def close(self):
-                self.closed = True
-
-        session = FakeTypeSafe()
-        client = FakeClient()
-        try:
-            token = self.start(client, typesafe=session)
-            seen = []
-            real = self.op.transact
-
-            def wrapped(message, timeout=60):
-                seen.append(json.dumps(message))
-                return real(message, timeout)
-
-            with mock.patch.object(jb.subprocess, "Popen", side_effect=AssertionError("spawned")):
-                with mock.patch.object(self.op, "transact", side_effect=wrapped):
-                    first = self.op.systemone({"questions": {"target": {}}})
-                    second = self.op.systemone({"questions": {"page": {}}})
-                    refused = real({"token": token, "op": "systemone", "key": secret, "body": {}})
-            self.assertEqual(first, {"answers": {"target": {"choice": "none"}}})
-            self.assertEqual(second, first)
-            self.assertEqual(
-                [item[0] for item in session.posts],
-                [{"questions": {"target": {}}}, {"questions": {"page": {}}}],
-            )
-            self.assertEqual(session.posts[0][1], secret)
-            self.assertEqual(session.posts[1][1], secret)
-            self.assertEqual(client.calls, [])
-            messages = [json.loads(item) for item in seen]
-            systemone_msgs = [item for item in messages if item.get("op") == "systemone"]
-            self.assertEqual(len(systemone_msgs), 2)
-            for message in messages:
-                self.assertNotIn(secret, json.dumps(message))
-                self.assertNotIn("authorization", message)
-                self.assertNotIn("api_key", message)
-            self.assertFalse(refused["ok"])
-            self.assertEqual(len(session.posts), 2)
-            jev = self.op.jev_mod()
-            old_key_file = jev.KEY_FILE
-
-            def boom(body, key, timeout=30):
-                raise jev.JevError("bad " + key)
-
-            session.post = boom
-            with mock.patch.object(jb.subprocess, "Popen", side_effect=AssertionError("spawned")):
-                with self.assertRaises(self.op.OperatorError) as caught:
-                    self.op.systemone({"questions": {"target": {}}})
-            self.assertNotIn(secret, str(caught.exception))
-            self.assertIn("[redacted]", str(caught.exception))
-            jev.KEY_FILE = str(self.tmp / "missing-typesafe-key")
-            os.environ.pop("TYPESAFE_API_KEY", None)
-            missing = self.op.handle_message(
-                {"op": "systemone", "body": {"model": "jev-latest"}},
-                FakeClient(),
-                lambda: session,
-            )
-            self.assertFalse(missing["ok"])
-            self.assertIn("TYPESAFE_API_KEY", missing["error"])
-            self.assertNotIn(secret, missing["error"])
-            stopped = self.op.transact({"token": token, "op": "stop"})
-            self.assertTrue(stopped.get("ok"))
-            self.thread.join(2)
-            self.thread = None
-            self.assertTrue(session.closed)
-            jev.KEY_FILE = old_key_file
-        finally:
-            if saved is None:
-                os.environ.pop("TYPESAFE_API_KEY", None)
-            else:
-                os.environ["TYPESAFE_API_KEY"] = saved
-
     def _bodies_with(self, client, marker):
         needle = marker.encode("utf-8")
         return [call for call in client.calls if call[3] and needle in call[3]]
 
     def test_a_slow_request_and_a_dropped_client_leave_the_operator_usable(self):
-        secret = "typesafe-test-key-not-real"
-        saved = os.environ.get("TYPESAFE_API_KEY")
-        os.environ["TYPESAFE_API_KEY"] = secret
         started = threading.Event()
         release = threading.Event()
 
-        class Holding:
-            def __init__(self):
-                self.posts = []
-                self.closed = False
-
-            def post(self, body, key, timeout=30):
-                self.posts.append((body, key, timeout))
+        def responder(method, url, headers, body, timeout):
+            if body and b'"marker": "held"' in body:
                 started.set()
                 if not release.wait(5):
                     raise TimeoutError("held")
-                return {"answers": {"target": {"choice": "none"}}, "marker": body.get("marker")}
+            return (200, b'{"ok":true}')
 
-            def close(self):
-                self.closed = True
-
-        session = Holding()
-        client = FakeClient()
+        client = FakeClient(responder=responder)
         outcome = {}
         follow = {}
         slow = None
         other = None
         try:
-            token = self.start(client, typesafe=session)
+            token = self.start(client)
             with mock.patch.object(self.op.subprocess, "Popen", side_effect=AssertionError("spawned")):
                 def run_slow():
                     try:
-                        outcome["res"] = self.op.systemone({"questions": {"target": {}}, "marker": "held"})
+                        outcome["res"] = self.op.transact({
+                            "token": token,
+                            "method": "POST",
+                            "path": "/admin/run",
+                            "data": {"request_id": "req_slow01", "marker": "held"},
+                            "timeout": 8,
+                        }, timeout=10)
                     except Exception as exc:
                         outcome["err"] = exc
 
                 slow = threading.Thread(target=run_slow, daemon=True)
                 slow.start()
-                self.assertTrue(started.wait(2), "model request did not start")
+                self.assertTrue(started.wait(2), "slow relay request did not start")
                 began = time.monotonic()
                 self.assertTrue(self.op.ping_ok())
                 self.assertLess(time.monotonic() - began, 1.5)
@@ -502,8 +409,7 @@ class OperatorTests(unittest.TestCase):
                         break
                     time.sleep(0.02)
             self.assertNotIn("err", outcome, outcome.get("err"))
-            self.assertEqual(outcome["res"]["marker"], "held")
-            self.assertEqual(len(session.posts), 1)
+            self.assertTrue(outcome["res"]["ok"])
             self.assertNotIn("err", follow, follow.get("err"))
             self.assertTrue(follow["res"]["ok"])
             self.assertEqual(len(self._bodies_with(client, "req_follow01")), 1)
@@ -517,18 +423,12 @@ class OperatorTests(unittest.TestCase):
             self.thread = None
             self.assertEqual(len(self._bodies_with(client, "req_follow01")), 1)
             self.assertEqual(len(self._bodies_with(client, "req_abandoned1")), 1)
-            self.assertEqual(len(session.posts), 1)
-            self.assertTrue(session.closed)
         finally:
             release.set()
             if slow is not None:
                 slow.join(3)
             if other is not None:
                 other.join(3)
-            if saved is None:
-                os.environ.pop("TYPESAFE_API_KEY", None)
-            else:
-                os.environ["TYPESAFE_API_KEY"] = saved
 
     def test_an_idle_client_cannot_hold_the_operator(self):
         client = FakeClient()
