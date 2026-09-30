@@ -274,7 +274,14 @@ async function main() {
   const hibernated = (await wsAttempt(["juno-bridge-v1", "juno-ticket." + hibernationTicket.ticket])).ws;
   await welcome(hibernated);
   assert.equal(typeof mf.unsafeEvictDurableObject, "function", "local runtime must support explicit hibernation verification");
-  await mf.unsafeEvictDurableObject("juno-audit-local", "BridgeHub", { name: "juno-bridge", webSockets: "hibernate" });
+  phase = "forced Durable Object socket hibernation";
+  let evictionTimer;
+  try {
+    await Promise.race([
+      mf.unsafeEvictDurableObject("juno-audit-local", "BridgeHub", { name: "juno-bridge", webSockets: "hibernate" }),
+      new Promise((_, reject) => { evictionTimer = setTimeout(() => reject(new Error("local dev-control eviction timed out")), 5000); }),
+    ]);
+  } finally { clearTimeout(evictionTimer); }
   const [delivered, wake] = await Promise.all([socketMessage(hibernated, "cmd"),
     call("/admin/cmd", { action: "ping", params: {}, device: token, request_id: "audit_hibernation_identity" })]);
   assert.equal(delivered.cmd.id, wake.id);
