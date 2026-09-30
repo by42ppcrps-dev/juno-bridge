@@ -137,15 +137,58 @@ function assertActive(epoch) {
   if (!commandLive(epoch)) throw cancelled();
 }
 
+function cursorKey(token) {
+  return `cursor:${token}`;
+}
+
+function savedCursor(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+// Migration must finish before any command can save progress. The scoped read
+// belongs inside this gate: a delayed, missing-key snapshot must never write an
+// old cursor after another reader has migrated it and taken a newer command.
+const cursorInitializations = new Map();
+
+async function initializeCursor(token) {
+  let pending = cursorInitializations.get(token);
+  if (!pending) {
+    pending = (async () => {
+      const key = cursorKey(token);
+      const stored = await chrome.storage.local.get({ [key]: null, cursor: 0, legacyCursorToken: null });
+      if (stored[key] !== null) return;
+      // The unscoped cursor is only an upgrade source. Bind it to its original
+      // device so a later device with no scoped cursor cannot borrow its seq.
+      const ownsLegacy = !stored.legacyCursorToken || stored.legacyCursorToken === token;
+      await chrome.storage.local.set({
+        [key]: ownsLegacy ? savedCursor(stored.cursor) : 0,
+        ...(ownsLegacy && !stored.legacyCursorToken ? { legacyCursorToken: token } : {}),
+      });
+    })();
+    cursorInitializations.set(token, pending);
+    const clear = () => {
+      if (cursorInitializations.get(token) === pending) cursorInitializations.delete(token);
+    };
+    pending.then(clear, clear);
+  }
+  await pending;
+}
+
 async function getState() {
   const state = await chrome.storage.local.get({
     deviceToken: null,
     enabled: true,
     allowlist: [], // deny by default: you add sites explicitly in Options
     allowEval: false,
-    cursor: 0, // seq of the last command taken from the relay
   });
-  return { ...state, allowlist: Array.isArray(state.allowlist) ? state.allowlist.slice() : [] };
+  let cursor = 0;
+  if (state.deviceToken) {
+    await initializeCursor(state.deviceToken);
+    const key = cursorKey(state.deviceToken);
+    const stored = await chrome.storage.local.get({ [key]: 0 });
+    cursor = savedCursor(stored[key]);
+  }
+  return { ...state, cursor, allowlist: Array.isArray(state.allowlist) ? state.allowlist.slice() : [] };
 }
 
 function permissionKey(state) {
@@ -1662,7 +1705,8 @@ async function takeAndRun(cmd, relayNow, receivedAt, scheduledEpoch, originToken
   if (!acceptingCommands || scheduledEpoch !== controlEpoch) return;
   if (typeof cmd.seq === "number") {
     if (cmd.seq <= state.cursor) return;
-    await chrome.storage.local.set({ cursor: cmd.seq });
+    // A late save from the old pairing can update only that device's progress.
+    await chrome.storage.local.set({ [cursorKey(state.deviceToken)]: cmd.seq });
     sendAck(cmd.seq, state.deviceToken, originSocket);
     if (!acceptingCommands || scheduledEpoch !== controlEpoch) {
       await finishTaken(state, cmd, { ok: false, error: "cancelled: extension paused" }, { target: "" }, originSocket);
@@ -1946,6 +1990,8 @@ if (typeof JUNO_TEST !== "undefined" && JUNO_TEST) {
     HANDLERS,
     schedule,
     takeAndRun,
+    getState,
+    cursorKey,
     pollOnce,
     runSocket,
     sendResult,

@@ -288,6 +288,7 @@ function boot(options = {}) {
     allowEval: false,
     cursor: 0,
     log: [],
+    ...options.store,
   };
   const tabs = new Map();
   const onChanged = [];
@@ -311,7 +312,9 @@ function boot(options = {}) {
     storage: {
       local: {
         get(defaults) {
-          const out = { ...(defaults || {}) };
+          const out = typeof defaults === "string" ? { [defaults]: undefined }
+            : Array.isArray(defaults) ? Object.fromEntries(defaults.map((key) => [key, undefined]))
+            : defaults == null ? { ...store } : { ...defaults };
           for (const key of Object.keys(out)) {
             if (Object.prototype.hasOwnProperty.call(store, key)) out[key] = store[key];
           }
@@ -322,6 +325,17 @@ function boot(options = {}) {
           for (const [key, value] of Object.entries(obj)) {
             changes[key] = { oldValue: store[key], newValue: value };
             store[key] = value;
+          }
+          for (const fn of onChanged) fn(changes, "local");
+          return Promise.resolve();
+        },
+        remove(keys) {
+          const changes = {};
+          for (const key of typeof keys === "string" ? [keys] : keys) {
+            if (Object.prototype.hasOwnProperty.call(store, key)) {
+              changes[key] = { oldValue: store[key] };
+              delete store[key];
+            }
           }
           for (const fn of onChanged) fn(changes, "local");
           return Promise.resolve();
@@ -510,14 +524,47 @@ function boot(options = {}) {
     fireDetach(tabId) {
       for (const fn of detachListeners) fn({ tabId });
     },
+    cursor() {
+      const scoped = store[juno.cursorKey(store.deviceToken)];
+      return scoped ?? ((!store.legacyCursorToken || store.legacyCursorToken === store.deviceToken) ? store.cursor : 0);
+    },
     state() {
       return {
         deviceToken: store.deviceToken,
         enabled: store.enabled,
         allowlist: store.allowlist.slice(),
         allowEval: !!store.allowEval,
-        cursor: store.cursor,
+        cursor: this.cursor(),
       };
+    },
+  };
+}
+
+function bootOptions(env, newToken) {
+  const nodes = new Map();
+  const document = { getElementById(id) {
+    if (!nodes.has(id)) nodes.set(id, {
+      value: "", checked: false, hidden: false, disabled: false,
+      textContent: "", className: "", listeners: new Map(),
+      addEventListener(type, fn) { this.listeners.set(type, fn); },
+    });
+    return nodes.get(id);
+  } };
+  const sandbox = {
+    chrome: env.chrome, document, URL,
+    fetch: async (url) => ({ ok: true, status: 200, json: async () =>
+      String(url).endsWith("/register") ? { device_token: newToken } : { ok: true } }),
+  };
+  vm.createContext(sandbox);
+  const source = ["config.js", "allowlist.js", "options.js"]
+    .map((name) => fs.readFileSync(path.join(root, "extension", name), "utf8")).join("\n");
+  vm.runInContext(source, sandbox);
+  return {
+    nodes,
+    async register() {
+      nodes.get("code").value = "SYNTHETIC";
+      await nodes.get("registerBtn").listeners.get("click")();
+      assert.equal(nodes.get("status").className, "ok", nodes.get("status").textContent);
     },
   };
 }
@@ -722,7 +769,7 @@ describe("extension", { concurrency: 1 }, () => {
     assert.match(body.error, /cancelled: extension paused/);
     assert.equal(body.data.status, "uncertain");
     assert.equal(body.data.dispatched, true);
-    assert.equal(env.store.cursor, cmd.seq);
+    assert.equal(env.cursor(), cmd.seq);
   });
 
   test("pause drops queued work and resume does not continue it", async () => {
@@ -738,7 +785,7 @@ describe("extension", { concurrency: 1 }, () => {
     await env.chrome.storage.local.set({ enabled: false });
     await pending;
     assert.equal(calls, 0);
-    assert.equal(env.store.cursor, 0);
+    assert.equal(env.cursor(), 0);
     assert.equal(resultFor(env, queued.id), undefined);
 
     await env.chrome.storage.local.set({ enabled: true });
@@ -772,7 +819,7 @@ describe("extension", { concurrency: 1 }, () => {
     await env.chrome.storage.local.set({ deviceToken: "cd".repeat(32) });
     await pending;
     assert.equal(calls, 0);
-    assert.equal(env.store.cursor, 0);
+    assert.equal(env.cursor(), 0);
     assert.equal(resultFor(env, cmd.id), undefined);
   });
 
@@ -1135,7 +1182,7 @@ describe("extension", { concurrency: 1 }, () => {
     const poll = env.fetches.find((item) => item.url.endsWith("/poll"));
     assert.equal(poll.body.token, env.store.deviceToken);
     assert.equal(poll.body.after, 0);
-    assert.equal(env.store.cursor, 4);
+    assert.equal(env.cursor(), 4);
     assert.equal(resultFor(env, cmd.id).ok, true);
 
     env.fetches.length = 0;
@@ -1180,7 +1227,7 @@ describe("extension", { concurrency: 1 }, () => {
       ws.onmessage({ data: JSON.stringify({ type: "cmd", cmd: newer, now }) });
       await env.juno.drain();
       assert.equal(calls, 1);
-      assert.equal(env.store.cursor, 6);
+      assert.equal(env.cursor(), 6);
       const sent = ws.sent.map((raw) => {
         try {
           return JSON.parse(raw);
@@ -2420,6 +2467,231 @@ describe("extension", { concurrency: 1 }, () => {
 });
 
 
+describe("device-scoped cursor regressions", { concurrency: 1 }, () => {
+  test("a delayed old-device save cannot overwrite Options pairing or new-device progress", async () => {
+    const env = boot();
+    const oldToken = env.store.deviceToken;
+    const newToken = "ef".repeat(32);
+    const oldKey = env.juno.cursorKey(oldToken);
+    const newKey = env.juno.cursorKey(newToken);
+    await env.juno.getState();
+    const writes = [];
+    const normalSet = env.chrome.storage.local.set;
+    let release;
+    env.chrome.storage.local.set = (obj) => {
+      writes.push({ ...obj });
+      if (obj[oldKey] === 91) return new Promise((resolve) => {
+        release = async () => { await normalSet(obj); resolve(); };
+      });
+      return normalSet(obj);
+    };
+    let calls = 0;
+    env.juno.HANDLERS.ping = () => { calls++; return {}; };
+    const old = command({ seq: 91, issued_at: env.now() });
+    const pending = env.juno.takeAndRun(old, env.now(), env.now(), env.juno.epoch(), oldToken);
+    await until(() => !!release);
+    await bootOptions(env, newToken).register();
+    assert.ok(writes.some((obj) => obj.deviceToken === newToken && obj[newKey] === 0));
+    assert.equal((await env.juno.getState()).cursor, 0);
+    await env.juno.schedule(command({ seq: 4, issued_at: env.now() }), env.now(), newToken);
+    await env.juno.schedule(command({ seq: 3, issued_at: env.now() }), env.now(), newToken);
+    assert.equal(calls, 1);
+    await release();
+    await pending;
+    assert.equal(env.store.deviceToken, newToken);
+    assert.equal(env.store[newKey], 4);
+    assert.equal(env.store[oldKey], 91);
+    assert.equal(env.store.cursor, 0, "active commands never save a shared cursor");
+    assert.equal(calls, 1, "the old command is cancelled after its save");
+    assert.equal(resultFor(env, old.id).token, oldToken);
+    assert.match(resultFor(env, old.id).error, /cancelled/);
+    const restarted = boot({ store: structuredClone(env.store) });
+    let restartedCalls = 0;
+    restarted.juno.HANDLERS.ping = () => { restartedCalls++; return {}; };
+    await restarted.juno.schedule(command({ seq: 4, issued_at: restarted.now() }), restarted.now(), newToken);
+    assert.equal(restartedCalls, 0);
+    await restarted.juno.schedule(command({ seq: 5, issued_at: restarted.now() }), restarted.now(), newToken);
+    assert.equal(restartedCalls, 1);
+    assert.equal(restarted.store[newKey], 5);
+  });
+
+  test("legacy progress migrates before execution and survives a worker restart", async () => {
+    const env = boot({ store: { cursor: 7 } });
+    const token = env.store.deviceToken;
+    const key = env.juno.cursorKey(token);
+    let calls = 0;
+    env.juno.HANDLERS.ping = () => { calls++; return {}; };
+    await env.juno.schedule(command({ seq: 7, issued_at: env.now() }), env.now());
+    assert.equal(calls, 0);
+    assert.equal(env.store[key], 7);
+    assert.equal(env.store.legacyCursorToken, token);
+    await env.juno.schedule(command({ seq: 8, issued_at: env.now() }), env.now());
+    assert.equal(calls, 1);
+    assert.equal(env.store[key], 8);
+    assert.equal(env.store.cursor, 7);
+    const restarted = boot({ store: structuredClone(env.store) });
+    restarted.juno.HANDLERS.ping = () => { calls++; return {}; };
+    await restarted.juno.schedule(command({ seq: 8, issued_at: restarted.now() }), restarted.now());
+    assert.equal(calls, 1);
+    restarted.fetchControl.fn = () => ({ ok: true, status: 204, json: async () => ({}) });
+    await restarted.juno.pollOnce();
+    assert.equal(restarted.fetches[0].body.after, 8);
+  });
+
+  for (const heldOperation of ["scoped read", "migration write"]) {
+    test(`concurrent migration waits for a delayed ${heldOperation} before taking a command`, async () => {
+      const env = boot({ store: { cursor: 7 } });
+      const key = env.juno.cursorKey(env.store.deviceToken);
+      const normalGet = env.chrome.storage.local.get;
+      const normalSet = env.chrome.storage.local.set;
+      let release;
+      let migrationWrites = 0;
+      env.chrome.storage.local.set = (obj) => {
+        if (obj[key] === 7) {
+          migrationWrites++;
+          if (heldOperation === "migration write") return new Promise((resolve) => {
+            release = async () => { await normalSet(obj); resolve(); };
+          });
+        }
+        return normalSet(obj);
+      };
+      env.chrome.storage.local.get = (defaults) => {
+        if (heldOperation === "scoped read" && defaults[key] === null && !release) {
+          const snapshot = normalGet(defaults);
+          return new Promise((resolve) => { release = async () => resolve(await snapshot); });
+        }
+        return normalGet(defaults);
+      };
+      let calls = 0;
+      env.juno.HANDLERS.ping = () => { calls++; return {}; };
+      const firstRead = env.juno.getState();
+      await until(() => !!release);
+      const secondRead = env.juno.getState();
+      const cmd = command({ seq: 10, issued_at: env.now() });
+      const taking = env.juno.schedule(cmd, env.now());
+      await tick();
+      assert.equal(calls, 0);
+      assert.equal(migrationWrites, heldOperation === "migration write" ? 1 : 0);
+      await release();
+      await Promise.all([firstRead, secondRead, taking]);
+      assert.equal(migrationWrites, 1);
+      assert.equal(env.store[key], 10);
+      assert.equal(env.store.cursor, 7);
+      assert.equal(calls, 1);
+      await env.juno.schedule(cmd, env.now());
+      assert.equal(calls, 1);
+      const restarted = boot({ store: structuredClone(env.store) });
+      restarted.juno.HANDLERS.ping = () => { calls++; return {}; };
+      await restarted.juno.schedule(cmd, restarted.now());
+      assert.equal(calls, 1);
+    });
+  }
+
+  test("a stale outer state snapshot cannot restart migration after command progress", async () => {
+    const env = boot({ store: { cursor: 7 } });
+    const key = env.juno.cursorKey(env.store.deviceToken);
+    const normalGet = env.chrome.storage.local.get;
+    const normalSet = env.chrome.storage.local.set;
+    let release;
+    let migrationWrites = 0;
+    env.chrome.storage.local.get = (defaults) => {
+      if (Object.hasOwn(defaults, "deviceToken") && !release) {
+        const snapshot = normalGet(defaults);
+        return new Promise((resolve) => { release = async () => resolve(await snapshot); });
+      }
+      return normalGet(defaults);
+    };
+    env.chrome.storage.local.set = (obj) => {
+      if (obj[key] === 7) migrationWrites++;
+      return normalSet(obj);
+    };
+    const stale = env.juno.getState();
+    await until(() => !!release);
+    let calls = 0;
+    env.juno.HANDLERS.ping = () => { calls++; return {}; };
+    const cmd = command({ seq: 10, issued_at: env.now() });
+    await env.juno.schedule(cmd, env.now());
+    assert.equal(env.store[key], 10);
+    await release();
+    assert.equal((await stale).cursor, 10);
+    assert.equal(env.store[key], 10);
+    assert.equal(migrationWrites, 1);
+    await env.juno.schedule(cmd, env.now());
+    assert.equal(calls, 1);
+  });
+
+  test("a new device without a scoped cursor cannot import another device's legacy progress", async () => {
+    const env = boot({ store: { cursor: 7 } });
+    const oldToken = env.store.deviceToken;
+    await env.juno.getState();
+    const token = "ef".repeat(32);
+    await env.chrome.storage.local.set({ deviceToken: token });
+    assert.equal((await env.juno.getState()).cursor, 0);
+    assert.equal(env.store[env.juno.cursorKey(token)], 0);
+    assert.equal(env.store.legacyCursorToken, oldToken);
+    let calls = 0;
+    env.juno.HANDLERS.ping = () => { calls++; return {}; };
+    await env.juno.schedule(command({ seq: 4, issued_at: env.now() }), env.now(), token);
+    assert.equal(calls, 1);
+    assert.equal(env.store[env.juno.cursorKey(token)], 4);
+    assert.equal(env.store.cursor, 7);
+  });
+
+  test("a delayed legacy migration cannot change a pairing initialized by Options", async () => {
+    const env = boot({ store: { cursor: 91 } });
+    const oldToken = env.store.deviceToken;
+    const oldKey = env.juno.cursorKey(oldToken);
+    const token = "ef".repeat(32);
+    const key = env.juno.cursorKey(token);
+    const normalSet = env.chrome.storage.local.set;
+    let release;
+    env.chrome.storage.local.set = (obj) => {
+      if (obj[oldKey] === 91) return new Promise((resolve) => {
+        release = async () => { await normalSet(obj); resolve(); };
+      });
+      return normalSet(obj);
+    };
+    const migrating = env.juno.getState();
+    await until(() => !!release);
+    await bootOptions(env, token).register();
+    assert.equal((await env.juno.getState()).cursor, 0);
+    await env.juno.schedule(command({ seq: 3, issued_at: env.now() }), env.now(), token);
+    await release();
+    await migrating;
+    assert.equal(env.store.deviceToken, token);
+    assert.equal(env.store[key], 3);
+    assert.equal(env.store[oldKey], 91);
+    assert.equal((await env.juno.getState()).cursor, 3);
+  });
+
+  for (const failedOperation of ["migration", "command save"]) {
+    test(`a failed ${failedOperation} does not execute or acknowledge a command`, async () => {
+      const env = boot({ store: { cursor: 7 } });
+      const token = env.store.deviceToken;
+      const key = env.juno.cursorKey(token);
+      if (failedOperation === "command save") await env.juno.getState();
+      const normalSet = env.chrome.storage.local.set;
+      env.chrome.storage.local.set = (obj) => Object.hasOwn(obj, key)
+        ? Promise.reject(new Error("synthetic storage failure")) : normalSet(obj);
+      const ws = new MockWebSocket("wss://synthetic.invalid/ws");
+      env.juno.attachSocket(ws, token);
+      await tick();
+      let calls = 0;
+      env.juno.HANDLERS.ping = () => { calls++; return {}; };
+      const cmd = command({ seq: 10, issued_at: env.now() });
+      try {
+        await assert.rejects(() => env.juno.takeAndRun(cmd, env.now(), env.now(), env.juno.epoch(), token, ws),
+          /synthetic storage failure/);
+        assert.equal(calls, 0);
+        assert.equal(ws.sent.length, 0);
+        assert.equal(env.store[key], failedOperation === "migration" ? undefined : 7);
+        assert.equal(env.store.cursor, 7);
+        assert.equal(resultFor(env, cmd.id), undefined);
+      } finally { ws.close(); }
+    });
+  }
+});
+
 describe("extension audit regressions", { concurrency: 1 }, () => {
   for (const mode of ["command", "empty", "rejected", "network error"]) {
     test(`a delayed old-device poll ${mode} cannot change the new pairing`, async () => {
@@ -2435,14 +2707,14 @@ describe("extension audit regressions", { concurrency: 1 }, () => {
       env.juno.HANDLERS.ping = () => { ran = true; return {}; };
       const pending = env.juno.pollOnce();
       await until(() => !!reply);
-      await env.chrome.storage.local.set({ deviceToken: "ef".repeat(32), cursor: 3,
+      await env.chrome.storage.local.set({ deviceToken: "ef".repeat(32), [env.juno.cursorKey("ef".repeat(32))]: 3,
         relayStatus: { state: "new pairing" } });
       if (mode === "network error") reply.reject(new Error("old request failed"));
       else reply.resolve({ ok: mode !== "rejected", status: mode === "empty" ? 204 : mode === "rejected" ? 403 : 200,
         json: async () => ({ cmd, now: env.now() }) });
       assert.equal(await pending, false);
       assert.equal(ran, false);
-      assert.equal(env.store.cursor, 3);
+      assert.equal(env.cursor(), 3);
       assert.equal(env.store.relayStatus.state, "new pairing");
       assert.equal(env.fetches.filter((entry) => entry.url.endsWith("/result")).length, 0);
       assert.equal(env.fetches[0].body.token, oldToken);
@@ -2465,7 +2737,7 @@ describe("extension audit regressions", { concurrency: 1 }, () => {
       else await env.chrome.storage.local.set({ [setting]: setting === "allowlist" ? [] : true });
       release();
       assert.equal(await pending, false);
-      assert.equal(env.store.cursor, 0);
+      assert.equal(env.cursor(), 0);
       assert.equal(env.store.relayStatus, undefined);
     });
   }
@@ -2490,7 +2762,7 @@ describe("extension audit regressions", { concurrency: 1 }, () => {
     assert.equal(count, 1);
     assert.equal(resultFor(env, first.id).ok, false);
     assert.equal(resultFor(env, second.id), undefined);
-    assert.equal(env.store.cursor, first.seq);
+    assert.equal(env.cursor(), first.seq);
   });
 
   for (const mode of ["allowlist", "eval permission", "notification delayed"]) {
@@ -2587,7 +2859,7 @@ describe("extension audit regressions", { concurrency: 1 }, () => {
       };
       await assert.rejects(() => env.juno.pollOnce(), /timed out/);
       assert.equal(signal.aborted, true);
-      assert.equal(env.store.cursor, 0);
+      assert.equal(env.cursor(), 0);
       assert.equal(env.store.relayStatus.state, "unreachable");
     });
 
@@ -2720,9 +2992,9 @@ describe("extension audit regressions", { concurrency: 1 }, () => {
     let calls = 0;
     env.juno.HANDLERS.ping = () => { calls++; return {}; };
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const previousCursor = env.store.cursor;
+      const previousCursor = env.cursor();
       const before = MockWebSocket.latest;
-      const pending = env.juno.runSocket(env.store.deviceToken, env.store.cursor);
+      const pending = env.juno.runSocket(env.store.deviceToken, env.cursor());
       await until(() => MockWebSocket.latest !== before);
       const ws = MockWebSocket.latest;
       try {
@@ -2738,13 +3010,13 @@ describe("extension audit regressions", { concurrency: 1 }, () => {
         ws.onmessage({ data: "null" });
         ws.onmessage({ data: JSON.stringify({ type: "cmd", cmd, now: env.now() }) });
         await env.juno.drain();
-        assert.equal(env.store.cursor, previousCursor);
+        assert.equal(env.cursor(), previousCursor);
         assert.equal(calls, attempt - 1);
         ws.onmessage({ data: JSON.stringify({ type: "welcome" }) });
         ws.onmessage({ data: JSON.stringify({ type: "cmd", cmd, now: env.now() }) });
         await env.juno.drain();
         assert.equal(calls, attempt);
-        assert.equal(env.store.cursor, cmd.seq);
+        assert.equal(env.cursor(), cmd.seq);
       } finally { ws.close(); await pending; }
     }
     assert.equal(mints, 2);
