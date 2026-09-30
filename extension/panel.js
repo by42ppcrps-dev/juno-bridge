@@ -59,18 +59,19 @@ async function refresh() {
   for (const e of items.slice(0, 30)) {
     const li = document.createElement("li");
     const mark = document.createElement("span");
-    mark.className = "t " + (e.ok ? "good" : "bad");
-    mark.textContent = e.ok ? "✓" : "✗";
+    mark.className = "t " + (e.deliveryError ? "warn" : e.ok ? "good" : "bad");
+    mark.textContent = e.deliveryError ? "!" : e.ok ? "✓" : "✗";
     li.appendChild(mark);
     const tt = document.createElement("span");
     tt.className = "t";
     tt.textContent = fmtTime(e.t);
     li.appendChild(tt);
     li.appendChild(document.createTextNode(`${e.action}${e.target ? " — " + e.target.slice(0, 80) : ""}`));
-    if (e.error) {
+    const errors = [e.error, e.deliveryError].filter(Boolean);
+    if (errors.length) {
       const why = document.createElement("span");
       why.className = "err";
-      why.textContent = e.error;
+      why.textContent = errors.join("; ");
       li.appendChild(why);
     }
     logList.appendChild(li);

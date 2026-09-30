@@ -45,6 +45,9 @@
 importScripts("config.js", "allowlist.js");
 
 const WS_URL = JUNO_RELAY_URL.replace(/^http/, "ws") + "/ws";
+const SOCKET_PROTOCOL = "juno-bridge-v1";
+const SOCKET_TICKET_TIMEOUT_MS = 10000;
+const SOCKET_WELCOME_TIMEOUT_MS = 10000;
 const PING_MS = 20000; // < 30s: keeps the MV3 service worker alive and the socket warm
 const SOCKET_SILENCE_MS = 50000; // nothing heard (not even a pong) → treat the socket as dead
 const WS_MAX_MSG = 900 * 1024; // larger results go over HTTP
@@ -72,7 +75,12 @@ const NAV_WAIT_MS = 15000;
 const CDP_VERSION = "1.3";
 const LOG_CAP = 50;
 const TEXT_CAP = 100000;
-const MAX_RESULT_CHARS = 16 * 1024 * 1024;
+// Count the full POST envelope. This is slightly stricter than the relay's
+// 8 MiB serialized record limit and leaves room for its receipt metadata.
+const MAX_RESULT_BYTES = 8 * 1024 * 1024;
+const RESULT_TIMEOUT_MS = 10000;
+const RESULT_RETRY_MS = 1000;
+const POLL_TIMEOUT_MS = 10000;
 
 // Puppeteer-style key definitions. A `text` makes CDP emit a real keypress,
 // which is what makes Enter submit a form; keys without text use rawKeyDown.
@@ -100,13 +108,13 @@ const SECRET_AUTOCOMPLETE = /^(cc-|current-password|new-password|one-time-code)/
 const SECRET_HINT = /password|passphrase|passcode|one[-_ ]?time|onetime|\botp\b|\btotp\b|\bpin\b|\bmfa\b|\b2fa\b|verification[-_ ]?code|security[-_ ]?code|auth(?:entication|enticator)?[-_ ]?code|\bcvv\b|\bcvc\b|\bcsc\b|card[-_ ]?(?:number|code|verification)|credit[-_ ]?card|cc[-_ ]?number|\bssn\b|social[-_ ]?security|tax[-_ ]?id|routing[-_ ]?number|account[-_ ]?number/i;
 
 let resultAckTimeoutMs = RESULT_ACK_MS_DEFAULT;
-// Bumped on pause, resume, and re-pair. A command captures the epoch when it
-// is scheduled; a mismatch means that command must not touch the browser.
+// Bumped on pause, resume, re-pair, and permission changes. A command captures
+// the epoch when scheduled; a mismatch means it must not touch the browser.
 let controlEpoch = 0;
 let acceptingCommands = true;
 
 function cancelled() {
-  const error = new Error("cancelled: extension paused");
+  const error = new Error("cancelled: extension paused or settings changed");
   error.code = "cancelled";
   return error;
 }
@@ -130,13 +138,29 @@ function assertActive(epoch) {
 }
 
 async function getState() {
-  return await chrome.storage.local.get({
+  const state = await chrome.storage.local.get({
     deviceToken: null,
     enabled: true,
     allowlist: [], // deny by default: you add sites explicitly in Options
     allowEval: false,
     cursor: 0, // seq of the last command taken from the relay
   });
+  return { ...state, allowlist: Array.isArray(state.allowlist) ? state.allowlist.slice() : [] };
+}
+
+function permissionKey(state) {
+  return JSON.stringify([state.deviceToken, state.allowlist, !!state.allowEval]);
+}
+
+// Read storage as well as the epoch: Chrome can deliver a storage notification
+// after the promise for a browser operation has already resolved.
+async function assertPermissions(state, control) {
+  assertActive(control);
+  const current = await getState();
+  assertActive(control);
+  if (!current.enabled || !current.deviceToken || permissionKey(current) !== permissionKey(state)) {
+    throw cancelled();
+  }
 }
 
 function errMsg(e) {
@@ -192,6 +216,7 @@ async function authorizeTab(params, state, ctx, verb, epoch) {
     throw new Error(`${verb}: tabId required`);
   }
   const tab = await resolveTab(params.tabId);
+  await assertPermissions(state, epoch);
   const url = tab.url || "";
   ctx.target = url;
   if (!urlAllowed(url, state.allowlist)) throw new Error(`${verb}: site not in allowlist`);
@@ -210,20 +235,22 @@ async function authorizeTab(params, state, ctx, verb, epoch) {
 
 async function assertStillAuthorized(auth) {
   const control = auth.control || auth.epoch;
-  assertActive(control);
+  await assertPermissions(auth.state, control);
   const tab = await chrome.tabs.get(auth.tabId);
-  assertActive(control);
+  await assertPermissions(auth.state, control);
   const url = tab.url || "";
   // Exact page, not merely "still on some allowlisted origin". The new URL
   // is deliberately absent from the error: it may itself be sensitive, and
   // it must not ride back through the relay in an error string.
-  if (url !== auth.url || pageOrigin(url) !== auth.origin || !urlAllowed(url, auth.state.allowlist)) {
+  if (url !== auth.url || (tab.pendingUrl && tab.pendingUrl !== auth.url) ||
+      pageOrigin(url) !== auth.origin || !urlAllowed(url, auth.state.allowlist)) {
     throw new Error(`${auth.verb}: tab navigated away from the authorized page`);
   }
 }
 
 async function readDocumentUrl(auth) {
   const control = auth.control || auth.epoch;
+  await assertPermissions(auth.state, control);
   assertActive(control);
   let res;
   try {
@@ -235,12 +262,30 @@ async function readDocumentUrl(auth) {
     if (!commandLive(control)) throw cancelled();
     throw e;
   }
-  assertActive(control);
+  await assertPermissions(auth.state, control);
   const value = res && res.result ? res.result.value : "";
   if (typeof value !== "string" || !value) {
     throw new Error(`${auth.verb}: could not confirm the authorized page`);
   }
   return value;
+}
+
+async function readDocumentId(auth) {
+  const control = auth.control || auth.epoch;
+  await assertPermissions(auth.state, control);
+  assertActive(control);
+  // Chrome's frame/loader ids survive neither navigation nor a same-URL
+  // reload. Page script cannot spoof them as it can performance.timeOrigin.
+  const res = await chrome.debugger.sendCommand({ tabId: auth.tabId }, "Page.getFrameTree");
+  await assertPermissions(auth.state, control);
+  const frame = res && res.frameTree && res.frameTree.frame;
+  const expectedUrl = new URL(auth.url);
+  expectedUrl.hash = "";
+  if (!frame || typeof frame.id !== "string" || typeof frame.loaderId !== "string" ||
+      !frame.id || !frame.loaderId || frame.url !== expectedUrl.href) {
+    throw new Error(`${auth.verb}: could not confirm the authorized document`);
+  }
+  return frame.id + "\0" + frame.loaderId;
 }
 
 async function cdp(auth, method, params = {}, opts = {}) {
@@ -250,17 +295,33 @@ async function cdp(auth, method, params = {}, opts = {}) {
   if (href !== auth.url) {
     throw new Error(`${auth.verb}: tab navigated away from the authorized page`);
   }
+  const documentId = await readDocumentId(auth);
+  if (auth.documentId && documentId !== auth.documentId) {
+    throw new Error(`${auth.verb}: the document changed`);
+  }
+  auth.documentId = documentId;
+  assertActive(auth.control || auth.epoch);
   if (detachedTabs.has(auth.tabId)) throw detachedError(auth);
   // After the page checks, immediately before the browser call. A failure
   // from here on may mean the input already reached Chrome.
   if (opts.dispatch && auth.control) auth.control.dispatched = true;
   try {
-    return await chrome.debugger.sendCommand({ tabId: auth.tabId }, method, params);
+    const result = await chrome.debugger.sendCommand({ tabId: auth.tabId }, method, params);
+    await assertPermissions(auth.state, auth.control || auth.epoch);
+    if (!opts.dispatch) {
+      // A capture or evaluation can finish after navigation, including a
+      // same-URL reload. Discard its output before any caller can publish it.
+      await assertStillAuthorized(auth);
+      if (await readDocumentId(auth) !== documentId) {
+        throw new Error(`${auth.verb}: the document changed`);
+      }
+    }
+    return result;
   } catch (e) {
-    if (detachedTabs.has(auth.tabId)) throw detachedError(auth);
     // Detach-on-pause rejects the in-flight call. The event may already have
     // reached Chrome; refusing the rest of the command is all pause can do.
     if (!commandLive(auth.control || auth.epoch)) throw cancelled();
+    if (detachedTabs.has(auth.tabId)) throw detachedError(auth);
     throw e;
   }
 }
@@ -528,6 +589,7 @@ async function cmdPing(_params, _state, _ctx, epoch) {
 async function cmdTabs(_params, state, ctx, epoch) {
   assertActive(epoch);
   const all = await chrome.tabs.query({});
+  await assertPermissions(state, epoch);
   const visible = all.filter((t) => urlAllowed(t.url, state.allowlist));
   ctx.target = `${visible.length} of ${all.length} tabs visible`;
   return {
@@ -547,7 +609,7 @@ async function cmdTabs(_params, state, ctx, epoch) {
 // before the navigation so a race can't send an allowlisted URL into a tab
 // that has since left the allowlist.
 async function cmdNavigate(params, state, ctx, epoch) {
-  assertActive(epoch);
+  await assertPermissions(state, epoch);
   const url = params.url;
   if (!url || typeof url !== "string") throw new Error("navigate: missing url");
   ctx.target = url;
@@ -555,27 +617,34 @@ async function cmdNavigate(params, state, ctx, epoch) {
   let tab;
   if (params.tabId !== undefined && params.tabId !== null) {
     const current = await resolveTab(params.tabId);
+    await assertPermissions(state, epoch);
     if (!urlAllowed(current.url, state.allowlist)) {
       throw new Error("navigate: that tab's current page is not in allowlist");
     }
     assertActive(epoch);
     const again = await chrome.tabs.get(current.id);
+    await assertPermissions(state, epoch);
     const againUrl = again.url || "";
-    if (againUrl !== (current.url || "") || !urlAllowed(againUrl, state.allowlist)) {
+    if (againUrl !== (current.url || "") || (again.pendingUrl && again.pendingUrl !== againUrl) ||
+        !urlAllowed(againUrl, state.allowlist)) {
       throw new Error("navigate: that tab changed or is no longer allowlisted");
     }
     // The second lookup was awaited. Pause or this command's timeout may
     // have landed during it. Recheck before the navigation is issued.
+    await assertPermissions(state, epoch);
     assertActive(epoch);
     tab = await chrome.tabs.update(again.id, { url });
   } else {
+    await assertPermissions(state, epoch);
     assertActive(epoch);
     tab = await chrome.tabs.create({ url, active: false });
   }
+  await assertPermissions(state, epoch);
   // The navigation has been handed to Chrome. Pause cannot pull it back;
   // waiting for load is observation, not another mutation.
   const loaded = await waitForLoad(tab.id, NAV_WAIT_MS);
   const final = await chrome.tabs.get(tab.id);
+  await assertPermissions(state, epoch);
   const finalUrl = final.url || final.pendingUrl;
   const stillAllowed = urlAllowed(finalUrl, state.allowlist);
   return {
@@ -1337,6 +1406,7 @@ async function cmdClose(params, state, ctx, epoch) {
   await assertStillAuthorized(auth);
   assertActive(epoch);
   await chrome.tabs.remove(auth.tabId);
+  await assertPermissions(state, epoch);
   return { tabId: auth.tabId, closed: true };
 }
 
@@ -1358,99 +1428,127 @@ const HANDLERS = {
 /* ---------- relay I/O ---------- */
 
 let socket = null; // the live WebSocket, when open
+const socketIdentities = new WeakMap();
 const pendingResultAcks = new Map();
 
-function waitForResultAck(id) {
+// The race covers fetch and body consumption. Abort releases a real fetch;
+// the race also frees the command queue if a mocked or broken reader ignores it.
+async function withRequestDeadline(ms, request) {
+  const abort = new AbortController();
+  let timer;
+  try {
+    return await Promise.race([
+      request(abort.signal),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          abort.abort();
+          reject(new Error("relay request timed out"));
+        }, ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function waitForResultAck(id, ws, token) {
   return new Promise((resolve) => {
+    const previous = pendingResultAcks.get(id);
+    if (previous) previous.finish("timeout");
+    const record = { ws, token, finish: null };
     let settled = false;
-    const finish = (status) => {
+    record.finish = (status) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      pendingResultAcks.delete(id);
+      if (pendingResultAcks.get(id) === record) pendingResultAcks.delete(id);
       resolve(status);
     };
-    const timer = setTimeout(() => finish("timeout"), resultAckTimeoutMs);
-    pendingResultAcks.set(id, finish);
+    const timer = setTimeout(() => record.finish("timeout"), resultAckTimeoutMs);
+    pendingResultAcks.set(id, record);
   });
 }
 
-function failPendingResultAcks() {
-  for (const finish of [...pendingResultAcks.values()]) finish("timeout");
+function failPendingResultAcks(ws) {
+  for (const record of [...pendingResultAcks.values()]) {
+    if (record.ws === ws) record.finish("timeout");
+  }
 }
 
-function handleSocketMessage(msg) {
+function handleSocketMessage(msg, ws = socket, token = socketIdentities.get(ws)?.token,
+  deliveryEpoch = controlEpoch) {
   if (!msg || typeof msg !== "object") return;
-  if (msg.type === "result_ack") {
-    const finish = pendingResultAcks.get(msg.id);
-    if (finish) finish("acked");
+  if (msg.type === "result_ack" || msg.type === "result_rejected") {
+    const record = pendingResultAcks.get(msg.id);
+    if (record && record.ws === ws && record.token === token) {
+      record.finish(msg.type === "result_ack" ? "acked" : "rejected");
+    }
     return;
   }
-  if (msg.type === "result_rejected") {
-    const finish = pendingResultAcks.get(msg.id);
-    if (finish) finish("rejected");
-    return;
+  if (msg.type === "cmd" && msg.cmd && socketIdentities.get(ws)?.welcomed) {
+    schedule(msg.cmd, msg.now, token, deliveryEpoch, ws);
   }
-  if (msg.type === "cmd" && msg.cmd) schedule(msg.cmd, msg.now);
 }
 
 async function postResult(deviceToken, id, outcome) {
   let body = JSON.stringify({
-    token: deviceToken,
-    id,
-    ok: outcome.ok,
-    data: outcome.data ?? null,
+    token: deviceToken, id, ok: outcome.ok, data: outcome.data ?? null,
     error: outcome.ok ? null : outcome.error,
   });
-  if (body.length > MAX_RESULT_CHARS) {
+  if (new TextEncoder().encode(body).byteLength > MAX_RESULT_BYTES) {
     body = JSON.stringify({ token: deviceToken, id, ok: false, data: null, error: "result too large to relay" });
   }
-  // One retry: a dropped result leaves the driver waiting for a timeout, and
-  // the command itself can't be re-run (the cursor has already moved on).
+  // Retrying delivery never retries the browser action. Successful receipts
+  // require the complete body; a stalled result cannot hold the queue forever.
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = await fetch(JUNO_RELAY_URL + "/result", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
+      const response = await withRequestDeadline(RESULT_TIMEOUT_MS, async (signal) => {
+        const res = await fetch(JUNO_RELAY_URL + "/result", {
+          method: "POST", headers: { "content-type": "application/json" }, body, signal,
+        });
+        const receipt = res.ok ? await res.json() : null;
+        return { res, receipt };
       });
-      if (res.ok || (res.status >= 400 && res.status < 500)) return;
+      if (response.res.ok && response.receipt && response.receipt.ok === true) return true;
+      if (response.res.status >= 400 && response.res.status < 500 &&
+          response.res.status !== 408 && response.res.status !== 429) return false;
     } catch {
-      /* fall through to retry */
+      /* fall through to the one bounded delivery retry */
     }
-    await sleep(1000);
+    if (attempt === 0) await sleep(RESULT_RETRY_MS);
   }
+  return false;
 }
 
-// A socket send() is not delivery. The relay acks a result only after it has
-// accepted ownership; anything else is posted over HTTP.
-async function sendResultOverSocket(id, outcome) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+// Bind both send and receipt to this exact socket and device. A late result
+// from a previous pairing must use that pairing's HTTP identity instead.
+async function sendResultOverSocket(deviceToken, id, outcome, originSocket) {
+  const ws = originSocket || socket;
+  const identity = ws && socketIdentities.get(ws);
+  if (!ws || ws.readyState !== WebSocket.OPEN || !identity?.welcomed || identity.token !== deviceToken) return null;
   const msg = JSON.stringify({
-    type: "result",
-    id,
-    ok: outcome.ok,
-    data: outcome.data ?? null,
+    type: "result", id, ok: outcome.ok, data: outcome.data ?? null,
     error: outcome.ok ? null : outcome.error,
   });
-  if (msg.length > WS_MAX_MSG) return false;
-  const ack = waitForResultAck(id);
+  if (new TextEncoder().encode(msg).byteLength > WS_MAX_MSG) return null;
+  const ack = waitForResultAck(id, ws, deviceToken);
   try {
-    socket.send(msg);
+    ws.send(msg);
   } catch {
-    const finish = pendingResultAcks.get(id);
-    if (finish) finish("timeout");
-    return false;
+    const record = pendingResultAcks.get(id);
+    if (record && record.ws === ws) record.finish("timeout");
+    return null;
   }
-  const status = await ack;
-  // "rejected" is still a receipt: the relay saw the result and refused it.
-  // Posting the same body over HTTP would get the same answer.
-  return status === "acked" || status === "rejected";
+  return await ack;
 }
 
-async function sendResult(deviceToken, id, outcome) {
-  if (await sendResultOverSocket(id, outcome)) return;
-  await postResult(deviceToken, id, outcome);
+async function sendResult(deviceToken, id, outcome, originSocket = null) {
+  const receipt = await sendResultOverSocket(deviceToken, id, outcome, originSocket);
+  if (receipt === "acked") return true;
+  // Only a matching socket/device can settle this receipt. Its explicit
+  // rejection is final, and is recorded as failed delivery in the local log.
+  if (receipt === "rejected") return false;
+  return await postResult(deviceToken, id, outcome);
 }
 
 // Runs one command under a timeout. The timer marks this command dead before
@@ -1482,6 +1580,8 @@ async function runCommand(cmd, state, ctx) {
         }, CMD_TIMEOUT_MS);
       }),
     ]);
+    await assertPermissions(state, control);
+    assertActive(control);
     return { ok: true, data };
   } catch (e) {
     const error = errMsg(e).slice(0, 500);
@@ -1508,13 +1608,15 @@ async function runCommand(cmd, state, ctx) {
   }
 }
 
-async function finishTaken(state, cmd, outcome, ctx) {
-  await sendResult(state.deviceToken, cmd.id, outcome);
+async function finishTaken(state, cmd, outcome, ctx, originSocket = null) {
+  const delivered = await sendResult(state.deviceToken, cmd.id, outcome, originSocket);
   try {
     await logActivity({
       action: String(cmd.action).slice(0, 40),
       target: ctx.target,
       ok: outcome.ok,
+      resultDelivered: delivered,
+      ...(!delivered ? { deliveryError: "result delivery failed; action will not be retried" } : {}),
       ...(outcome.ok ? {} : { error: String(outcome.error || "").slice(0, 160) }),
     });
   } catch {
@@ -1522,10 +1624,12 @@ async function finishTaken(state, cmd, outcome, ctx) {
   }
 }
 
-function sendAck(seq) {
-  if (socket && socket.readyState === WebSocket.OPEN) {
+function sendAck(seq, deviceToken, originSocket) {
+  const ws = originSocket || socket;
+  const identity = ws && socketIdentities.get(ws);
+  if (ws && ws.readyState === WebSocket.OPEN && identity?.welcomed && identity.token === deviceToken) {
     try {
-      socket.send(JSON.stringify({ type: "ack", seq }));
+      ws.send(JSON.stringify({ type: "ack", seq }));
     } catch {
       /* the next hello carries the cursor anyway */
     }
@@ -1537,10 +1641,9 @@ function sendAck(seq) {
 // longer matches, and takeAndRun returns without running it.
 let work = Promise.resolve();
 
-function schedule(cmd, relayNow) {
+function schedule(cmd, relayNow, originToken = null, scheduledEpoch = controlEpoch, originSocket = null) {
   const receivedAt = Date.now();
-  const scheduledEpoch = controlEpoch;
-  const run = work.then(() => takeAndRun(cmd, relayNow, receivedAt, scheduledEpoch));
+  const run = work.then(() => takeAndRun(cmd, relayNow, receivedAt, scheduledEpoch, originToken, originSocket));
   work = run.catch((err) => {
     console.error("juno-bridge: command queue error", err && err.stack ? err.stack : err);
   });
@@ -1551,18 +1654,18 @@ function schedule(cmd, relayNow) {
 // re-send after reconnect), saves the new cursor BEFORE running, then acks.
 // Once the cursor is saved the command will not be redelivered, so every
 // path after that point sends a result — including cancel and expiry.
-async function takeAndRun(cmd, relayNow, receivedAt, scheduledEpoch) {
+async function takeAndRun(cmd, relayNow, receivedAt, scheduledEpoch, originToken = null, originSocket = null) {
   if (!cmd || typeof cmd.id !== "string") return;
   if (!acceptingCommands || scheduledEpoch !== controlEpoch) return;
   const state = await getState();
-  if (!state.enabled || !state.deviceToken) return;
+  if (!state.enabled || !state.deviceToken || (originToken && state.deviceToken !== originToken)) return;
   if (!acceptingCommands || scheduledEpoch !== controlEpoch) return;
   if (typeof cmd.seq === "number") {
     if (cmd.seq <= state.cursor) return;
     await chrome.storage.local.set({ cursor: cmd.seq });
-    sendAck(cmd.seq);
+    sendAck(cmd.seq, state.deviceToken, originSocket);
     if (!acceptingCommands || scheduledEpoch !== controlEpoch) {
-      await finishTaken(state, cmd, { ok: false, error: "cancelled: extension paused" }, { target: "" });
+      await finishTaken(state, cmd, { ok: false, error: "cancelled: extension paused" }, { target: "" }, originSocket);
       return;
     }
   }
@@ -1579,98 +1682,127 @@ async function takeAndRun(cmd, relayNow, receivedAt, scheduledEpoch) {
   } else {
     outcome = await runCommand(cmd, state, ctx);
   }
-  await finishTaken(state, cmd, outcome, ctx);
+  await finishTaken(state, cmd, outcome, ctx, originSocket);
 }
 
 /* ---------- live socket ---------- */
 
 // Runs one socket session until it closes. Resolves with what happened so
 // the loop can decide whether to reconnect, back off, or fall back to HTTP.
-function runSocket(token, after) {
+async function runSocket(token, after) {
+  const outcome = { opened: false, welcomed: false, rejected: false };
+  const sessionEpoch = controlEpoch;
+  let ticket;
+  try {
+    const authorization = await withRequestDeadline(SOCKET_TICKET_TIMEOUT_MS, async (signal) => {
+      const res = await fetch(JUNO_RELAY_URL + "/ws-ticket", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }), signal,
+      });
+      return { status: res.status, ok: res.ok, data: res.ok ? await res.json() : null };
+    });
+    // No socket is constructed for a paused, re-paired, or permission-changed
+    // session, even if it was resumed while ticket issuance was in flight.
+    if (!await deliveryCurrent(token, sessionEpoch)) return outcome;
+    if (authorization.status === 401 || authorization.status === 403) {
+      outcome.rejected = true;
+      return outcome;
+    }
+    if (!authorization.ok || typeof authorization.data?.ticket !== "string" ||
+        !/^[0-9a-f]{64}$/.test(authorization.data.ticket)) return outcome;
+    ticket = authorization.data.ticket;
+  } catch {
+    return outcome; // old relays and unavailable ticket service use HTTP
+  }
   return new Promise((resolve) => {
-    const outcome = { opened: false, welcomed: false, rejected: false };
     let ws;
     try {
-      ws = new WebSocket(WS_URL);
+      ws = new WebSocket(WS_URL, [SOCKET_PROTOCOL, "juno-ticket." + ticket]);
     } catch {
       resolve(outcome);
       return;
     }
     socket = ws;
+    const identity = { token, welcomed: false };
+    socketIdentities.set(ws, identity);
     let lastHeard = Date.now();
     let finished = false;
+    let pinger;
+    let welcomeTimer;
     const finish = () => {
       if (finished) return;
       finished = true;
       clearInterval(pinger);
-      failPendingResultAcks();
+      clearTimeout(welcomeTimer);
+      failPendingResultAcks(ws);
       if (socket === ws) socket = null;
       resolve(outcome);
     };
-    // Keepalive doubles as dead-connection detection: the relay answers
-    // "ping" with "pong", so silence means the connection is gone.
-    const pinger = setInterval(() => {
+    const stop = (code, reason) => {
+      try { ws.close(code, reason); } catch { /* already closed */ }
+      finish();
+    };
+    // Pongs cannot extend this absolute connect-and-welcome deadline.
+    welcomeTimer = setTimeout(() => stop(4008, "welcome timeout"), SOCKET_WELCOME_TIMEOUT_MS);
+    pinger = setInterval(() => {
       if (Date.now() - lastHeard > SOCKET_SILENCE_MS) {
-        try {
-          ws.close(4008, "silent");
-        } catch {
-          /* already closed */
-        }
-        finish();
+        stop(4008, "silent");
         return;
       }
-      try {
-        ws.send("ping");
-      } catch {
-        /* close event follows */
-      }
+      try { ws.send("ping"); } catch { stop(4008, "send failed"); }
     }, PING_MS);
-
     ws.onopen = () => {
+      if (finished || sessionEpoch !== controlEpoch || !acceptingCommands) {
+        stop(1000, "state changed");
+        return;
+      }
       outcome.opened = true;
-      ws.send(JSON.stringify({
-        type: "hello", token, after, version: chrome.runtime.getManifest().version,
-      }));
+      try {
+        ws.send(JSON.stringify({ type: "hello", after, version: chrome.runtime.getManifest().version }));
+      } catch { stop(4008, "hello failed"); }
     };
     ws.onmessage = (ev) => {
+      if (finished || sessionEpoch !== controlEpoch || !acceptingCommands) return;
       lastHeard = Date.now();
       if (ev.data === "pong" || typeof ev.data !== "string") return;
       let msg;
-      try {
-        msg = JSON.parse(ev.data);
-      } catch {
-        return;
-      }
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (!msg || typeof msg !== "object") return;
       if (msg.type === "welcome") {
         outcome.welcomed = true;
+        identity.welcomed = true;
+        clearTimeout(welcomeTimer);
         failStreak = 0;
         setRelayState("ok", "live").catch(() => {});
         return;
       }
       if (msg.type === "error" && msg.error === "unknown_device") {
         outcome.rejected = true;
+        stop(4003, "rejected");
         return;
       }
-      handleSocketMessage(msg);
+      if (identity.welcomed) handleSocketMessage(msg, ws, token, sessionEpoch);
     };
     ws.onclose = (ev) => {
-      if (ev.code === 4003) outcome.rejected = true;
+      if (!finished && ev.code === 4003 && sessionEpoch === controlEpoch) outcome.rejected = true;
       finish();
     };
-    ws.onerror = () => {
-      /* onclose follows */
-    };
+    ws.onerror = () => { /* onclose follows; the welcome timer also bounds it */ };
   });
 }
 
 function closeSocket(reason) {
-  failPendingResultAcks();
   if (!socket) return;
-  try {
-    socket.close(1000, reason);
-  } catch {
-    /* already closed */
-  }
+  const ws = socket;
+  failPendingResultAcks(ws);
+  try { ws.close(1000, reason); } catch { /* already closed */ }
+}
+
+async function deliveryCurrent(token, epoch, requestedState = null) {
+  if (epoch !== controlEpoch || !acceptingCommands) return false;
+  const state = await getState();
+  return epoch === controlEpoch && acceptingCommands && !!state.enabled && state.deviceToken === token &&
+    (!requestedState || permissionKey(state) === permissionKey(requestedState));
 }
 
 /* ---------- HTTP fallback poll ---------- */
@@ -1686,20 +1818,27 @@ function pollDelayMs() {
 // Returns true if a command was handled (so the loop can poll again at once).
 // Throws on relay trouble so the loop backs off.
 async function pollOnce() {
+  const deliveryEpoch = controlEpoch;
   const state = await getState();
-  if (!state.enabled || !state.deviceToken) return false;
-  let res;
+  if (!state.enabled || !state.deviceToken || deliveryEpoch !== controlEpoch) return false;
+  let response;
   try {
-    // Token travels in the POST body only — never in the URL.
-    res = await fetch(JUNO_RELAY_URL + "/poll", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token: state.deviceToken, after: state.cursor }),
+    response = await withRequestDeadline(POLL_TIMEOUT_MS, async (signal) => {
+      const res = await fetch(JUNO_RELAY_URL + "/poll", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: state.deviceToken, after: state.cursor }), signal,
+      });
+      return { res, payload: res.ok && res.status !== 204 ? await res.json() : null };
     });
   } catch (e) {
+    if (!await deliveryCurrent(state.deviceToken, deliveryEpoch, state) || deliveryEpoch !== controlEpoch) return false;
     await setRelayState("unreachable");
     throw e;
   }
+  // An old request has no authority over the new pairing's status, cursor,
+  // queue, or acknowledgements. Check before the first state write.
+  if (!await deliveryCurrent(state.deviceToken, deliveryEpoch, state) || deliveryEpoch !== controlEpoch) return false;
+  const { res, payload } = response;
   if (res.status === 401 || res.status === 403) {
     await setRelayState("rejected");
     throw new Error("relay rejected device token");
@@ -1709,12 +1848,10 @@ async function pollOnce() {
     throw new Error("relay error " + res.status);
   }
   await setRelayState("ok", "polling");
-  if (res.status === 204) return false;
-
-  const payload = await res.json();
   const cmd = payload && payload.cmd;
   if (!cmd || typeof cmd.id !== "string") return false;
-  await schedule(cmd, payload.now);
+  if (!await deliveryCurrent(state.deviceToken, deliveryEpoch, state)) return false;
+  await schedule(cmd, payload.now, state.deviceToken, deliveryEpoch);
   return true;
 }
 
@@ -1794,8 +1931,9 @@ chrome.runtime.onInstalled.addListener(kick);
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.enabled) applyEnabled(!!changes.enabled.newValue);
-  if (changes.deviceToken) {
+  if (changes.deviceToken || changes.allowlist || changes.allowEval) {
     controlEpoch++;
+    forgetSnapshots();
     releaseAllDebuggers().catch(() => {});
     lastRelayState = null;
     closeSocket("state change");
@@ -1819,7 +1957,7 @@ if (typeof JUNO_TEST !== "undefined" && JUNO_TEST) {
     pageTextExpression,
     forgetSnapshots,
     simulateWorkerRestart,
-    attachSocket(ws) { socket = ws; },
+    attachSocket(ws, token) { socket = ws; socketIdentities.set(ws, { token, welcomed: true }); },
     setResultAckMs(ms) { resultAckTimeoutMs = ms; },
     epoch() { return controlEpoch; },
     drain() { return work; },

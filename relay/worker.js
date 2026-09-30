@@ -21,7 +21,7 @@
  *   authenticate anyone. POST /admin/bootstrap is disabled — the first caller
  *   of a fresh deploy cannot claim the relay.
  * - Device: per-device token issued at registration. It travels only in a
- *   POST body or the first WebSocket message — never in a URL.
+ *   POST body. WebSockets use single-use tickets in a private subprotocol.
  * - Results: a device may submit a result only for a command id that was
  *   enqueued for that device. The association outlives delivery
  *   acknowledgement and lasts until the result is accepted (further posts
@@ -34,8 +34,8 @@
  *
  * Optional request_id on /admin/cmd and /admin/run is per device. A repeat
  * returns the original command and does not enqueue another execution. The
- * result is copied onto that record so a caller can read it again after
- * GET /admin/result has consumed its own copy. The copy lasts until the
+ * result is referenced by that record so a caller can read it again after
+ * GET /admin/result has consumed its receipt. The reference lasts until the
  * ownership TTL. A different request_id is a different command.
  *
  * Migration: on first boot, if the old KV namespace is still bound as BRIDGE,
@@ -52,8 +52,28 @@ const RESULT_TTL_MS = 600_000;
 // Command→device ownership outlives queue acknowledgement so a result can
 // still be checked after the command was delivered, and dies with the result.
 const OWNER_TTL_MS = RESULT_TTL_MS;
-const RESULT_PERSIST_MAX = 1_000_000; // Durable Object storage values cap at 2 MB
-const MAX_RESULT_BYTES = 20 * 1024 * 1024;
+const MAX_RESULT_BYTES = 8 * 1024 * 1024;
+const RESULT_TOTAL_BYTES = 16 * 1024 * 1024;
+const RESULT_MAX = 128;
+const RESULT_CHUNK_BYTES = 100 * 1024;
+const QUEUE_BYTES_MAX = 4 * 1024 * 1024;
+const QUEUE_DEVICE_BYTES_MAX = 1024 * 1024;
+const IDEM_BYTES_MAX = 4 * 1024 * 1024;
+const OWNER_MAX = 1000;
+const IDEM_MAX = 1000;
+const DEVICE_MAX = 256;
+const PAIR_MAX = 64;
+const TICKET_MAX = 64;
+const TICKET_TTL_MS = 30_000;
+const BODY_MAX = 64 * 1024;
+const RESULT_BODY_MAX = 10 * 1024 * 1024;
+const BODY_TIMEOUT_MS = 15_000;
+const BODY_READERS_MAX = 8;
+const WS_MESSAGE_MAX = 900 * 1024;
+const WAITERS_MAX = 256;
+const RESULT_STREAMS_MAX = 16;
+const RESULT_STREAM_TIMEOUT_MS = 30_000;
+const CLEANUP_MS = 60_000;
 const RESULT_WAIT_DEFAULT_S = 10;
 const RUN_WAIT_DEFAULT_S = 30;
 const WAIT_MAX_S = 60;
@@ -120,7 +140,7 @@ function normalizePairCode(code) {
 // CORS is only meaningful for the extension (a browser). Admin endpoints are
 // curl-only and get no CORS headers at all. Only extension origins are
 // reflected, so ordinary web pages can't script the device endpoints.
-const DEVICE_PATHS = new Set(["/register", "/poll", "/result", "/unregister"]);
+const DEVICE_PATHS = new Set(["/register", "/poll", "/result", "/unregister", "/ws-ticket"]);
 
 function corsHeaders(path, origin) {
   if (!DEVICE_PATHS.has(path)) return {};
@@ -146,12 +166,66 @@ function bearer(req) {
   return m ? m[1].trim() : null;
 }
 
-// Constant-time string compare (no timingSafeEqual in Workers runtime).
+// Workers provides this constant-time Web Crypto extension.
 function ctEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
+  return crypto.subtle.timingSafeEqual(enc.encode(a), enc.encode(b));
+}
+
+class RelayError extends Error {
+  constructor(error, status) { super(error); this.status = status; }
+}
+
+function bytes(value) { return enc.encode(JSON.stringify(value)).byteLength; }
+
+async function deleteKeys(storage, keys) {
+  for (let start = 0; start < keys.length; start += 128) await storage.delete(keys.slice(start, start + 128));
+}
+
+// One absolute deadline covers the full stream, including an incomplete body.
+async function readJsonBody(req, limit) {
+  const declared = req.headers.get("content-length");
+  if (declared && /^\d+$/.test(declared) && Number(declared) > limit) {
+    if (req.body) void req.body.cancel().catch(() => {});
+    throw new RelayError("body_too_large", 413);
+  }
+  if (!req.body) return {};
+  const reader = req.body.getReader();
+  const decoder = new TextDecoder();
+  let timedOut = false, timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      void reader.cancel().catch(() => {});
+      reject(new RelayError("body_timeout", 408));
+    }, BODY_TIMEOUT_MS);
+  });
+  try {
+    const text = await Promise.race([timeout, (async () => {
+      let size = 0, segment = "";
+      const segments = [];
+      while (true) {
+        const { value, done } = await reader.read();
+        if (timedOut) throw new RelayError("body_timeout", 408);
+        if (done) break;
+        size += value.byteLength;
+        if (size > limit) throw new RelayError("body_too_large", 413);
+        segment += decoder.decode(value, { stream: true });
+        if (segment.length >= 65536) { segments.push(segment); segment = ""; }
+      }
+      segments.push(segment + decoder.decode());
+      return segments.join("");
+    })()]);
+    let body;
+    try { body = text.trim() ? JSON.parse(text) : {}; }
+    catch { throw new RelayError("bad_json", 400); }
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new RelayError("bad_json", 400);
+    return body;
+  } finally {
+    clearTimeout(timer);
+    void reader.cancel().catch(() => {});
+    try { reader.releaseLock(); } catch { /* a cancelled read may still be settling */ }
+  }
 }
 
 function clientIp(req) {
@@ -188,6 +262,13 @@ export default {
       if (!adminSecret(env)) {
         return jsonResponse({ error: "admin_not_configured" }, 503, corsHeaders(path, origin));
       }
+      // Reject header-only attackers before forwarding any body to the hub.
+      // The hub repeats this check for direct Durable Object requests.
+      if (path.startsWith("/admin/")) {
+        const token = bearer(req);
+        if (!token) return jsonResponse({ error: "missing_auth" }, 401);
+        if (!ctEqual(await sha256hex(token), adminSecret(env))) return jsonResponse({ error: "bad_auth" }, 403);
+      }
       // Optional: bind a Rate Limiting API binding named REGISTER_LIMITER for
       // a per-IP limit on pairing attempts.
       if (path === "/register" && env.REGISTER_LIMITER) {
@@ -197,7 +278,7 @@ export default {
       const hub = env.HUB.get(env.HUB.idFromName("juno-bridge"));
       return await hub.fetch(req);
     } catch (e) {
-      console.error("juno-bridge:", path, e && e.stack ? e.stack : e);
+      console.error("juno-bridge: request failed");
       return jsonResponse({ error: "relay_unavailable" }, 503, corsHeaders(path, origin));
     }
   },
@@ -211,89 +292,178 @@ export class BridgeHub {
     this.env = env;
     this.waiters = new Map(); // cmd id → Set of wake-up functions (in-flight /admin/result waits)
     this.owners = new Map(); // cmd id → { token, expires, done }
-    this.idem = new Map(); // token:request_id → { cmd, expires, result, gate }
+    this.idem = new Map(); // token:request_id → { cmd, expires, resultId }
     this.idemByCmd = new Map(); // cmd id → idempotency key
     this.idemWaiters = new Map(); // idempotency key → Set of wake-up functions
+    this.mutations = Promise.resolve();
+    this.waiterCount = 0;
+    this.bodyReaders = 0;
+    this.postRequests = 0;
+    this.resultBodyReaders = 0;
+    this.resultStreams = 0;
+    this.resultPins = new Map(); // active, deadline-bounded streams defer TTL deletion
     // The runtime answers the extension's keepalive without waking the hub.
     ctx.setWebSocketAutoResponse(new globalThis.WebSocketRequestResponsePair("ping", "pong"));
     ctx.blockConcurrencyWhile(() => this.load());
   }
 
-  /* ----- state ----- */
+  /* ----- state and bounded, transactional mutations ----- */
+
+  mutate(fn) {
+    const work = this.mutations.then(fn);
+    this.mutations = work.catch(() => {});
+    return work;
+  }
+
+  async *records(prefix, pageSize = 128) {
+    let startAfter;
+    while (true) {
+      const page = await this.ctx.storage.list({ prefix, limit: pageSize, ...(startAfter ? { startAfter } : {}) });
+      for (const pair of page) yield pair;
+      if (page.size < pageSize) return;
+      startAfter = [...page.keys()].at(-1);
+    }
+  }
+
+  async commit(writes = {}, deletes = []) {
+    await this.ctx.storage.transaction(async (tx) => {
+      await deleteKeys(tx, deletes);
+      const entries = Object.entries(writes);
+      for (let i = 0; i < entries.length; i += 128) await tx.put(Object.fromEntries(entries.slice(i, i + 128)));
+      await tx.setAlarm(Date.now() + CLEANUP_MS);
+    });
+  }
+
+  registry(devices = this.devices, order = this.order, pairs = this.pairs) {
+    return { admin_hash: this.adminHash, devices, order, pairs, migrated: this.migrated };
+  }
 
   async load() {
     const s = this.ctx.storage;
+    const now = Date.now();
     const reg = await s.get(["admin_hash", "devices", "order", "pairs", "migrated"]);
     this.adminHash = reg.get("admin_hash") || null;
-    this.devices = reg.get("devices") || new Map(); // token → { name, created }
-    this.order = reg.get("order") || []; // tokens, oldest first; last is "default"
-    this.pairs = reg.get("pairs") || new Map(); // code → expiresAt
-    if (!reg.get("migrated")) await this.importFromKv();
-    this.queues = new Map(); // token → { last, items: [cmd] }
-    for (const [k, v] of await s.list({ prefix: "queue:" })) this.queues.set(k.slice(6), v);
-    this.results = new Map(); // id → { record: string, expires }
-    for (const [k, v] of await s.list({ prefix: "res:" })) this.results.set(k.slice(4), v);
+    this.devices = reg.get("devices") || new Map();
+    this.order = reg.get("order") || [];
+    const storedPairs = reg.get("pairs") || new Map();
+    this.pairs = new Map([...storedPairs].filter(([, expires]) => expires > now));
+    this.migrated = !!reg.get("migrated");
+    if (this.devices.size > DEVICE_MAX || this.pairs.size > PAIR_MAX) throw new Error("legacy registry exceeds safe limits");
+    if (!this.migrated) await this.importFromKv();
+    else if (storedPairs.size !== this.pairs.size) await this.commit({ pairs: this.pairs });
+    this.queues = new Map();
+    this.results = new Map();
+    this.payloads = new Map(); // metadata only; primary and replay share durable chunks
     this.owners = new Map();
-    for (const [k, v] of await s.list({ prefix: "own:" })) {
-      if (v && typeof v.token === "string") {
-        this.owners.set(k.slice(4), { token: v.token, expires: v.expires, done: !!v.done });
-      }
-    }
-    await this.purgeOwners();
     this.idem = new Map();
     this.idemByCmd = new Map();
-    for (const [k, v] of await s.list({ prefix: "idem:" })) {
-      if (!v || !v.cmd || typeof v.cmd.id !== "string") continue;
-      const key = k.slice("idem:".length);
-      this.idem.set(key, { cmd: v.cmd, expires: v.expires, result: v.result || null, gate: null });
-      this.idemByCmd.set(v.cmd.id, key);
+    this.tickets = new Map();
+    for await (const [k, v] of this.records("queue:", 1)) {
+      if (!this.devices.has(k.slice(6))) { await s.delete(k); continue; }
+      const queue = { last: v.last, items: v.items.filter((c) => now - c.issued_at < QUEUE_KEEP_MS) };
+      if (queue.items.length !== v.items.length) await this.commit({ [k]: queue });
+      this.queues.set(k.slice(6), queue);
+      if (queue.items.length > QUEUE_MAX || bytes(queue) > QUEUE_DEVICE_BYTES_MAX || this.queueBytes() > QUEUE_BYTES_MAX) throw new Error("legacy queues exceed safe limits");
     }
-    await this.purgeIdem();
+    for await (const [k, v] of this.records("own:")) {
+      if (!v || !TOKEN_RE.test(v.token)) continue;
+      // Leave expired rows available to attribute old raw result records until
+      // migration finishes, but never count them against the live-state bound.
+      if (v.expires <= now || !this.devices.has(v.token)) continue;
+      this.owners.set(k.slice(4), { ...v, done: !!v.done });
+      if (this.owners.size > OWNER_MAX) throw new Error("legacy owners exceed safe limits");
+    }
+    for await (const [k, v] of this.records("payload:")) {
+      if (!v || !Number.isSafeInteger(v.chunks) || v.chunks < 1 || v.chunks > Math.ceil(MAX_RESULT_BYTES / RESULT_CHUNK_BYTES) || !Number.isSafeInteger(v.bytes) || v.bytes < 1 || v.bytes > MAX_RESULT_BYTES) throw new Error("invalid durable result metadata");
+      if (v.expires <= now || (v.token && !this.devices.has(v.token))) { await deleteKeys(s, [k, ...this.chunkKeys(k.slice(8), v)]); continue; }
+      const token = v.token || (await s.get("own:" + k.slice(8)))?.token || null;
+      if (token && !this.devices.has(token)) { await deleteKeys(s, [k, "res:" + k.slice(8), ...this.chunkKeys(k.slice(8), v)]); continue; }
+      const meta = token && !v.token ? { ...v, token } : v;
+      if (meta !== v) await this.commit({ [k]: meta });
+      this.payloads.set(k.slice(8), meta);
+      if (this.payloads.size > RESULT_MAX || this.payloadBytes() > RESULT_TOTAL_BYTES) throw new Error("legacy results exceed safe limits");
+    }
+    for await (const [k, v] of this.records("res:", 1)) {
+      const id = k.slice(4);
+      if (!v) continue;
+      if (v.expires <= now) { await s.delete(k); continue; }
+      if (typeof v.record === "string") {
+        const oldOwner = this.owners.get(id) || await s.get("own:" + id);
+        if (oldOwner?.token && !this.devices.has(oldOwner.token)) { await s.delete(k); continue; }
+        await this.importResult(id, v.record, v.expires, { [k]: { expires: v.expires } }, oldOwner?.token);
+      } else if (!this.payloads.has(id)) throw new Error("missing durable result payload");
+      this.results.set(id, { expires: v.expires });
+    }
+    for await (const [k, v] of this.records("idem:", 1)) {
+      if (!v || !v.cmd || !CMD_ID_RE.test(v.cmd.id)) continue;
+      const key = k.slice(5);
+      if (v.expires <= now || !this.devices.has(key.slice(0, 64))) { await s.delete(k); continue; }
+      const entry = { cmd: v.cmd, expires: v.expires, resultId: v.resultId || null };
+      if (v.result) {
+        entry.resultId = v.cmd.id;
+        await this.importResult(v.cmd.id, JSON.stringify(v.result), v.expires, { [k]: entry }, key.slice(0, 64));
+      }
+      if (entry.resultId && !this.payloads.has(entry.resultId)) throw new Error("missing durable replay payload");
+      if (entry.resultId && !this.payloads.get(entry.resultId).token) {
+        const meta = { ...this.payloads.get(entry.resultId), token: key.slice(0, 64) };
+        await this.commit({ ["payload:" + entry.resultId]: meta }); this.payloads.set(entry.resultId, meta);
+      }
+      this.idem.set(key, entry);
+      this.idemByCmd.set(v.cmd.id, key);
+      if (this.idem.size > IDEM_MAX || this.idemBytes() > IDEM_BYTES_MAX) throw new Error("legacy idempotency records exceed safe limits");
+    }
+    for await (const [k, v] of this.records("ticket:")) {
+      if (!v || v.expires <= now || !this.devices.has(v.token)) { await s.delete(k); continue; }
+      this.tickets.set(k.slice(7), v);
+      if (this.tickets.size > TICKET_MAX) throw new Error("legacy tickets exceed safe limits");
+    }
+    // Older schemas might have queued commands without independent ownership.
+    const owners = {};
+    for (const [token, q] of this.queues) for (const cmd of q.items) {
+      if (this.owners.has(cmd.id)) continue;
+      const owner = { token, expires: cmd.issued_at + OWNER_TTL_MS, done: this.payloads.has(cmd.id) };
+      owners["own:" + cmd.id] = owner;
+      this.owners.set(cmd.id, owner);
+    }
+    if (this.owners.size > OWNER_MAX) throw new Error("legacy owners exceed safe limits");
+    // A previously acknowledged, memory-only screenshot cannot be reconstructed.
+    // Keep the receipt and expose an explicit failure rather than pending forever.
+    for (const [id, owner] of this.owners) if (owner.done && !owner.consumed && !this.payloads.has(id)) owner.resultMissing = true;
+    if (Object.keys(owners).length) await this.commit(owners);
+    let expiredOwners = [];
+    for await (const [k, v] of this.records("own:")) {
+      if (!v || v.expires <= now || !this.devices.has(v.token)) expiredOwners.push(k);
+      if (expiredOwners.length === 128) { await deleteKeys(s, expiredOwners); expiredOwners = []; }
+    }
+    await deleteKeys(s, expiredOwners);
+    await this.purgeExpired();
   }
 
   async importFromKv() {
     const kv = this.env.BRIDGE;
+    const devices = new Map(this.devices), order = [...this.order];
+    let hash = this.adminHash;
     if (kv) {
-      try {
-        const h = await kv.get("cfg:admin_hash");
-        // Kept so an operator can see the old hash. Auth ignores it.
-        if (h && !this.adminHash) this.adminHash = h;
-        for (const t of (await kv.get("devices:index", "json")) || []) {
-          if (!TOKEN_RE.test(t) || this.devices.has(t)) continue;
-          const d = await kv.get("device:" + t, "json");
-          if (!d) continue;
-          this.devices.set(t, { name: d.name || "chrome", created: d.created || Date.now() });
-          this.order.push(t);
-        }
-      } catch (e) {
-        console.error("juno-bridge: KV import failed; will retry on next boot", e);
-        return;
+      const imported = await kv.get("cfg:admin_hash");
+      if (imported && !hash) hash = imported;
+      for (const token of (await kv.get("devices:index", "json")) || []) {
+        if (!TOKEN_RE.test(token) || devices.has(token)) continue;
+        if (devices.size >= DEVICE_MAX) throw new Error("KV registry exceeds safe limits");
+        const d = await kv.get("device:" + token, "json");
+        if (!d) continue;
+        devices.set(token, { name: String(d.name || "chrome").slice(0, NAME_MAX), created: d.created || Date.now() });
+        order.push(token);
       }
     }
-    await this.saveRegistry();
+    // No partial import becomes visible or marks migration complete.
+    await this.commit({ admin_hash: hash, devices, order, pairs: this.pairs, migrated: true });
+    this.adminHash = hash; this.devices = devices; this.order = order; this.migrated = true;
   }
 
-  async saveRegistry() {
-    await this.ctx.storage.put({
-      admin_hash: this.adminHash,
-      devices: this.devices,
-      order: this.order,
-      pairs: this.pairs,
-      migrated: true,
-    });
-  }
+  adminHashValue() { return adminSecret(this.env); }
 
-  adminHashValue() {
-    // The stored admin_hash (bootstrap, or a KV import) is not a credential.
-    return adminSecret(this.env);
-  }
-
-  // "default"/absent → most recently registered device; a full token; or a
-  // unique prefix of at least 8 chars (as /admin/devices shows).
   resolveDevice(selector) {
-    if (!selector || selector === "default") {
-      return this.order.length ? { token: this.order[this.order.length - 1] } : { error: "no_device", status: 404 };
-    }
+    if (!selector || selector === "default") return this.order.length ? { token: this.order.at(-1) } : { error: "no_device", status: 404 };
     if (typeof selector !== "string") return { error: "bad_device", status: 400 };
     const sel = selector.trim().toLowerCase().replace(/…$/, "");
     if (TOKEN_RE.test(sel)) return this.devices.has(sel) ? { token: sel } : { error: "no_device", status: 404 };
@@ -303,310 +473,265 @@ export class BridgeHub {
     return hits.length ? { token: hits[0] } : { error: "no_device", status: 404 };
   }
 
+  queueBytes() { let total = 0; for (const q of this.queues.values()) total += bytes(q); return total; }
+  idemBytes() { let total = 0; for (const e of this.idem.values()) total += bytes(e.cmd); return total; }
+  payloadBytes() { let total = 0; for (const p of this.payloads.values()) total += p.bytes; return total; }
+  chunkKeys(id, meta = this.payloads.get(id)) { return meta ? Array.from({ length: meta.chunks }, (_, i) => `chunk:${id}:${i}`) : []; }
+
   async removeDevice(token) {
-    this.devices.delete(token);
-    this.order = this.order.filter((t) => t !== token);
-    this.queues.delete(token);
-    await this.ctx.storage.delete("queue:" + token);
-    await this.saveRegistry();
-    const deadIdem = [];
-    for (const [key, entry] of this.idem) {
-      if (!key.startsWith(token + ":")) continue;
-      deadIdem.push(key);
-      this.idem.delete(key);
-      if (entry && entry.cmd) this.idemByCmd.delete(entry.cmd.id);
-    }
-    if (deadIdem.length) await this.ctx.storage.delete(deadIdem.map((key) => "idem:" + key));
-    for (const ws of this.socketsFor(token)) {
-      try {
-        ws.close(4003, "revoked");
-      } catch {
-        /* already closed */
-      }
-    }
+    return this.mutate(async () => {
+      const devices = new Map(this.devices); devices.delete(token);
+      const order = this.order.filter((t) => t !== token);
+      const ownerIds = [...this.owners].filter(([, o]) => o.token === token).map(([id]) => id);
+      const idemKeys = [...this.idem.keys()].filter((k) => k.startsWith(token + ":"));
+      const ids = new Set([...ownerIds, ...idemKeys.map((k) => this.idem.get(k).cmd.id), ...[...this.payloads].filter(([, p]) => p.token === token).map(([id]) => id)]);
+      const ticketKeys = [...this.tickets].filter(([, t]) => t.token === token).map(([k]) => k);
+      const deletes = ["queue:" + token, ...ownerIds.map((id) => "own:" + id), ...idemKeys.map((k) => "idem:" + k), ...ticketKeys.map((k) => "ticket:" + k)];
+      for (const id of ids) deletes.push("res:" + id, "payload:" + id, ...this.chunkKeys(id));
+      await this.commit(this.registry(devices, order), deletes);
+      this.devices = devices; this.order = order; this.queues.delete(token);
+      for (const id of ids) { this.owners.delete(id); this.results.delete(id); this.payloads.delete(id); this.idemByCmd.delete(id); this.wake(this.waiters, id); }
+      for (const k of idemKeys) { this.idem.delete(k); this.wake(this.idemWaiters, k); }
+      for (const k of ticketKeys) this.tickets.delete(k);
+      for (const ws of this.socketsFor(token)) try { ws.close(4003, "revoked"); } catch { /* closing */ }
+    });
   }
 
-  /* ----- queue ----- */
-
-  // Unacknowledged commands for a device, minus any too old to run.
   pending(token) {
     const q = this.queues.get(token);
-    if (!q) return [];
-    const now = Date.now();
-    return q.items.filter((c) => now - c.issued_at < QUEUE_KEEP_MS);
+    return q ? q.items.filter((c) => Date.now() - c.issued_at < QUEUE_KEEP_MS) : [];
   }
 
-  async saveQueue(token, q) {
-    this.queues.set(token, q);
-    await this.ctx.storage.put("queue:" + token, q);
-  }
-
-  // `requestId` omitted: a normal one-shot command. Present: reserve the id
-  // before any await so two overlapping calls share one execution.
   async enqueue(token, action, params, requestId) {
-    let reserved = null;
-    let stale = [];
-    if (requestId !== undefined && requestId !== null) {
-      if (typeof requestId !== "string" || !REQUEST_ID_RE.test(requestId)) {
-        return { error: "bad_request_id", status: 400 };
+    return this.mutate(async () => {
+      await this.purgeExpired();
+      if (!this.devices.has(token)) return { error: "unknown_device", status: 403 };
+      let key = null;
+      if (requestId !== undefined && requestId !== null) {
+        if (typeof requestId !== "string" || !REQUEST_ID_RE.test(requestId)) return { error: "bad_request_id", status: 400 };
+        key = token + ":" + requestId;
+        const prior = this.idem.get(key);
+        if (prior) return { cmd: prior.cmd, duplicate: true, idemKey: key };
       }
-      const key = token + ":" + requestId;
-      // Drop expired records in memory before the reserve. The map update is
-      // synchronous so two overlapping calls cannot both miss it.
-      stale = this.forgetExpiredIdem();
-      const prior = this.idem.get(key);
-      if (prior && (prior.expires >= Date.now() || prior.gate)) {
-        if (stale.length) await this.ctx.storage.delete(stale.map((id) => "idem:" + id));
-        if (prior.gate) {
-          const cmd = await prior.gate;
-          if (!cmd) return null;
-          return { cmd, duplicate: true, idemKey: key };
-        }
-        if (prior.cmd) return { cmd: prior.cmd, duplicate: true, idemKey: key };
-      }
-      let resolveGate;
-      const gate = new Promise((resolve) => {
-        resolveGate = resolve;
-      });
-      const entry = { cmd: null, expires: Date.now() + OWNER_TTL_MS, result: null, gate };
-      this.idem.set(key, entry);
-      reserved = { key, entry, resolve: resolveGate, published: false };
-    }
-    try {
-      if (stale.length) await this.ctx.storage.delete(stale.map((id) => "idem:" + id));
       const q = this.queues.get(token) || { last: 0, items: [] };
       const items = this.pending(token);
-      if (items.length >= QUEUE_MAX) {
-        this.cancelReserve(reserved);
-        return null;
-      }
+      if (items.length >= QUEUE_MAX || this.owners.size >= OWNER_MAX || (key && this.idem.size >= IDEM_MAX)) return null;
       const now = Date.now();
-      const cmd = {
-        id: "cmd_" + randHex(8),
-        seq: Math.max(now, q.last + 1),
-        action,
-        params: params && typeof params === "object" ? params : {},
-        issued_at: now,
-      };
-      items.push(cmd);
-      if (reserved) {
-        reserved.entry.cmd = cmd;
-        this.idemByCmd.set(cmd.id, reserved.key);
-      }
-      // Owner is durable before the command is visible to the device, so a
-      // result cannot win the race against the association.
-      await this.rememberOwner(cmd.id, token);
-      if (reserved) await this.persistIdem(reserved.key);
-      await this.saveQueue(token, { last: cmd.seq, items });
+      const cmd = { id: "cmd_" + randHex(8), seq: Math.max(now, q.last + 1), action, params: params && typeof params === "object" ? params : {}, issued_at: now };
+      if (bytes(cmd) > BODY_MAX) return { error: "command_too_large", status: 413 };
+      const next = { last: cmd.seq, items: [...items, cmd] };
+      if (bytes(next) > QUEUE_DEVICE_BYTES_MAX || this.queueBytes() - (this.queues.has(token) ? bytes(q) : 0) + bytes(next) > QUEUE_BYTES_MAX || (key && this.idemBytes() + bytes(cmd) > IDEM_BYTES_MAX)) return null;
+      const owner = { token, expires: now + OWNER_TTL_MS, done: false };
+      const entry = key ? { cmd, expires: now + OWNER_TTL_MS, resultId: null } : null;
+      const writes = { ["queue:" + token]: next, ["own:" + cmd.id]: owner };
+      if (key) writes["idem:" + key] = entry;
+      await this.commit(writes);
+      this.queues.set(token, next); this.owners.set(cmd.id, owner);
+      if (key) { this.idem.set(key, entry); this.idemByCmd.set(cmd.id, key); }
       this.push(token, [cmd]);
-      if (reserved) {
-        reserved.published = true;
-        reserved.entry.gate = null;
-        reserved.resolve(cmd);
-        reserved.resolve = null;
+      return { cmd, duplicate: false, idemKey: key };
+    });
+  }
+
+  async ack(token, seq) {
+    if (!Number.isSafeInteger(seq) || seq < 0) return;
+    return this.mutate(async () => {
+      if (!this.devices.has(token)) return;
+      const q = this.queues.get(token);
+      if (!q) return;
+      const items = q.items.filter((c) => c.seq > seq);
+      if (items.length === q.items.length) return;
+      const next = { last: q.last, items };
+      await this.commit({ ["queue:" + token]: next });
+      this.queues.set(token, next);
+    });
+  }
+
+  async legacyPoll(token) {
+    return this.mutate(async () => {
+      if (!this.devices.has(token)) return null;
+      const items = this.pending(token);
+      if (!items.length) return null;
+      const cmd = items.shift(), next = { last: this.queues.get(token).last, items };
+      await this.commit({ ["queue:" + token]: next });
+      this.queues.set(token, next);
+      return cmd;
+    });
+  }
+
+  async putPayload(tx, id, encoded, expires, token = this.owners.get(id)?.token || null) {
+    const meta = { bytes: encoded.byteLength, chunks: Math.ceil(encoded.byteLength / RESULT_CHUNK_BYTES), expires, token };
+    // Small write batches keep the write buffer bounded, including >128 chunks.
+    for (let i = 0; i < meta.chunks; i++) await tx.put(`chunk:${id}:${i}`, encoded.slice(i * RESULT_CHUNK_BYTES, (i + 1) * RESULT_CHUNK_BYTES), { noCache: true });
+    await tx.put("payload:" + id, meta);
+    return meta;
+  }
+
+  async importResult(id, record, expires, writes, token) {
+    if (this.payloads.has(id)) {
+      const old = this.payloads.get(id);
+      const meta = !old.token && token ? { ...old, token } : old;
+      await this.commit({ ...writes, ["payload:" + id]: meta }); this.payloads.set(id, meta); return;
+    }
+    const encoded = enc.encode(record);
+    if (encoded.byteLength > MAX_RESULT_BYTES || this.payloads.size >= RESULT_MAX || this.payloadBytes() + encoded.byteLength > RESULT_TOTAL_BYTES) throw new Error("legacy result exceeds safe limits");
+    let meta;
+    await this.ctx.storage.transaction(async (tx) => {
+      meta = await this.putPayload(tx, id, encoded, expires, token);
+      await tx.put(writes);
+      await tx.setAlarm(Date.now() + CLEANUP_MS);
+    });
+    this.payloads.set(id, meta);
+  }
+
+  async acceptResult(token, id, body) {
+    return this.mutate(async () => {
+      await this.purgeExpired();
+      if (!this.devices.has(token)) return { ok: false, error: "unknown_device", status: 403 };
+      const owner = this.owners.get(id);
+      if (!owner) return { ok: false, error: "unknown_command", status: 403 };
+      if (owner.token !== token) return { ok: false, error: "not_command_owner", status: 403 };
+      if (owner.done) return { ok: true, duplicate: true };
+      let parsed = { ok: !!body.ok, data: body.data ?? null, error: body.error == null ? null : String(body.error).slice(0, 1000), finished_at: Date.now() };
+      let encoded = enc.encode(JSON.stringify(parsed));
+      if (encoded.byteLength > MAX_RESULT_BYTES || this.payloadBytes() + encoded.byteLength > RESULT_TOTAL_BYTES) {
+        parsed = { ok: false, data: null, error: encoded.byteLength > MAX_RESULT_BYTES ? "result_too_large" : "result_capacity", finished_at: Date.now() };
+        encoded = enc.encode(JSON.stringify(parsed));
       }
-      return { cmd, duplicate: false, idemKey: reserved ? reserved.key : null };
-    } catch (err) {
-      this.cancelReserve(reserved);
-      throw err;
-    }
+      if (this.payloads.size >= RESULT_MAX || this.payloadBytes() + encoded.byteLength > RESULT_TOTAL_BYTES) return { ok: false, error: "result_capacity", status: 429 };
+      const completed = { ...owner, done: true }, primary = { expires: Date.now() + RESULT_TTL_MS };
+      const key = this.idemByCmd.get(id), prior = key && this.idem.get(key);
+      const replay = prior ? { ...prior, resultId: id } : null;
+      let meta;
+      await this.ctx.storage.transaction(async (tx) => {
+        meta = await this.putPayload(tx, id, encoded, Math.max(primary.expires, replay ? replay.expires : 0));
+        const writes = { ["res:" + id]: primary, ["own:" + id]: completed };
+        if (key && replay) writes["idem:" + key] = replay;
+        await tx.put(writes);
+        await tx.setAlarm(Date.now() + CLEANUP_MS);
+      });
+      // Visibility, done receipts, waiters and socket acknowledgements follow commit.
+      this.payloads.set(id, meta); this.results.set(id, primary); this.owners.set(id, completed);
+      if (replay) this.idem.set(key, replay);
+      this.wake(this.waiters, id); if (key) this.wake(this.idemWaiters, key);
+      return { ok: true };
+    });
   }
 
-  cancelReserve(reserved) {
-    if (!reserved || !reserved.resolve) return;
-    if (!reserved.published) {
-      const current = this.idem.get(reserved.key);
-      if (current === reserved.entry) this.idem.delete(reserved.key);
-      if (reserved.entry.cmd) this.idemByCmd.delete(reserved.entry.cmd.id);
-    }
-    reserved.entry.gate = null;
-    reserved.resolve(reserved.published ? reserved.entry.cmd : null);
-    reserved.resolve = null;
+  wake(map, key) { const set = map.get(key); if (set) for (const wake of [...set]) wake(); }
+
+  async wait(map, key, seconds, ready, live) {
+    if (ready() || !live() || seconds <= 0) return;
+    if (this.waiterCount >= WAITERS_MAX) throw new RelayError("too_many_waiters", 429);
+    this.waiterCount++;
+    await new Promise((resolve) => {
+      const set = map.get(key) || new Set(); map.set(key, set);
+      let finished = false;
+      const wake = () => {
+        if (finished) return; finished = true; clearTimeout(timer);
+        set.delete(wake); if (!set.size && map.get(key) === set) map.delete(key);
+        this.waiterCount--; resolve();
+      };
+      const timer = setTimeout(wake, seconds * 1000);
+      set.add(wake);
+      if (ready() || !live()) wake();
+    });
   }
 
-  async persistIdem(key) {
-    const entry = this.idem.get(key);
-    if (!entry || !entry.cmd) return;
-    const record = entry.result ? JSON.stringify(entry.result) : "";
-    const stored = {
-      cmd: entry.cmd,
-      expires: entry.expires,
-      result: record && record.length <= RESULT_PERSIST_MAX ? entry.result : null,
-    };
-    await this.ctx.storage.put("idem:" + key, stored);
-  }
+  missingResult(id) { return this.owners.get(id)?.resultMissing ? { inline: { ok: false, data: null, error: "result_unavailable_after_upgrade", finished_at: Date.now() } } : null; }
 
-  forgetExpiredIdem() {
-    const now = Date.now();
-    const dead = [];
-    for (const [key, entry] of this.idem) {
-      if (!entry || (entry.expires < now && !entry.gate)) dead.push(key);
-    }
-    for (const key of dead) {
-      const entry = this.idem.get(key);
-      this.idem.delete(key);
-      if (entry && entry.cmd) this.idemByCmd.delete(entry.cmd.id);
-    }
-    return dead;
-  }
-
-  async purgeIdem() {
-    const dead = this.forgetExpiredIdem();
-    if (dead.length) await this.ctx.storage.delete(dead.map((key) => "idem:" + key));
+  async waitForResult(id, seconds) {
+    await this.wait(this.waiters, id, seconds, () => this.results.has(id) || this.missingResult(id), () => this.owners.has(id) && !this.owners.get(id).done);
+    return this.results.has(id) ? { id, consume: true } : this.missingResult(id);
   }
 
   async waitForIdem(key, seconds) {
-    const ready = () => {
-      const entry = this.idem.get(key);
-      return entry && entry.result ? entry.result : null;
-    };
-    if (!ready() && seconds > 0) {
-      await new Promise((resolve) => {
-        const set = this.idemWaiters.get(key) || new Set();
-        this.idemWaiters.set(key, set);
-        const timer = setTimeout(() => {
-          set.delete(wake);
-          if (!set.size && this.idemWaiters.get(key) === set) this.idemWaiters.delete(key);
-          resolve();
-        }, seconds * 1000);
-        const wake = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-        set.add(wake);
-        if (ready()) wake();
-      });
-    }
-    return ready();
+    const ready = () => this.idem.get(key)?.resultId || (this.idem.has(key) && this.missingResult(this.idem.get(key).cmd.id));
+    await this.wait(this.idemWaiters, key, seconds, ready, () => this.idem.has(key));
+    const entry = this.idem.get(key);
+    return entry?.resultId ? { id: entry.resultId, consume: false } : entry ? this.missingResult(entry.cmd.id) : null;
   }
 
-  // The extension has taken everything up to `seq`. This drops the command
-  // from the queue only. Ownership stays until the result is in (or expires),
-  // so a delivery ack is not permission for a different device to answer it.
-  async ack(token, seq) {
-    const q = this.queues.get(token);
-    if (!q) return;
-    const items = q.items.filter((c) => c.seq > seq);
-    if (items.length !== q.items.length) await this.saveQueue(token, { last: q.last, items });
-  }
-
-  async rememberOwner(id, token) {
-    const entry = { token, expires: Date.now() + OWNER_TTL_MS, done: false };
-    this.owners.set(id, entry);
-    await this.ctx.storage.put("own:" + id, entry);
-    await this.purgeOwners();
-  }
-
-  async purgeOwners() {
-    const now = Date.now();
-    const dead = [];
-    for (const [id, owner] of this.owners) if (!owner || owner.expires < now) dead.push(id);
-    for (const id of dead) this.owners.delete(id);
-    if (dead.length) await this.ctx.storage.delete(dead.map((id) => "own:" + id));
-  }
-
-  // { ok: true, duplicate?: true } or { ok: false, error, status }.
-  // The first accepted body wins. A later post from the same device is a
-  // no-op receipt; any other device is rejected. The owner record is kept
-  // until expiry so that check still works after completion.
-  async acceptResult(token, id, body) {
-    await this.purgeOwners();
-    if (!this.devices.has(token)) return { ok: false, error: "unknown_device", status: 403 };
-    const owner = this.owners.get(id);
-    if (!owner) return { ok: false, error: "unknown_command", status: 403 };
-    if (owner.token !== token) return { ok: false, error: "not_command_owner", status: 403 };
-    if (owner.done) return { ok: true, duplicate: true };
-    await this.storeResult(id, body);
-    owner.done = true;
-    this.owners.set(id, owner);
-    await this.ctx.storage.put("own:" + id, owner);
-    return { ok: true };
-  }
-
-  /* ----- results ----- */
-
-  async storeResult(id, body) {
-    let parsed = {
-      ok: !!body.ok,
-      data: body.data ?? null,
-      error: body.error == null ? null : String(body.error).slice(0, 1000),
-      finished_at: Date.now(),
-    };
-    let record = JSON.stringify(parsed);
-    if (record.length > MAX_RESULT_BYTES) {
-      parsed = { ok: false, data: null, error: "result_too_large", finished_at: Date.now() };
-      record = JSON.stringify(parsed);
-    }
-    const entry = { record, expires: Date.now() + RESULT_TTL_MS };
-    this.results.set(id, entry);
-    // Copy before waking waiters. takeResult consumes the primary record;
-    // a repeat of the same request_id reads this copy and does not run again.
-    const idemKey = this.idemByCmd.get(id);
-    if (idemKey) {
-      const idem = this.idem.get(idemKey);
-      if (idem) {
-        idem.result = parsed;
-        await this.persistIdem(idemKey);
-        const idemWaiting = this.idemWaiters.get(idemKey);
-        if (idemWaiting) {
-          this.idemWaiters.delete(idemKey);
-          for (const wake of idemWaiting) wake();
-        }
+  async resultResponse(envelope, result, headers) {
+    if (result.inline) return jsonResponse({ ...envelope, result: result.inline }, 200, headers);
+    return this.mutate(async () => {
+      const meta = this.payloads.get(result.id);
+      if (!meta || meta.expires < Date.now() || (result.consume && !this.results.has(result.id))) return jsonResponse({ ...envelope, pending: true }, 200, headers);
+      if (this.resultStreams >= RESULT_STREAMS_MAX) throw new RelayError("too_many_result_readers", 429);
+      if (result.consume) {
+        const owner = this.owners.get(result.id), completed = owner ? { ...owner, consumed: true } : null;
+        await this.commit(completed ? { ["own:" + result.id]: completed } : {}, ["res:" + result.id]);
+        this.results.delete(result.id); if (completed) this.owners.set(result.id, completed);
       }
-    }
-    const waiting = this.waiters.get(id);
-    if (waiting) {
-      this.waiters.delete(id);
-      for (const wake of waiting) wake();
-    }
-    // Big results (screenshots) live in memory only; a waiting driver takes
-    // them immediately, so persisting them would only cost storage writes.
-    if (record.length <= RESULT_PERSIST_MAX) await this.ctx.storage.put("res:" + id, entry);
-    await this.purgeResults();
-  }
-
-  async purgeResults() {
-    const now = Date.now();
-    const dead = [];
-    for (const [id, r] of this.results) if (r.expires < now) dead.push(id);
-    for (const id of dead) this.results.delete(id);
-    if (dead.length) await this.ctx.storage.delete(dead.map((id) => "res:" + id));
-  }
-
-  async takeResult(id) {
-    const r = this.results.get(id);
-    if (!r) return null;
-    this.results.delete(id);
-    await this.ctx.storage.delete("res:" + id);
-    return r.expires < Date.now() ? null : JSON.parse(r.record);
-  }
-
-  async waitForResult(id, seconds) {
-    if (!this.results.has(id) && seconds > 0) {
-      await new Promise((resolve) => {
-        const set = this.waiters.get(id) || new Set();
-        this.waiters.set(id, set);
-        const timer = setTimeout(() => {
-          set.delete(wake);
-          if (!set.size && this.waiters.get(id) === set) this.waiters.delete(id);
-          resolve();
-        }, seconds * 1000);
-        const wake = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-        set.add(wake);
+      this.resultStreams++;
+      this.resultPins.set(result.id, (this.resultPins.get(result.id) || 0) + 1);
+      let index = -1, settled = false, timer;
+      const release = () => {
+        if (settled) return; settled = true; clearTimeout(timer); this.resultStreams--;
+        const pins = this.resultPins.get(result.id) - 1;
+        if (pins) this.resultPins.set(result.id, pins); else this.resultPins.delete(result.id);
+      };
+      const prefix = JSON.stringify(envelope).slice(0, -1) + ',"result":';
+      const stream = new ReadableStream({
+        start(controller) {
+          timer = setTimeout(() => { try { controller.error(new Error("result_stream_timeout")); } finally { release(); } }, RESULT_STREAM_TIMEOUT_MS);
+        },
+        pull: async (controller) => {
+          try {
+            if (settled) return;
+            if (index === -1) { index = 0; controller.enqueue(enc.encode(prefix)); return; }
+            if (index < meta.chunks) {
+              const chunk = await this.ctx.storage.get(`chunk:${result.id}:${index++}`, { noCache: true });
+              if (settled) return;
+              if (!(chunk instanceof Uint8Array)) throw new Error("missing durable result chunk");
+              controller.enqueue(chunk); return;
+            }
+            controller.enqueue(enc.encode("}")); controller.close(); release();
+          } catch (e) { if (!settled) controller.error(e); release(); }
+        },
+        cancel() { release(); },
       });
-    }
-    return await this.takeResult(id);
+      return new Response(stream, { status: 200, headers: { "content-type": "application/json", ...headers } });
+    });
   }
+
+  async purgeExpired() {
+    const now = Date.now(), deletes = [], writes = {};
+    const ownerIds = [...this.owners].filter(([, v]) => !this.devices.has(v.token) || v.expires <= now).map(([id]) => id);
+    const idemKeys = [...this.idem].filter(([k, v]) => !this.devices.has(k.slice(0, 64)) || v.expires <= now).map(([k]) => k);
+    const resultIds = [...this.results].filter(([id, v]) => v.expires <= now && !this.resultPins.has(id)).map(([id]) => id);
+    const payloadIds = [...this.payloads].filter(([id, v]) => (v.token && !this.devices.has(v.token)) || (v.expires <= now && !this.resultPins.has(id))).map(([id]) => id);
+    const tickets = [...this.tickets].filter(([, v]) => !this.devices.has(v.token) || v.expires <= now).map(([k]) => k);
+    const pairs = new Map([...this.pairs].filter(([, exp]) => exp > now));
+    if (pairs.size !== this.pairs.size) Object.assign(writes, this.registry(this.devices, this.order, pairs));
+    const queues = new Map();
+    for (const [token, q] of this.queues) {
+      const items = q.items.filter((c) => now - c.issued_at < QUEUE_KEEP_MS);
+      if (items.length !== q.items.length) { const next = { last: q.last, items }; queues.set(token, next); writes["queue:" + token] = next; }
+    }
+    deletes.push(...ownerIds.map((id) => "own:" + id), ...idemKeys.map((k) => "idem:" + k), ...resultIds.map((id) => "res:" + id), ...tickets.map((k) => "ticket:" + k));
+    for (const id of payloadIds) deletes.push("payload:" + id, ...this.chunkKeys(id));
+    if (deletes.length || Object.keys(writes).length) await this.commit(writes, deletes);
+    this.pairs = pairs;
+    for (const [token, q] of queues) this.queues.set(token, q);
+    for (const id of ownerIds) { this.owners.delete(id); this.wake(this.waiters, id); }
+    for (const k of idemKeys) { const e = this.idem.get(k); this.idem.delete(k); if (e) this.idemByCmd.delete(e.cmd.id); this.wake(this.idemWaiters, k); }
+    for (const id of resultIds) { this.results.delete(id); this.wake(this.waiters, id); }
+    for (const id of payloadIds) this.payloads.delete(id);
+    for (const k of tickets) this.tickets.delete(k);
+    const expiring = this.owners.size || this.idem.size || this.results.size || this.payloads.size || this.tickets.size || this.pairs.size || [...this.queues.values()].some((q) => q.items.length);
+    if (expiring) await this.ctx.storage.setAlarm(now + CLEANUP_MS);
+    else await this.ctx.storage.deleteAlarm();
+  }
+
+  async alarm() { await this.mutate(() => this.purgeExpired()); }
 
   /* ----- sockets ----- */
 
   socketsFor(token) {
     return this.ctx.getWebSockets().filter((ws) => {
       const a = ws.deserializeAttachment();
-      return a && a.token === token;
+      return a && a.token === token && (ws.readyState === undefined ? !ws.closed : ws.readyState === 1);
     });
   }
 
@@ -614,6 +739,7 @@ export class BridgeHub {
     if (!cmds.length) return;
     const now = Date.now();
     for (const ws of this.socketsFor(token)) {
+      if (!this.devices.has(token) || ws.deserializeAttachment().hello === false) continue;
       for (const cmd of cmds) {
         try {
           ws.send(JSON.stringify({ type: "cmd", cmd, now }));
@@ -625,19 +751,25 @@ export class BridgeHub {
   }
 
   async webSocketMessage(ws, message) {
-    if (typeof message !== "string") return;
+    if (typeof message !== "string" || message.length > WS_MESSAGE_MAX || enc.encode(message).byteLength > WS_MESSAGE_MAX) {
+      try { ws.close(1009, "message_too_large"); } catch { /* closing */ }
+      return;
+    }
     let msg;
     try {
       msg = JSON.parse(message);
     } catch {
       return;
     }
-    if (!msg || typeof msg !== "object") return;
+    message = null;
+    if (!msg || typeof msg !== "object" || Array.isArray(msg)) return;
     const att = ws.deserializeAttachment() || {};
-
-    if (!att.token) {
-      const token = msg.type === "hello" && typeof msg.token === "string" ? msg.token : null;
-      if (!token || !TOKEN_RE.test(token) || !this.devices.has(token)) {
+    if (!att.token || !this.devices.has(att.token)) {
+      try { ws.close(4003, "unknown_device"); } catch { /* closing */ }
+      return;
+    }
+    if (att.hello === false) {
+      if (msg.type !== "hello" || (msg.token !== undefined && msg.token !== att.token) || Date.now() - att.since > HELLO_TIMEOUT_MS) {
         try {
           ws.send(JSON.stringify({ type: "error", error: "unknown_device" }));
           ws.close(4003, "unknown_device");
@@ -646,25 +778,25 @@ export class BridgeHub {
         }
         return;
       }
-      // One live socket per device: a reconnect replaces the old one.
-      for (const other of this.socketsFor(token)) {
-        try {
-          other.close(4000, "replaced");
-        } catch {
-          /* already closed */
-        }
-      }
-      ws.serializeAttachment({ token, since: Date.now() });
-      if (typeof msg.after === "number") await this.ack(token, msg.after);
+      ws.serializeAttachment({ ...att, hello: true });
+      const after = msg.after; msg = null;
+      if (typeof after === "number") await this.ack(att.token, after);
       ws.send(JSON.stringify({ type: "welcome", now: Date.now(), capabilities: CAPABILITIES }));
-      this.push(token, this.pending(token));
+      this.push(att.token, this.pending(att.token));
       return;
     }
 
     if (msg.type === "ack" && typeof msg.seq === "number") {
-      await this.ack(att.token, msg.seq);
+      const seq = msg.seq; msg = null;
+      await this.ack(att.token, seq);
     } else if (msg.type === "result" && typeof msg.id === "string" && CMD_ID_RE.test(msg.id)) {
-      const verdict = await this.acceptResult(att.token, msg.id, msg);
+      // HTTP and socket result commits share one large-payload admission slot.
+      // Close rather than issuing a final rejection: the client can use HTTP.
+      if (this.resultBodyReaders >= 1) { try { ws.close(1013, "result_busy"); } catch { /* closing */ } return; }
+      this.resultBodyReaders++;
+      let verdict;
+      try { verdict = await this.acceptResult(att.token, msg.id, msg); }
+      finally { this.resultBodyReaders--; }
       try {
         ws.send(JSON.stringify(verdict.ok
           ? { type: "result_ack", id: msg.id }
@@ -691,15 +823,30 @@ export class BridgeHub {
 
   async fetch(req) {
     const path = new URL(req.url).pathname;
+    const origin = req.headers.get("origin");
+    const resultBody = path === "/result" && req.method === "POST";
+    const ordinaryPost = req.method === "POST" && !resultBody;
+    if (resultBody && this.resultBodyReaders >= 1) return jsonResponse({ error: "too_many_body_readers" }, 429, corsHeaders(path, req.headers.get("origin")));
+    if (ordinaryPost && this.postRequests >= BODY_READERS_MAX) return jsonResponse({ error: "too_many_body_readers" }, 429, corsHeaders(path, req.headers.get("origin")));
+    if (resultBody) this.resultBodyReaders++;
+    if (ordinaryPost) this.postRequests++;
+    let admittedPost = ordinaryPost;
+    const releasePost = () => { if (admittedPost) { admittedPost = false; this.postRequests--; } };
     try {
-      return await this.handle(req);
+      const work = this.handle(req, releasePost);
+      req = null;
+      return await work;
     } catch (e) {
-      console.error("juno-bridge hub:", path, e && e.stack ? e.stack : e);
-      return jsonResponse({ error: "server_error" }, 500, corsHeaders(path, req.headers.get("origin")));
+      if (e instanceof RelayError) return jsonResponse({ error: e.message }, e.status, corsHeaders(path, origin));
+      console.error("juno-bridge hub: request failed");
+      return jsonResponse({ error: "server_error" }, 500, corsHeaders(path, origin));
+    } finally {
+      if (resultBody) this.resultBodyReaders--;
+      releasePost();
     }
   }
 
-  async handle(req) {
+  async handle(req, releasePost = () => {}) {
     const url = new URL(req.url);
     const path = url.pathname;
     const origin = req.headers.get("origin");
@@ -718,43 +865,54 @@ export class BridgeHub {
       }
       // Browsers always send Origin on WebSockets; only extensions may connect.
       if (origin && !origin.startsWith("chrome-extension://")) return json({ error: "forbidden_origin" }, 403);
-      if (this.ctx.getWebSockets().length >= MAX_SOCKETS) return json({ error: "too_many_sockets" }, 503);
-      const [client, server] = Object.values(new globalThis.WebSocketPair());
-      this.ctx.acceptWebSocket(server);
-      server.serializeAttachment({ token: null });
-      // The first message must be a valid hello; drop sockets that never send one.
-      const helloTimer = setTimeout(() => {
-        try {
-          const a = server.deserializeAttachment();
-          if (!a || !a.token) server.close(4001, "hello_timeout");
-        } catch {
-          /* already closed */
-        }
-      }, HELLO_TIMEOUT_MS);
-      if (helloTimer && typeof helloTimer.unref === "function") helloTimer.unref();
-      return new Response(null, { status: 101, webSocket: client });
+      const protocols = (req.headers.get("sec-websocket-protocol") || "").split(",").map((v) => v.trim());
+      const offered = protocols.filter((v) => /^juno-ticket\.[0-9a-f]{64}$/.test(v));
+      if (url.search || !protocols.includes("juno-bridge-v1") || offered.length !== 1) return json({ error: "bad_or_expired_ticket" }, 403);
+      return this.mutate(async () => {
+        await this.purgeExpired();
+        const key = offered[0].slice("juno-ticket.".length), ticket = this.tickets.get(key);
+        if (!ticket || ticket.expires <= Date.now() || !this.devices.has(ticket.token) || (ticket.origin && ticket.origin !== origin)) return json({ error: "bad_or_expired_ticket" }, 403);
+        const own = this.socketsFor(ticket.token);
+        const active = this.ctx.getWebSockets().filter((ws) => {
+          const a = ws.deserializeAttachment();
+          return a?.token && this.devices.has(a.token) && (ws.readyState === undefined ? !ws.closed : ws.readyState === 1);
+        });
+        if (active.length - own.length >= MAX_SOCKETS) return json({ error: "too_many_sockets" }, 503);
+        // Single use is durable BEFORE WebSocketPair construction or acceptance.
+        await this.commit({}, ["ticket:" + key]); this.tickets.delete(key);
+        for (const other of own) try { other.close(4000, "replaced"); } catch { /* closing */ }
+        const [client, server] = Object.values(new globalThis.WebSocketPair());
+        this.ctx.acceptWebSocket(server);
+        server.serializeAttachment({ token: ticket.token, since: Date.now(), hello: false });
+        const timer = setTimeout(() => {
+          try { if (server.deserializeAttachment()?.hello === false) server.close(4001, "hello_timeout"); } catch { /* closing */ }
+        }, HELLO_TIMEOUT_MS);
+        if (timer && typeof timer.unref === "function") timer.unref();
+        return new Response(null, { status: 101, webSocket: client, headers: { "sec-websocket-protocol": "juno-bridge-v1" } });
+      });
     }
 
-    // An empty POST body (e.g. `curl -X POST .../admin/pair`) means {}.
-    let body = {};
-    if (req.method === "POST") {
-      try {
-        const text = await req.text();
-        body = text.trim() ? JSON.parse(text) : {};
-      } catch {
-        return json({ error: "bad_json" }, 400);
-      }
-      if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "bad_json" }, 400);
-    }
-
+    let authenticated = false;
     const requireAdmin = async () => {
+      if (authenticated) return null;
       const tok = bearer(req);
       if (!tok) return json({ error: "missing_auth" }, 401);
       const stored = this.adminHashValue();
       if (!stored) return json({ error: "admin_not_configured" }, 503);
       if (!ctEqual(await sha256hex(tok), stored)) return json({ error: "bad_auth" }, 403);
+      authenticated = true;
       return null;
     };
+    // Authenticate headers before allocating readers or parsing admin JSON.
+    if (path.startsWith("/admin/")) { const denied = await requireAdmin(); if (denied) return denied; }
+    if (DEVICE_PATHS.has(path) && origin && !origin.startsWith("chrome-extension://")) return json({ error: "forbidden_origin" }, 403);
+    let body = {};
+    if (req.method === "POST") {
+      if (this.bodyReaders >= BODY_READERS_MAX) return json({ error: "too_many_body_readers" }, 429);
+      this.bodyReaders++;
+      try { body = await readJsonBody(req, path === "/result" ? RESULT_BODY_MAX : BODY_MAX); }
+      finally { this.bodyReaders--; }
+    }
 
     // Token accepted ONLY from the POST body — never from the query string.
     const requireDevice = () => {
@@ -764,16 +922,34 @@ export class BridgeHub {
       return { token: tok };
     };
 
+    if (path === "/ws-ticket" && req.method === "POST") {
+      const d = requireDevice(); if (d.err) return d.err;
+      return this.mutate(async () => {
+        await this.purgeExpired();
+        if (!this.devices.has(d.token)) return json({ error: "unknown_device" }, 403);
+        const prior = [...this.tickets].filter(([, t]) => t.token === d.token).map(([k]) => k);
+        if (this.tickets.size - prior.length >= TICKET_MAX) return json({ error: "too_many_tickets" }, 429);
+        const ticket = randHex(32), entry = { token: d.token, origin: origin || null, expires: Date.now() + TICKET_TTL_MS };
+        await this.commit({ ["ticket:" + ticket]: entry }, prior.map((k) => "ticket:" + k));
+        for (const k of prior) this.tickets.delete(k);
+        this.tickets.set(ticket, entry);
+        return json({ ticket, expires_in: TICKET_TTL_MS / 1000 });
+      });
+    }
+
     // ---- admin: create a short-lived pairing code ----
     if (path === "/admin/pair" && req.method === "POST") {
       const err = await requireAdmin();
       if (err) return err;
-      const now = Date.now();
-      for (const [c, exp] of this.pairs) if (exp < now) this.pairs.delete(c);
-      const code = pairCode();
-      this.pairs.set(code, now + PAIR_TTL_MS);
-      await this.saveRegistry();
-      return json({ code, expires_in: PAIR_TTL_MS / 1000 });
+      return this.mutate(async () => {
+        await this.purgeExpired();
+        if (this.pairs.size >= PAIR_MAX) return json({ error: "too_many_pairs" }, 429);
+        let code; do { code = pairCode(); } while (this.pairs.has(code));
+        const pairs = new Map(this.pairs); pairs.set(code, Date.now() + PAIR_TTL_MS);
+        await this.commit(this.registry(this.devices, this.order, pairs));
+        this.pairs = pairs;
+        return json({ code, expires_in: PAIR_TTL_MS / 1000 });
+      });
     }
 
     // ---- admin: enqueue a command (and optionally wait for its result) ----
@@ -793,14 +969,18 @@ export class BridgeHub {
       const device = dev.token.slice(0, 8) + "…";
       if (queued.duplicate) {
         if (!isRun) return json({ ok: true, id: cmd.id, device, duplicate: true });
-        const result = await this.waitForIdem(queued.idemKey, waitSeconds(body.wait, RUN_WAIT_DEFAULT_S));
-        return json(result
-          ? { ok: true, id: cmd.id, device, duplicate: true, pending: false, result }
-          : { ok: true, id: cmd.id, device, duplicate: true, pending: true });
+        const wait = waitSeconds(body.wait, RUN_WAIT_DEFAULT_S);
+        body = null; req = null; releasePost();
+        const result = await this.waitForIdem(queued.idemKey, wait);
+        return result
+          ? this.resultResponse({ ok: true, id: cmd.id, device, duplicate: true, pending: false }, result, cors)
+          : json({ ok: true, id: cmd.id, device, duplicate: true, pending: true });
       }
       if (!isRun) return json({ ok: true, id: cmd.id, device });
-      const result = await this.waitForResult(cmd.id, waitSeconds(body.wait, RUN_WAIT_DEFAULT_S));
-      return json(result ? { ok: true, id: cmd.id, device, pending: false, result } : { ok: true, id: cmd.id, device, pending: true });
+      const wait = waitSeconds(body.wait, RUN_WAIT_DEFAULT_S);
+      body = null; req = null; releasePost();
+      const result = await this.waitForResult(cmd.id, wait);
+      return result ? this.resultResponse({ ok: true, id: cmd.id, device, pending: false }, result, cors) : json({ ok: true, id: cmd.id, device, pending: true });
     }
 
     // ---- admin: fetch (and consume) a command result, waiting briefly ----
@@ -810,8 +990,9 @@ export class BridgeHub {
       const id = url.searchParams.get("id");
       if (!id) return json({ error: "missing_id" }, 400);
       if (!CMD_ID_RE.test(id)) return json({ error: "bad_id" }, 400);
+      if (!this.owners.has(id) && !this.results.has(id)) return json({ error: "unknown_command" }, 404);
       const res = await this.waitForResult(id, waitSeconds(url.searchParams.get("wait"), RESULT_WAIT_DEFAULT_S));
-      return json(res ? { pending: false, result: res } : { pending: true });
+      return res ? this.resultResponse({ pending: false }, res, cors) : json({ pending: true });
     }
 
     // ---- admin: connectivity check ----
@@ -855,16 +1036,19 @@ export class BridgeHub {
       if (body.code === undefined || body.code === null || body.code === "") {
         return json({ error: "missing_code" }, 400);
       }
-      const code = normalizePairCode(body.code);
-      const exp = PAIR_RE.test(code) ? this.pairs.get(code) : undefined;
-      if (!exp || exp < Date.now()) return json({ error: "bad_or_expired_code" }, 403);
-      this.pairs.delete(code);
-      const token = randHex(32);
-      const name = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, NAME_MAX) : "chrome";
-      this.devices.set(token, { name, created: Date.now() });
-      this.order.push(token);
-      await this.saveRegistry();
-      return json({ ok: true, device_token: token });
+      return this.mutate(async () => {
+        await this.purgeExpired();
+        const code = normalizePairCode(body.code), exp = PAIR_RE.test(code) ? this.pairs.get(code) : undefined;
+        if (!exp || exp <= Date.now()) return json({ error: "bad_or_expired_code" }, 403);
+        if (this.devices.size >= DEVICE_MAX) return json({ error: "too_many_devices" }, 429);
+        const pairs = new Map(this.pairs); pairs.delete(code);
+        const token = randHex(32), devices = new Map(this.devices), order = [...this.order, token];
+        const name = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, NAME_MAX) : "chrome";
+        devices.set(token, { name, created: Date.now() });
+        await this.commit(this.registry(devices, order, pairs));
+        this.pairs = pairs; this.devices = devices; this.order = order;
+        return json({ ok: true, device_token: token });
+      });
     }
 
     // ---- device: unregister itself (revokes the token) ----
@@ -887,10 +1071,8 @@ export class BridgeHub {
         return json({ cmd, now: Date.now() });
       }
       // Legacy destructive dequeue for extensions that don't send `after`.
-      const items = this.pending(d.token);
-      if (!items.length) return new Response(null, { status: 204, headers: cors });
-      const cmd = items.shift();
-      await this.saveQueue(d.token, { last: this.queues.get(d.token).last, items });
+      const cmd = await this.legacyPoll(d.token);
+      if (!cmd) return new Response(null, { status: 204, headers: cors });
       return json({ cmd, now: Date.now() });
     }
 

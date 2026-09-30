@@ -34,8 +34,9 @@ class MockWebSocket {
   static CLOSED = 3;
   static latest = null;
 
-  constructor(url) {
+  constructor(url, protocols) {
     this.url = url;
+    this.protocols = protocols;
     this.readyState = MockWebSocket.CONNECTING;
     this.sent = [];
     this.onopen = null;
@@ -396,7 +397,11 @@ function boot(options = {}) {
           return { result: { value: (tab && (tab.href || tab.url)) || "" } };
         }
         if (method === "Page.getFrameTree") {
-          return { frameTree: { frame: { id: "frame-1" } } };
+          const tab = tabs.get(target.tabId);
+          const url = new URL((tab && (tab.href || tab.url)) || "https://example.com/page");
+          url.hash = "";
+          return { frameTree: { frame: { id: "frame-1", url: url.href,
+            loaderId: "loader-" + ((tab && tab.timeOrigin) || 1000) } } };
         }
         if (method === "Page.createIsolatedWorld") {
           return { executionContextId: 4 };
@@ -433,6 +438,8 @@ function boot(options = {}) {
     chrome,
     console,
     URL,
+    AbortController,
+    TextEncoder,
     setTimeout,
     clearTimeout,
     setInterval,
@@ -450,7 +457,10 @@ function boot(options = {}) {
     if (opts && opts.body) body = JSON.parse(opts.body);
     fetches.push({ url: String(url), body });
     if (fetchControl.fn) return fetchControl.fn(String(url), body, opts);
-    return { ok: true, status: 200, json: async () => ({}) };
+    if (String(url).endsWith("/ws-ticket")) {
+      return { ok: true, status: 200, json: async () => ({ ticket: "cd".repeat(32), expires_in: 30 }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
   };
   vm.createContext(sandbox);
   sandbox.JUNO_TEST = true;
@@ -463,7 +473,11 @@ function boot(options = {}) {
   sandbox.chrome = chrome;
   sandbox.importScripts = () => {};
   sandbox.fetch = sandbox.fetch;
-  vm.runInContext(prefixed, sandbox, { filename: "extension/background.js" });
+  let testSource = prefixed;
+  for (const [name, value] of Object.entries({ ...options.timeouts, ...options.constants })) {
+    testSource = testSource.replace(new RegExp(`const ${name} = [^;]+;`), `const ${name} = ${value};`);
+  }
+  vm.runInContext(testSource, sandbox, { filename: "extension/background.js" });
   sandbox.WebSocket = MockWebSocket;
 
   const juno = sandbox.__juno || (sandbox.globalThis && sandbox.globalThis.__juno);
@@ -610,7 +624,10 @@ function bootPage(extra = {}) {
     async sendCommand(info) {
       const { method, params } = info;
       if (method === "Page.getFrameTree") {
-        return { frameTree: { frame: { id: "frame-1" } } };
+        const url = new URL(page.realm.location.href);
+        url.hash = "";
+        return { frameTree: { frame: { id: "frame-1", url: url.href,
+          loaderId: "loader-" + page.realm.performance.timeOrigin } } };
       }
       if (method === "Page.createIsolatedWorld") {
         page.worlds.push(params);
@@ -628,7 +645,7 @@ function bootPage(extra = {}) {
       if (method === "Runtime.evaluate" && params && params.expression === "location.href") {
         return undefined;
       }
-      if (method === "Runtime.evaluate" && params && String(params.expression).includes("performance.timeOrigin")) {
+      if (method === "Runtime.evaluate" && params && String(params.expression).includes("let hold = globalThis.__junoHold")) {
         page.docReads += 1;
         if (extra.flipOnDocRead && page.docReads === extra.flipOnDocRead) {
           page.realm.performance.timeOrigin += 5000;
@@ -1033,18 +1050,19 @@ describe("extension", { concurrency: 1 }, () => {
       () => env.juno.HANDLERS.eval({ tabId: 7, js: "document.body.innerText" }, state, { target: "" }, epoch),
       /eval: disabled/,
     );
+    await env.chrome.storage.local.set({ allowEval: true });
     state.allowEval = true;
     const result = await env.juno.HANDLERS.eval(
       { tabId: 7, js: "document.body.innerText" },
       state,
       { target: "" },
-      epoch,
+      env.juno.epoch(),
     );
     assert.equal(result.value, "pw-SECRET-alpha");
     assert.equal(result.redaction, undefined);
   });
 
-  test("a socket send waits for result_ack and falls back only on timeout", async () => {
+  test("a socket send waits for a matching receipt, falls back on timeout, and treats rejection as final", async () => {
     const env = boot();
     env.juno.setResultAckMs(40);
     const id = command().id;
@@ -1058,7 +1076,7 @@ describe("extension", { concurrency: 1 }, () => {
       },
       close() {},
     };
-    env.juno.attachSocket(ws);
+    env.juno.attachSocket(ws, env.store.deviceToken);
     await env.juno.sendResult(env.store.deviceToken, id, { ok: true, data: { n: 1 } });
     assert.equal(env.fetches.some((item) => item.url.endsWith("/result")), false);
     assert.equal(ws.sent.length, 1);
@@ -1072,7 +1090,7 @@ describe("extension", { concurrency: 1 }, () => {
       },
       close() {},
     };
-    env.juno.attachSocket(slow);
+    env.juno.attachSocket(slow, env.store.deviceToken);
     const slowId = command().id;
     const pending = env.juno.sendResult(env.store.deviceToken, slowId, { ok: false, error: "nope" });
     await Promise.resolve();
@@ -1096,9 +1114,9 @@ describe("extension", { concurrency: 1 }, () => {
       },
       close() {},
     };
-    env.juno.attachSocket(rejecting);
+    env.juno.attachSocket(rejecting, env.store.deviceToken);
     const before = env.fetches.length;
-    await env.juno.sendResult(env.store.deviceToken, command().id, { ok: true, data: { n: 2 } });
+    assert.equal(await env.juno.sendResult(env.store.deviceToken, command().id, { ok: true, data: { n: 2 } }), false);
     assert.equal(env.fetches.length, before);
   });
 
@@ -1141,6 +1159,7 @@ describe("extension", { concurrency: 1 }, () => {
     };
     const before = MockWebSocket.latest;
     const pending = env.juno.runSocket(env.store.deviceToken, 5);
+    await until(() => MockWebSocket.latest !== before);
     const ws = MockWebSocket.latest;
     assert.notEqual(ws, before);
     try {
@@ -1149,7 +1168,9 @@ describe("extension", { concurrency: 1 }, () => {
       const hello = JSON.parse(ws.sent[0]);
       assert.equal(hello.type, "hello");
       assert.equal(hello.after, 5);
-      assert.equal(hello.token, env.store.deviceToken);
+      assert.equal(hello.token, undefined);
+      assert.equal(ws.protocols[0], "juno-bridge-v1");
+      assert.equal(ws.protocols[1], "juno-ticket." + "cd".repeat(32));
       assert.equal(hello.version, "1.3.0");
       const now = env.now();
       const old = command({ seq: 5, issued_at: now });
@@ -2395,5 +2416,396 @@ describe("extension", { concurrency: 1 }, () => {
     assert.match(body.error, /snapshot required/);
     assert.equal(body.data, null);
     assert.equal(methodCalls(env, "attach").length, 0);
+  });
+});
+
+
+describe("extension audit regressions", { concurrency: 1 }, () => {
+  for (const mode of ["command", "empty", "rejected", "network error"]) {
+    test(`a delayed old-device poll ${mode} cannot change the new pairing`, async () => {
+      const env = boot();
+      const oldToken = env.store.deviceToken;
+      const cmd = command({ seq: 91, issued_at: env.now() });
+      let reply;
+      env.fetchControl.fn = (url) => {
+        if (url.endsWith("/poll")) return new Promise((resolve, reject) => { reply = { resolve, reject }; });
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      };
+      let ran = false;
+      env.juno.HANDLERS.ping = () => { ran = true; return {}; };
+      const pending = env.juno.pollOnce();
+      await until(() => !!reply);
+      await env.chrome.storage.local.set({ deviceToken: "ef".repeat(32), cursor: 3,
+        relayStatus: { state: "new pairing" } });
+      if (mode === "network error") reply.reject(new Error("old request failed"));
+      else reply.resolve({ ok: mode !== "rejected", status: mode === "empty" ? 204 : mode === "rejected" ? 403 : 200,
+        json: async () => ({ cmd, now: env.now() }) });
+      assert.equal(await pending, false);
+      assert.equal(ran, false);
+      assert.equal(env.store.cursor, 3);
+      assert.equal(env.store.relayStatus.state, "new pairing");
+      assert.equal(env.fetches.filter((entry) => entry.url.endsWith("/result")).length, 0);
+      assert.equal(env.fetches[0].body.token, oldToken);
+    });
+  }
+
+  for (const setting of ["enabled", "allowlist", "allowEval", "delayed permission notification"]) {
+    test(`a policy epoch change during poll JSON drops ${setting} work`, async () => {
+      const env = boot();
+      const cmd = command({ seq: 99, issued_at: env.now() });
+      let release;
+      env.fetchControl.fn = () => ({ ok: true, status: 200,
+        json: () => new Promise((resolve) => { release = () => resolve({ cmd, now: env.now() }); }) });
+      const pending = env.juno.pollOnce();
+      await until(() => !!release);
+      if (setting === "enabled") {
+        await env.chrome.storage.local.set({ enabled: false });
+        await env.chrome.storage.local.set({ enabled: true });
+      } else if (setting === "delayed permission notification") env.store.allowlist = [];
+      else await env.chrome.storage.local.set({ [setting]: setting === "allowlist" ? [] : true });
+      release();
+      assert.equal(await pending, false);
+      assert.equal(env.store.cursor, 0);
+      assert.equal(env.store.relayStatus, undefined);
+    });
+  }
+
+  test("allowlist changes invalidate queued and active commands", async () => {
+    const env = boot();
+    let release;
+    let count = 0;
+    env.juno.HANDLERS.ping = () => {
+      count++;
+      if (count === 1) return new Promise((resolve) => { release = resolve; });
+      return {};
+    };
+    const first = command({ issued_at: env.now() });
+    const second = command({ issued_at: env.now() });
+    const running = env.juno.schedule(first, env.now());
+    const queued = env.juno.schedule(second, env.now());
+    await until(() => !!release);
+    await env.chrome.storage.local.set({ allowlist: [] });
+    release({});
+    await Promise.all([running, queued]);
+    assert.equal(count, 1);
+    assert.equal(resultFor(env, first.id).ok, false);
+    assert.equal(resultFor(env, second.id), undefined);
+    assert.equal(env.store.cursor, first.seq);
+  });
+
+  for (const mode of ["allowlist", "eval permission", "notification delayed"]) {
+    test(`permission change during mouseMoved (${mode}) prevents further input`, async () => {
+      const env = boot({
+        async sendCommand({ method, params, chrome, store }) {
+          if (method === "Input.dispatchMouseEvent" && params.type === "mouseMoved") {
+            if (mode === "notification delayed") store.allowlist = [];
+            else await chrome.storage.local.set(mode === "allowlist" ? { allowlist: [] } : { allowEval: false });
+          }
+        },
+      });
+      if (mode === "eval permission") await env.chrome.storage.local.set({ allowEval: true });
+      env.addTab(7, "https://example.com/page");
+      const cmd = command({ action: "click", issued_at: env.now(), params: { tabId: 7, x: 1, y: 2 } });
+      await env.juno.schedule(cmd, env.now());
+      assert.deepEqual(mouseTypes(env), ["mouseMoved"]);
+      assert.equal(resultFor(env, cmd.id).ok, false);
+      assert.match(resultFor(env, cmd.id).error, /cancelled/);
+    });
+  }
+
+  for (const drift of ["url", "pending navigation", "same-url reload", "permission"]) {
+    test(`screenshot output is discarded on ${drift} during capture`, async () => {
+      const env = boot({
+        async sendCommand({ method, tabs, store }) {
+          if (method !== "Page.captureScreenshot") return;
+          const tab = tabs.get(7);
+          if (drift === "url") tab.url = "https://private.invalid/secret";
+          if (drift === "pending navigation") tab.pendingUrl = "https://private.invalid/secret";
+          if (drift === "same-url reload") tab.timeOrigin = 5000;
+          if (drift === "permission") store.allowlist = [];
+          return { data: "PRIVATE-PIXELS" };
+        },
+      });
+      env.addTab(7, "https://example.com/page");
+      const cmd = command({ action: "screenshot", issued_at: env.now(), params: { tabId: 7 } });
+      await env.juno.schedule(cmd, env.now());
+      const result = resultFor(env, cmd.id);
+      assert.equal(result.ok, false);
+      assert.equal(result.data, null);
+      assert.equal(JSON.stringify(result).includes("PRIVATE-PIXELS"), false);
+      assert.equal(JSON.stringify(result).includes("private.invalid"), false);
+    });
+  }
+
+  test("text output is discarded after a same-URL reload during evaluation", async () => {
+    const env = boot({
+      async sendCommand({ method, params, tabs }) {
+        if (method === "Runtime.evaluate" && params.expression.includes("document.body ? document.body.innerText")) {
+          tabs.get(7).timeOrigin = 5000;
+          return { result: { value: { url: "https://example.com/page", text: "PRIVATE-TEXT" } } };
+        }
+      },
+    });
+    env.addTab(7, "https://example.com/page");
+    const cmd = command({ action: "text", issued_at: env.now(), params: { tabId: 7 } });
+    await env.juno.schedule(cmd, env.now());
+    const result = resultFor(env, cmd.id);
+    assert.equal(result.ok, false);
+    assert.equal(JSON.stringify(result).includes("PRIVATE-TEXT"), false);
+  });
+
+  test("disabling eval while its response is pending discards the value", async () => {
+    let release;
+    const env = boot({
+      async sendCommand({ method, params }) {
+        if (method === "Runtime.evaluate" && params.expression === "secretValue") {
+          return await new Promise((resolve) => { release = () => resolve({ result: { value: "PRIVATE-EVAL" } }); });
+        }
+      },
+    });
+    await env.chrome.storage.local.set({ allowEval: true });
+    env.addTab(7, "https://example.com/page");
+    const cmd = command({ action: "eval", issued_at: env.now(), params: { tabId: 7, js: "secretValue" } });
+    const pending = env.juno.schedule(cmd, env.now());
+    await until(() => !!release);
+    await env.chrome.storage.local.set({ allowEval: false });
+    release();
+    await pending;
+    const result = resultFor(env, cmd.id);
+    assert.equal(result.ok, false);
+    assert.equal(JSON.stringify(result).includes("PRIVATE-EVAL"), false);
+  });
+
+  for (const stalled of ["fetch", "JSON body"]) {
+    test(`a stalled poll ${stalled} aborts on the whole-request deadline`, async () => {
+      const env = boot({ timeouts: { POLL_TIMEOUT_MS: 25 } });
+      let signal;
+      env.fetchControl.fn = (_url, _body, opts) => {
+        signal = opts.signal;
+        if (stalled === "fetch") return new Promise(() => {});
+        return { ok: true, status: 200, json: () => new Promise(() => {}) };
+      };
+      await assert.rejects(() => env.juno.pollOnce(), /timed out/);
+      assert.equal(signal.aborted, true);
+      assert.equal(env.store.cursor, 0);
+      assert.equal(env.store.relayStatus.state, "unreachable");
+    });
+
+    test(`a stalled result ${stalled} aborts, logs delivery failure, and releases the queue`, async () => {
+      const env = boot({ timeouts: { RESULT_TIMEOUT_MS: 25, RESULT_RETRY_MS: 1 } });
+      const signals = [];
+      let firstId;
+      env.fetchControl.fn = (url, body, opts) => {
+        assert.ok(url.endsWith("/result"));
+        if (body.id !== firstId) return { ok: true, status: 200, json: async () => ({ ok: true }) };
+        signals.push(opts.signal);
+        if (stalled === "fetch") return new Promise(() => {});
+        return { ok: true, status: 200, json: () => new Promise(() => {}) };
+      };
+      const first = command({ issued_at: env.now() });
+      firstId = first.id;
+      const second = command({ issued_at: env.now() });
+      let runs = 0;
+      env.juno.HANDLERS.ping = () => { runs++; return {}; };
+      await Promise.all([env.juno.schedule(first, env.now()), env.juno.schedule(second, env.now())]);
+      assert.equal(runs, 2);
+      assert.equal(signals.length, 2);
+      assert.ok(signals.every((signal) => signal.aborted));
+      assert.equal(env.store.log[0].ok, true);
+      assert.equal(env.store.log[0].resultDelivered, false);
+      assert.match(env.store.log[0].deliveryError, /will not be retried/);
+      assert.equal(env.store.log[1].resultDelivered, true);
+    });
+  }
+
+  test("HTTP delivery retries 429 but refuses a terminal ownership error", async () => {
+    const env = boot({ timeouts: { RESULT_RETRY_MS: 1 } });
+    let posts = 0;
+    env.fetchControl.fn = () => ({ ok: ++posts > 1, status: posts === 1 ? 429 : 200,
+      json: async () => ({ ok: true }) });
+    assert.equal(await env.juno.sendResult(env.store.deviceToken, command().id, { ok: true }), true);
+    assert.equal(posts, 2);
+    env.fetchControl.fn = () => { posts++; return { ok: false, status: 403 }; };
+    assert.equal(await env.juno.sendResult(env.store.deviceToken, command().id, { ok: true }), false);
+    assert.equal(posts, 3);
+  });
+
+  test("old-pairing results use the original token over HTTP and never the new socket", async () => {
+    const env = boot();
+    const oldToken = env.store.deviceToken;
+    await env.chrome.storage.local.set({ deviceToken: "ef".repeat(32) });
+    const ws = { readyState: 1, sent: [], send(data) { this.sent.push(data); }, close() {} };
+    env.juno.attachSocket(ws, env.store.deviceToken);
+    const id = command().id;
+    await env.juno.sendResult(oldToken, id, { ok: true, data: {} });
+    assert.equal(ws.sent.length, 0);
+    assert.equal(resultFor(env, id).token, oldToken);
+  });
+
+  for (const receipt of ["result_ack", "result_rejected"]) {
+    test(`a ${receipt} from a different socket cannot settle the originating result`, async () => {
+      const env = boot();
+      env.juno.setResultAckMs(30);
+      const old = { readyState: 1, send() {}, close() {} };
+      const newer = { readyState: 1, send() {}, close() {} };
+      env.juno.attachSocket(old, env.store.deviceToken);
+      const id = command().id;
+      const pending = env.juno.sendResult(env.store.deviceToken, id, { ok: true }, old);
+      env.juno.attachSocket(newer, env.store.deviceToken);
+      env.juno.handleSocketMessage({ type: receipt, id }, newer, env.store.deviceToken);
+      await pending;
+      assert.ok(resultFor(env, id));
+    });
+  }
+
+  test("the originating socket can acknowledge after a newer same-device socket appears", async () => {
+    const env = boot();
+    env.juno.setResultAckMs(100);
+    const old = { readyState: 1, send() {}, close() {} };
+    const newer = { readyState: 1, send() {}, close() {} };
+    env.juno.attachSocket(old, env.store.deviceToken);
+    const id = command().id;
+    const pending = env.juno.sendResult(env.store.deviceToken, id, { ok: true }, old);
+    env.juno.attachSocket(newer, env.store.deviceToken);
+    env.juno.handleSocketMessage({ type: "result_ack", id }, old, env.store.deviceToken);
+    assert.equal(await pending, true);
+    assert.equal(resultFor(env, id), undefined);
+  });
+
+  test("socket and HTTP caps count encoded UTF-8 bytes", async () => {
+    const env = boot({ constants: { MAX_RESULT_BYTES: 1400, WS_MAX_MSG: 1000 } });
+    const ws = { readyState: 1, sent: [], send(data) { this.sent.push(data); }, close() {} };
+    env.juno.attachSocket(ws, env.store.deviceToken);
+    const socketId = command().id;
+    const outcome = { ok: true, data: "é".repeat(550) };
+    assert.ok(JSON.stringify(outcome).length < 1000);
+    await env.juno.sendResult(env.store.deviceToken, socketId, outcome);
+    assert.equal(ws.sent.length, 0);
+    assert.equal(resultFor(env, socketId).data, outcome.data);
+    const httpId = command().id;
+    await env.juno.sendResult(env.store.deviceToken, httpId, { ok: true, data: "é".repeat(800) });
+    assert.equal(resultFor(env, httpId).ok, false);
+    assert.equal(resultFor(env, httpId).error, "result too large to relay");
+  });
+
+  test("the full HTTP envelope has an eight-MiB byte cap with a bounded error at the boundary", async () => {
+    const env = boot();
+    const id = command().id;
+    const limit = 8 * 1024 * 1024;
+    const envelope = { token: env.store.deviceToken, id, ok: true, data: "", error: null };
+    const overhead = new TextEncoder().encode(JSON.stringify(envelope)).byteLength;
+    const fitting = "x".repeat(limit - overhead);
+    await env.juno.sendResult(env.store.deviceToken, id, { ok: true, data: fitting });
+    const accepted = resultFor(env, id);
+    assert.equal(accepted.ok, true);
+    assert.equal(new TextEncoder().encode(JSON.stringify(accepted)).byteLength, limit);
+    assert.ok(new TextEncoder().encode(JSON.stringify({ ok: true, data: accepted.data,
+      error: null, finished_at: env.now() })).byteLength < limit);
+    const tooLargeId = command().id;
+    await env.juno.sendResult(env.store.deviceToken, tooLargeId, { ok: true, data: fitting + "x" });
+    const rejected = resultFor(env, tooLargeId);
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.data, null);
+    assert.equal(rejected.error, "result too large to relay");
+  });
+
+  test("each socket attempt mints a fresh ticket, keeps credentials out of URL and hello, and gates commands", async () => {
+    const env = boot();
+    let mints = 0;
+    env.fetchControl.fn = (url) => {
+      assert.ok(url.endsWith("/ws-ticket"));
+      mints++;
+      return { ok: true, status: 200, json: async () => ({ ticket: mints.toString(16).padStart(64, "0"), expires_in: 30 }) };
+    };
+    let calls = 0;
+    env.juno.HANDLERS.ping = () => { calls++; return {}; };
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const previousCursor = env.store.cursor;
+      const before = MockWebSocket.latest;
+      const pending = env.juno.runSocket(env.store.deviceToken, env.store.cursor);
+      await until(() => MockWebSocket.latest !== before);
+      const ws = MockWebSocket.latest;
+      try {
+        await tick();
+        assert.ok(ws.url.endsWith("/ws"));
+        assert.equal(ws.url.includes(env.store.deviceToken), false);
+        assert.equal(ws.url.includes("?"), false);
+        assert.equal(ws.protocols[0], "juno-bridge-v1");
+        assert.equal(ws.protocols[1], "juno-ticket." + attempt.toString(16).padStart(64, "0"));
+        const hello = JSON.parse(ws.sent[0]);
+        assert.equal(hello.token, undefined);
+        const cmd = command({ issued_at: env.now() });
+        ws.onmessage({ data: "null" });
+        ws.onmessage({ data: JSON.stringify({ type: "cmd", cmd, now: env.now() }) });
+        await env.juno.drain();
+        assert.equal(env.store.cursor, previousCursor);
+        assert.equal(calls, attempt - 1);
+        ws.onmessage({ data: JSON.stringify({ type: "welcome" }) });
+        ws.onmessage({ data: JSON.stringify({ type: "cmd", cmd, now: env.now() }) });
+        await env.juno.drain();
+        assert.equal(calls, attempt);
+        assert.equal(env.store.cursor, cmd.seq);
+      } finally { ws.close(); await pending; }
+    }
+    assert.equal(mints, 2);
+    assert.ok(env.fetches.every((entry) => entry.body.token === env.store.deviceToken));
+  });
+
+  for (const change of ["pause and resume", "re-pair", "permissions"]) {
+    test(`ticket issuance followed by ${change} constructs no stale socket`, async () => {
+      const env = boot();
+      let release;
+      env.fetchControl.fn = () => ({ ok: true, status: 200,
+        json: () => new Promise((resolve) => { release = () => resolve({ ticket: "cd".repeat(32) }); }) });
+      const before = MockWebSocket.latest;
+      const pending = env.juno.runSocket(env.store.deviceToken, 0);
+      await until(() => !!release);
+      if (change === "pause and resume") {
+        await env.chrome.storage.local.set({ enabled: false });
+        await env.chrome.storage.local.set({ enabled: true });
+      } else await env.chrome.storage.local.set(change === "re-pair" ? { deviceToken: "ef".repeat(32) } : { allowlist: [] });
+      release();
+      const result = await pending;
+      assert.equal(result.opened, false);
+      assert.equal(MockWebSocket.latest, before);
+    });
+  }
+
+  for (const failure of ["malformed ticket", "malformed JSON", "old relay", "rate limited", "network", "stalled fetch", "stalled JSON", "revoked"]) {
+    test(`ticket ${failure} refuses the upgrade and selects the fallback outcome`, async () => {
+      const env = boot({ timeouts: { SOCKET_TICKET_TIMEOUT_MS: 25 } });
+      let signal;
+      env.fetchControl.fn = (_url, _body, opts) => {
+        signal = opts.signal;
+        if (failure === "network") throw new Error("offline");
+        if (failure === "stalled fetch") return new Promise(() => {});
+        const status = failure === "old relay" ? 404 : failure === "rate limited" ? 429 : failure === "revoked" ? 403 : 200;
+        return { ok: status === 200, status, json: async () => {
+          if (failure === "malformed JSON") throw new Error("JSON error");
+          if (failure === "stalled JSON") return await new Promise(() => {});
+          return { ticket: failure === "malformed ticket" ? "not-a-ticket" : "cd".repeat(32) };
+        } };
+      };
+      const before = MockWebSocket.latest;
+      const result = await env.juno.runSocket(env.store.deviceToken, 0);
+      assert.equal(result.opened, false);
+      assert.equal(result.rejected, failure === "revoked");
+      assert.equal(MockWebSocket.latest, before);
+      if (failure.startsWith("stalled")) assert.equal(signal.aborted, true);
+    });
+  }
+
+  test("pongs do not extend a socket's absolute welcome deadline", async () => {
+    const env = boot({ timeouts: { SOCKET_WELCOME_TIMEOUT_MS: 30 } });
+    const before = MockWebSocket.latest;
+    const pending = env.juno.runSocket(env.store.deviceToken, 0);
+    await until(() => MockWebSocket.latest !== before);
+    const ws = MockWebSocket.latest;
+    await tick();
+    ws.onmessage({ data: "pong" });
+    const result = await pending;
+    assert.equal(result.opened, true);
+    assert.equal(result.welcomed, false);
+    assert.equal(ws.readyState, MockWebSocket.CLOSED);
   });
 });

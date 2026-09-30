@@ -59,9 +59,46 @@ Optional Jev checks cover default-off behavior, configuration and override
 precedence, private key handling, observation reuse, and refusal of unsafe
 or stale clicks. Use fake keys and responses; these checks do not call
 TypeSafe, spend API credit, or run live browser actions.
+Relay and extension regressions also cover ticket replay and origin binding,
+stale pairing replies, permission changes during browser work, stalled body
+reads, UTF-8 size limits, durable large results, transactional enqueue failures,
+legacy-import retries, revocation cleanup, and bounded storage batches.
 
 They do not load the extension in Chrome and they do not deploy a relay.
 Step 3 above is still required before a transport or browser change is merged.
+
+For an additional real local-runtime/browser check, use existing Miniflare,
+Playwright, Chrome, and OpenSSL installations:
+
+```bash
+node scripts/local-audit-integration.mjs
+```
+
+`JUNO_MINIFLARE_MODULE` and `JUNO_PLAYWRIGHT_MODULE` can point at existing
+module entry points; `JUNO_CHROME_PATH` selects the browser executable.
+The script installs nothing and uses a disposable Chrome profile, local
+worker storage, a generated fixture certificate, and synthetic page data.
+It checks actual pairing, WebSocket delivery, HTTP fallback, result recovery
+after restart, and revocation. It does not touch a normal browser profile.
+This script is outside the default test suite and makes no paid model calls.
+
+To test an already-provisioned, disposable Cloudflare staging relay, set
+`JUNO_AUDIT_RELAY_URL` to its HTTPS `audit-` or `staging-` Worker URL and
+`JUNO_AUDIT_PSK_FILE` to a private, owner-controlled, mode-0600 regular file
+outside the repository. The script does not deploy the relay. It checks the
+same browser transports and result receipts with verified upstream TLS.
+Do not point it at a production relay. Remove your disposable Worker after
+testing.
+
+Runtime restart checks run locally. Forced socket hibernation is opt-in with
+`JUNO_AUDIT_FORCE_HIBERNATION=1` and requires a working eviction-control API
+in the installed Miniflare version. The report identifies checks that were
+not run; it does not claim to force a Cloudflare runtime restart.
+When a cloud ingress holds half-open uploads before invoking the Worker,
+`JUNO_AUDIT_SKIP_HALF_OPEN_BODY=1` can omit only those staging probes. The
+report records the omission; completed-body authentication and size checks
+still run. This flag is rejected in local mode, where the deadline tests
+remain required.
 
 ## Optional third-party decisions
 
