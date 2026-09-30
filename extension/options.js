@@ -80,7 +80,10 @@ registerBtn.addEventListener("click", async () => {
     const data = await postRelay("/register", { code, name });
     if (!data.device_token) throw new Error("relay sent no device token");
     await chrome.storage.local.set({
-      deviceToken: data.device_token, deviceName: name, enabled: true, cursor: 0, relayStatus: null,
+      // Publish the token and its progress together. Old-device saves use a
+      // separate item and cannot overwrite this pairing's initial cursor.
+      deviceToken: data.device_token, [`cursor:${data.device_token}`]: 0,
+      deviceName: name, enabled: true, relayStatus: null,
     });
     if (oldToken && oldToken !== data.device_token) await revokeOnRelay(oldToken);
     codeInput.value = "";
@@ -98,7 +101,7 @@ unregisterBtn.addEventListener("click", async () => {
   // Stop polling first, then revoke; the local token goes either way.
   await chrome.storage.local.set({ enabled: false });
   const revoked = deviceToken ? await revokeOnRelay(deviceToken) : true;
-  await chrome.storage.local.remove(["deviceToken", "deviceName", "cursor", "relayStatus"]);
+  await chrome.storage.local.remove(["deviceToken", "deviceName", "cursor", "legacyCursorToken", "relayStatus"]);
   setStatus(
     revoked
       ? "Unregistered and revoked on the relay. The extension no longer talks to it."

@@ -274,7 +274,14 @@ async function main() {
   const hibernated = (await wsAttempt(["juno-bridge-v1", "juno-ticket." + hibernationTicket.ticket])).ws;
   await welcome(hibernated);
   assert.equal(typeof mf.unsafeEvictDurableObject, "function", "local runtime must support explicit hibernation verification");
-  await mf.unsafeEvictDurableObject("juno-audit-local", "BridgeHub", { name: "juno-bridge", webSockets: "hibernate" });
+  phase = "forced Durable Object socket hibernation";
+  let evictionTimer;
+  try {
+    await Promise.race([
+      mf.unsafeEvictDurableObject("juno-audit-local", "BridgeHub", { name: "juno-bridge", webSockets: "hibernate" }),
+      new Promise((_, reject) => { evictionTimer = setTimeout(() => reject(new Error("local dev-control eviction timed out")), 5000); }),
+    ]);
+  } finally { clearTimeout(evictionTimer); }
   const [delivered, wake] = await Promise.all([socketMessage(hibernated, "cmd"),
     call("/admin/cmd", { action: "ping", params: {}, device: token, request_id: "audit_hibernation_identity" })]);
   assert.equal(delivered.cmd.id, wake.id);
@@ -333,7 +340,7 @@ async function main() {
   await options.locator("#deviceName").fill("isolated audit Chrome"); await options.locator("#code").fill(pairingCode); await options.locator("#registerBtn").click();
   await waitUntil(() => options.locator("#status").textContent().then(text => text.startsWith("Registered.")), "actual extension pairs");
   await waitUntil(() => worker.evaluate(async () => (await chrome.storage.local.get("relayStatus")).relayStatus?.via === "live"), "authenticated extension WebSocket", 20000);
-  const browserToken = await worker.evaluate(async () => (await chrome.storage.local.get("deviceToken")).deviceToken);
+  let browserToken = await worker.evaluate(async () => (await chrome.storage.local.get("deviceToken")).deviceToken);
   assert.match(browserToken, /^[0-9a-f]{64}$/);
   registeredDevices.add(browserToken);
   assert.ok((counts.get("/ws-ticket") || 0) > 0);
@@ -404,6 +411,61 @@ async function main() {
   await worker.evaluate(() => { chrome.debugger.sendCommand = globalThis.auditOriginalSendCommand; });
   await fixtureCdp.detach();
   checked("held real native screenshot is discarded after actual storage permission revocation");
+
+  // Hold an old device's receipt immediately before Chrome applies it, then
+  // perform a real new Options pairing. Storage calls from different contexts
+  // may arrive in this order; old progress must never suppress the new queue.
+  const oldBrowserToken = browserToken;
+  const nextCode = (await cli("pair")).match(/Pairing code:\s*([A-Z0-9]{8})/)[1];
+  await worker.evaluate(token => {
+    globalThis.auditOriginalStorageSet = chrome.storage.local.set.bind(chrome.storage.local);
+    globalThis.auditHeldCursor = false;
+    globalThis.auditHoldCursorOnce = true;
+    globalThis.auditCursorApplied = false;
+    chrome.storage.local.set = async values => {
+      if (globalThis.auditHoldCursorOnce && !Object.hasOwn(values, "deviceToken") &&
+          Object.hasOwn(values, "cursor:" + token)) {
+        globalThis.auditHoldCursorOnce = false;
+        globalThis.auditHeldCursor = true;
+        await new Promise(resolve => { globalThis.auditReleaseCursor = resolve; });
+        await globalThis.auditOriginalStorageSet(values);
+        globalThis.auditCursorApplied = true;
+        return;
+      }
+      return globalThis.auditOriginalStorageSet(values);
+    };
+  }, oldBrowserToken);
+  try {
+    // Direct enqueue avoids blocking the operator while Options re-pair may
+    // revoke the old owner and wake its pending result wait.
+    await call("/admin/cmd", { action: "snapshot", params: { tabId: tab.id }, device: oldBrowserToken });
+    await waitUntil(() => worker.evaluate(() => globalThis.auditHeldCursor === true), "old-device cursor receipt held before application");
+    await options.locator("#deviceName").fill("isolated audit re-pair");
+    await options.locator("#code").fill(nextCode); await options.locator("#registerBtn").click();
+    await waitUntil(async () => {
+      browserToken = await worker.evaluate(async () => (await chrome.storage.local.get("deviceToken")).deviceToken);
+      return browserToken && browserToken !== oldBrowserToken;
+    }, "actual Options changes device identity while old receipt is held");
+    registeredDevices.add(browserToken);
+    await worker.evaluate(() => globalThis.auditReleaseCursor());
+    await waitUntil(() => worker.evaluate(() => globalThis.auditCursorApplied === true), "old-device cursor write applies after re-pair");
+    assert.equal(await worker.evaluate(async () => (await getState()).cursor), 0,
+      "old receipt cannot overwrite the new device's initial progress");
+    await worker.evaluate(() => { chrome.storage.local.set = globalThis.auditOriginalStorageSet; });
+    await waitUntil(() => worker.evaluate(async () => (await chrome.storage.local.get("relayStatus")).relayStatus?.via === "live"), "re-paired extension connects with its own ticket", 20000);
+    const pairedSnapshot = JSON.parse(await cli("send", "snapshot", JSON.stringify({ tabId: tab.id })));
+    assert.equal(pairedSnapshot.ok, true);
+    assert.ok(await worker.evaluate(async () => (await getState()).cursor) > 0,
+      "new device runs its first command despite the late old-device receipt");
+    const oldDevice = await request("/admin/revoke", { body: { device: oldBrowserToken }, headers: admin });
+    assert.ok(oldDevice.status === 200 || oldDevice.status === 404); registeredDevices.delete(oldBrowserToken);
+    checked("held real old-device cursor write cannot suppress the actual new pairing's first snapshot command");
+  } finally {
+    await worker.evaluate(() => {
+      globalThis.auditReleaseCursor?.();
+      chrome.storage.local.set = globalThis.auditOriginalStorageSet;
+    }).catch(() => {});
+  }
 
   fallback = true;
   await worker.evaluate(async () => { await chrome.storage.local.set({ enabled: false }); });

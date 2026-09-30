@@ -179,6 +179,9 @@ python3 driver/jb.py send workflow '{"tabId":123456,"snapshot":"snap_0123456789a
   policy that started them. Re-pairing, pausing, or changing permissions
   discards stale work; an old result is never sent on a new device's socket.
   Polling and result delivery have deadlines covering the response body.
+  Saved command positions are scoped to each device; a late write from an
+  old pairing cannot overwrite the new pairing's progress. Existing numeric
+  positions migrate without resetting the current device's cursor.
 - Admin authentication happens before body reading. Request bodies,
   readers, retained results, queues, registry records, sockets, and waiters
   have explicit limits. Sizes count UTF-8 bytes. Periodic cleanup and
