@@ -759,6 +759,80 @@ async function takeSnapshot(env) {
   return body.data.snapshot;
 }
 
+describe("bounded node identity reads", { concurrency: 1 }, () => {
+  function nodes(n = 11) {
+    return Array.from({ length: n }, (_, i) => labeledButton("node " + i,
+      { x: 10 + i * 45, y: 20, width: 40, height: 20 }));
+  }
+  function delayed(env, method, before) {
+    const original = env.chrome.debugger.sendCommand;
+    const stats = { active: 0, peak: 0, started: 0, detachedWithActive: false };
+    env.chrome.debugger.sendCommand = async (...args) => {
+      if (args[1] !== method) return original(...args);
+      const i = stats.started++;
+      stats.peak = Math.max(stats.peak, ++stats.active);
+      try {
+        await new Promise(resolve => setTimeout(resolve, 15 + (i % 3) * 2));
+        if (before) await before(i);
+        return await original(...args);
+      } finally { stats.active--; }
+    };
+    const detach = env.chrome.debugger.detach;
+    env.chrome.debugger.detach = (...args) => {
+      stats.detachedWithActive ||= stats.active > 0;
+      return detach(...args);
+    };
+    return stats;
+  }
+  test("describe/restore overlap is bounded and preserves ref order", async () => {
+    const env = bootPage({ nodes: nodes() });
+    const describing = delayed(env, "DOM.describeNode");
+    const snapshot = await takeSnapshot(env);
+    assert.equal(describing.peak, 4);
+    assert.equal(describing.started, 11);
+    assert.equal(describing.detachedWithActive, false);
+    const restoring = delayed(env, "DOM.resolveNode");
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e8", expect: { text: "node 7" } }], snapshot);
+    assert.equal(resultFor(env, cmd.id).ok, true);
+    assert.equal(restoring.peak, 4);
+    assert.equal(restoring.started, 11);
+    assert.equal(restoring.detachedWithActive, false);
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+  });
+  test("partial describe failure drains started reads and publishes no binding", async () => {
+    const env = bootPage({ nodes: nodes() });
+    const stats = delayed(env, "DOM.describeNode", i => { if (i === 0) throw new Error("injected node failure"); });
+    const cmd = command({ action: "snapshot", issued_at: env.now(), params: { tabId: 7 } });
+    await env.juno.schedule(cmd, env.now());
+    assert.equal(resultFor(env, cmd.id).ok, false);
+    assert.equal(stats.started, 4);
+    assert.equal(stats.active, 0);
+    assert.equal(stats.detachedWithActive, false);
+    const pageId = vm.runInContext("globalThis.__junoHold.snapshot", env.page.realm);
+    const attempt = await runWorkflow(env, [{ op: "click", ref: "e1" }], pageId);
+    assert.equal(resultFor(env, attempt.id).ok, false);
+    assert.match(resultFor(env, attempt.id).error, /snapshot is stale/);
+    assert.deepEqual(mouseTypes(env), []);
+  });
+  for (const invalidation of ["policy without event", "pairing without event", "same URL reload"]) {
+    test(invalidation + " during overlap refuses late binding and input", async () => {
+      const env = bootPage({ nodes: nodes() });
+      const snapshot = await takeSnapshot(env);
+      const stats = delayed(env, "DOM.resolveNode", i => {
+        if (i !== 0) return;
+        if (invalidation === "policy without event") env.store.enabled = false;
+        else if (invalidation === "pairing without event") env.store.deviceToken = "ef".repeat(32);
+        else env.page.realm.performance.timeOrigin += 1000;
+      });
+      const cmd = await runWorkflow(env, [{ op: "click", ref: "e8" }], snapshot);
+      assert.equal(resultFor(env, cmd.id).ok, false);
+      assert.ok(stats.started <= 4);
+      assert.equal(stats.active, 0);
+      assert.deepEqual(mouseTypes(env), []);
+    });
+  }
+});
+
 describe("extension", { concurrency: 1 }, () => {
   test("pause during a click cancels the press and release", async () => {
     const env = boot({

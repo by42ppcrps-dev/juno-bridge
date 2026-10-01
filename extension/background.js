@@ -757,6 +757,32 @@ function simulateWorkerRestart() {
 
 // Record backend node ids for the elements the store expression just held.
 // A later command resolves those ids. It does not search the DOM for a copy.
+const NODE_READ_CONCURRENCY = 4;
+
+// Only independent node identity reads use this pool. Every read retains cdp's
+// fresh policy, tab and document checks. On failure stop taking new work and
+// drain started reads before unwinding the attachment or publishing a binding.
+async function mapNodeReads(auth, entries, read) {
+  const results = new Array(entries.length);
+  let next = 0;
+  let failure = null;
+  async function worker() {
+    while (!failure && next < entries.length) {
+      const index = next++;
+      try {
+        assertActive(auth.control || auth.epoch);
+        results[index] = await read(entries[index], index);
+      } catch (error) {
+        failure ||= error;
+      }
+    }
+  }
+  await Promise.allSettled(Array.from({ length: Math.min(NODE_READ_CONCURRENCY, entries.length) }, worker));
+  if (failure) throw failure;
+  assertActive(auth.control || auth.epoch);
+  return results;
+}
+
 async function retainSnapshot(auth, snapshotId, described) {
   const elements = described.elements;
   if (!Array.isArray(elements)) throw new Error("snapshot: snapshot failed");
@@ -774,7 +800,7 @@ async function retainSnapshot(auth, snapshotId, described) {
     contextId: auth.contextId,
   });
   if (remote && remote.exceptionDetails) throw new Error("snapshot: could not retain the captured nodes");
-  const nodes = [];
+  let nodes = [];
   if (elements.length > 0) {
     const listId = remote && remote.result && remote.result.objectId;
     if (!listId) throw new Error("snapshot: could not retain the captured nodes");
@@ -787,14 +813,14 @@ async function retainSnapshot(auth, snapshotId, described) {
       byIndex.set(Number(prop.name), id);
     }
     if (byIndex.size !== elements.length) throw new Error("snapshot: could not retain the captured nodes");
-    for (let i = 0; i < elements.length; i++) {
+    nodes = await mapNodeReads(auth, elements, async (_element, i) => {
       const describedNode = await cdp(auth, "DOM.describeNode", { objectId: byIndex.get(i) });
       const backendNodeId = describedNode && describedNode.node && describedNode.node.backendNodeId;
       if (!Number.isInteger(backendNodeId) || backendNodeId <= 0) {
         throw new Error("snapshot: could not retain the captured nodes");
       }
-      nodes.push({ ref: "e" + (i + 1), backendNodeId });
-    }
+      return { ref: "e" + (i + 1), backendNodeId };
+    });
   }
   rememberSnapshot(snapshotId, {
     tabId: auth.tabId,
@@ -940,8 +966,7 @@ async function callInPage(auth, functionDeclaration, args) {
 }
 
 async function restoreSnapshot(auth, snapshotId, binding) {
-  const args = [];
-  for (const entry of binding.nodes) {
+  const args = await mapNodeReads(auth, binding.nodes, async (entry) => {
     let objectId = null;
     try {
       const resolved = await cdp(auth, "DOM.resolveNode", {
@@ -952,10 +977,17 @@ async function restoreSnapshot(auth, snapshotId, binding) {
         objectId = resolved.object.objectId || null;
       }
     } catch {
+      // A missing backend node is represented by null. Cancellation or document
+      // replacement must terminate the pool instead of being treated as missing.
+      assertActive(auth.control || auth.epoch);
+      await assertStillAuthorized(auth);
+      if (await readDocumentId(auth) !== auth.documentId) {
+        throw new Error(`${auth.verb}: the document changed`);
+      }
       objectId = null;
     }
-    args.push(objectId ? { objectId } : { value: null });
-  }
+    return objectId ? { objectId } : { value: null };
+  });
   return callInPage(auth, installHoldSource(snapshotId, binding.doc, binding.url), args);
 }
 
