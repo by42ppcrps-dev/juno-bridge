@@ -152,6 +152,45 @@ async function sha256(text) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+describe("versioned run contract", () => {
+  test("missing id and unknown version fail before enqueue; replay remains durable", async () => {
+    const { hub } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const { token } = await pairAndRegister(hub, "A");
+    const listing = await read(await hub.fetch(admin("/admin/devices")));
+    assert.equal(listing.data.run_protocol, "juno-run-v1");
+    for (const requestId of [undefined, "short", "bad id!!"]) {
+      const reply = await read(await hub.fetch(admin("/admin/run/v1", { method:"POST", body:{device:token, action:"click", wait:0, request_id:requestId} })));
+      assert.equal(reply.status, 400);
+    }
+    assert.equal(hub.pending(token).length, 0);
+    const wrong = await read(await hub.fetch(admin("/admin/run/v2", { method:"POST", body:{device:token, action:"click", request_id:"req_unknown_v2", wait:0} })));
+    assert.equal(wrong.status, 404);
+    assert.equal(hub.pending(token).length, 0);
+    const body = {device:token, action:"click", request_id:"req_versioned_1", wait:0};
+    const first = await read(await hub.fetch(admin("/admin/run/v1", {method:"POST", body})));
+    const replay = await read(await hub.fetch(admin("/admin/run/v1", {method:"POST", body})));
+    assert.equal(first.status, 200);
+    assert.equal(first.data.id, replay.data.id);
+    assert.equal(replay.data.duplicate, true);
+    assert.equal(hub.pending(token).length, 1);
+    await hub.acceptResult(token, first.data.id, {ok:true, data:{oneEffect:true}});
+    const finished = await read(await hub.fetch(admin("/admin/run/v1", {method:"POST", body})));
+    assert.equal(finished.data.result.data.oneEffect, true);
+  });
+  test("cached route knowledge never bypasses authentication, ambiguity or revocation", async () => {
+    const { hub } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const { token } = await pairAndRegister(hub, "A");
+    const body = {device:token, action:"click", request_id:"req_revoked_v1", wait:0};
+    const denied = await read(await hub.fetch(admin("/admin/run/v1", {method:"POST", body, passphrase:"wrong-synthetic-passphrase"})));
+    assert.equal(denied.status, 403);
+    assert.equal(hub.pending(token).length, 0);
+    await hub.removeDevice(token);
+    const revoked = await read(await hub.fetch(admin("/admin/run/v1", {method:"POST", body})));
+    assert.equal(revoked.status, 404);
+    assert.equal(hub.owners.size, 0);
+  });
+});
+
 function bomb() {
   const hub = {
     calls: 0,

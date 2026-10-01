@@ -52,6 +52,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -287,11 +288,22 @@ def run_action(action, params, device="default"):
     request_id is new for each call. A transport retry inside the operator
     reuses this same id; it does not enqueue a second browser command.
     """
-    listing = relay_request("GET", "/admin/devices", tolerate=(404,))
+    # Only a canonical explicit selector may reuse a static versioned route
+    # contract. Default/name selection remains a fresh listing for every call.
+    listing = None
+    if operator_enabled() and isinstance(device, str) and re.fullmatch(r"[0-9a-f]{8,64}", device):
+        try:
+            listing = operator_mod().negotiate_explicit_device(relay_url(), device)
+        except operator_mod().OperatorError as exc:
+            die(f"request failed: {exc}")
+    if listing is None:
+        listing = relay_request("GET", "/admin/devices", tolerate=(404,))
     unlisted_legacy = listing.get("_status") == 404
     capabilities = listing.get("capabilities")
     idempotent = (not unlisted_legacy and isinstance(capabilities, list)
                   and "idempotency" in capabilities)
+    versioned = idempotent and listing.get("run_protocol") == "juno-run-v1"
+    run_route = "/admin/run/v1" if versioned else "/admin/run"
     if not unlisted_legacy and (not device or device == "default"):
         selected = listing.get("default")
         entries = listing.get("devices")
@@ -316,9 +328,11 @@ def run_action(action, params, device="default"):
     if legacy:
         res = relay_request("POST", "/admin/cmd", cmd)
     else:
-        res = relay_request("POST", "/admin/run", dict(cmd, wait=25), timeout=60,
+        res = relay_request("POST", run_route, dict(cmd, wait=25), timeout=60,
                             tolerate=(404,), retry_safe=True)
         if res.get("_status") == 404:
+            if versioned:
+                die("versioned run route unavailable; no fallback enqueue, outcome requires reconciliation")
             legacy = True
             res = relay_request("POST", "/admin/cmd", cmd)
         elif not res.get("pending"):
@@ -337,7 +351,7 @@ def run_action(action, params, device="default"):
             # A result GET consumes its receipt. If its reply is interrupted,
             # repeating the GET can wait forever. Repeating this request_id on
             # current relays returns the original command and retained result.
-            r = relay_request("POST", "/admin/run", dict(cmd, wait=20),
+            r = relay_request("POST", run_route, dict(cmd, wait=20),
                               timeout=min(35, max(1, deadline - time.monotonic())),
                               retry_safe=True)
             if r.get("id") != cmd_id:

@@ -23,6 +23,7 @@ import importlib.util
 import json
 import os
 import queue
+import re
 import select
 import socket
 import stat
@@ -43,6 +44,45 @@ TYPESAFE_CONTEXT_ERROR = (
     "TypeSafe configuration changed; run jb.py operator stop and retry. "
     "No API call was made."
 )
+RUN_PROTOCOL = "juno-run-v1"
+NEGOTIATION_TTL_S = 30
+NEGOTIATION_MAX = 32
+
+
+def _negotiate_explicit(msg, client, cache):
+    device = msg.get("device")
+    if not isinstance(device, str) or re.fullmatch(r"[0-9a-f]{8,64}", device) is None:
+        return {"ok": False, "error": "explicit canonical device required"}
+    base = relay_base()
+    if msg.get("relay_context") != base:
+        cache.clear()
+        return {"ok": False, "error": "relay configuration changed; no request was made"}
+    # Read normal supported authentication afresh even on a cache hit. The
+    # digest is private cache identity, never returned, persisted, or logged.
+    auth = hashlib.sha256(admin_psk().encode("utf-8")).digest()
+    identity = (base, auth)
+    if cache.get("identity") != identity:
+        cache.clear()
+        cache["identity"] = identity
+    entries = cache.setdefault("entries", {})
+    now = time.monotonic()
+    for key, deadline in list(entries.items()):
+        if deadline <= now:
+            del entries[key]
+    if device in entries:
+        return {"ok": True, "status": 200, "payload": {
+            "capabilities": ["idempotency"], "run_protocol": RUN_PROTOCOL,
+            "negotiation_cache_hit": True}}
+    result = handle_message({"op": "relay_request_v1", "method": "GET", "route": "/admin/devices"}, client)
+    payload = result.get("payload")
+    if (result.get("ok") is True and result.get("status") == 200
+            and isinstance(payload, dict) and payload.get("run_protocol") == RUN_PROTOCOL
+            and isinstance(payload.get("capabilities"), list) and "idempotency" in payload["capabilities"]):
+        if len(entries) >= NEGOTIATION_MAX:
+            del entries[next(iter(entries))]
+        entries[device] = time.monotonic() + NEGOTIATION_TTL_S
+    # Legacy metadata is returned for this call but is never cached.
+    return result
 
 # libcurl option numbers. VERIFYHOST 2 and VERIFYPEER 1 stay set on purpose.
 CURLOPT_TIMEOUT = 13
@@ -446,7 +486,7 @@ def _handle_systemone(msg, typesafe_getter, admission=None):
     return {"ok": True, "response": _scrub_provider_response(response, key)}
 
 
-def handle_message(msg, client, typesafe_getter=None, admission=None):
+def handle_message(msg, client, typesafe_getter=None, admission=None, negotiation_cache=None):
     if not isinstance(msg, dict):
         return {"ok": False, "error": "bad message"}
     if msg.get("op") == "stop":
@@ -455,6 +495,8 @@ def handle_message(msg, client, typesafe_getter=None, admission=None):
         return {"ok": True, "pong": True}
     if msg.get("op") in ("systemone", "systemone_byok_v1", "systemone_byok_v2"):
         return _handle_systemone(msg, typesafe_getter, admission)
+    if msg.get("op") == "negotiate_relay_v1":
+        return _negotiate_explicit(msg, client, negotiation_cache if negotiation_cache is not None else {})
     relay_v1 = msg.get("op") == "relay_request_v1"
     path = msg.get("route") if relay_v1 else msg.get("path")
     if not isinstance(path, str) or not path.startswith("/") or "://" in path or "\n" in path:
@@ -462,6 +504,10 @@ def handle_message(msg, client, typesafe_getter=None, admission=None):
     method = msg.get("method") if isinstance(msg.get("method"), str) else "GET"
     try:
         url = relay_base() + path
+        if path.split("?", 1)[0] == "/admin/run/v1" and msg.get("relay_context") != relay_base():
+            if negotiation_cache is not None:
+                negotiation_cache.clear()
+            return {"ok": False, "error": "relay configuration changed; no request was made"}
         headers = [f"Authorization: Bearer {admin_psk()}"]
         body = None
         if msg.get("data") is not None:
@@ -471,16 +517,19 @@ def handle_message(msg, client, typesafe_getter=None, admission=None):
         route = path.split("?", 1)[0]
         retry = (method.upper() == "GET" and route != "/admin/result") or (
             relay_v1 and msg.get("retry_safe") is True
-            and method.upper() == "POST" and route == "/admin/run"
+            and method.upper() == "POST" and route in ("/admin/run", "/admin/run/v1")
             and isinstance(msg.get("data"), dict)
             and isinstance(msg["data"].get("request_id"), str)
         )
         status, raw = request_with_retry(client, method, url, headers, body, timeout, retry=retry)
     except TimeoutError:
+        if negotiation_cache is not None: negotiation_cache.clear()
         return {"ok": False, "error": "request failed: timed out"}
     except OperatorError as exc:
+        if negotiation_cache is not None: negotiation_cache.clear()
         return {"ok": False, "error": str(exc)[:300]}
     except OSError as exc:
+        if negotiation_cache is not None: negotiation_cache.clear()
         return {"ok": False, "error": "request failed: " + str(exc)[:300]}
     text = raw.decode("utf-8", "replace") if raw else ""
     try:
@@ -489,6 +538,8 @@ def handle_message(msg, client, typesafe_getter=None, admission=None):
         payload = {"_raw": text.strip()[-300:]}
     if not isinstance(payload, dict):
         payload = {"_raw": payload}
+    if not 200 <= status < 300 and negotiation_cache is not None:
+        negotiation_cache.clear()
     return {"ok": True, "status": status, "payload": payload}
 
 
@@ -571,6 +622,7 @@ def _caller_budget(conn, deadline):
 
 def _worker_loop(work, client, typesafe_getter, gate):
     """One thread owns the relay client and the TypeSafe client."""
+    negotiation_cache = {}
     while True:
         item = work.get()
         if item is None:
@@ -584,7 +636,7 @@ def _worker_loop(work, client, typesafe_getter, gate):
             else:
                 try:
                     admission = (lambda: _caller_budget(conn, deadline)) if deadline is not None else None
-                    result = handle_message(msg, client, typesafe_getter, admission)
+                    result = handle_message(msg, client, typesafe_getter, admission, negotiation_cache)
                 except Exception:
                     result = {"ok": False, "error": "request failed"}
                 _safe_send(conn, result)
@@ -861,6 +913,8 @@ def call(method, path, data, timeout, retry_safe=False):
     # sending any relay request with its former unconditional retry policy.
     message = {"token": token, "op": "relay_request_v1", "method": method,
                "route": path, "timeout": int(timeout), "retry_safe": retry_safe}
+    if path.split("?", 1)[0] == "/admin/run/v1":
+        message["relay_context"] = relay_base()
     if data is not None:
         message["data"] = data
     res = transact(message, timeout=int(timeout) + SOCKET_RESPONSE_GRACE_S)
@@ -869,6 +923,23 @@ def call(method, path, data, timeout, retry_safe=False):
             raise OperatorError("operator is outdated; run jb.py operator stop and retry. No relay request was made")
         raise OperatorError(res.get("error") or "request failed")
     return res.get("status"), res.get("payload") if isinstance(res.get("payload"), dict) else {}
+
+
+def negotiate_explicit_device(relay, device):
+    ensure()
+    res = transact({"token": read_private(token_path()), "op": "negotiate_relay_v1",
+                    "relay_context": relay, "device": device}, timeout=30 + SOCKET_RESPONSE_GRACE_S)
+    if not res.get("ok"):
+        # Old daemons reject this path-less operation locally before any relay
+        # request. The caller uses the ordinary fresh listing compatibility path.
+        if res.get("error") == "bad path": return None
+        raise OperatorError(res.get("error") or "negotiation failed")
+    payload = res.get("payload")
+    if not isinstance(payload, dict): raise OperatorError("invalid negotiation response")
+    status = res.get("status")
+    if status == 404: return dict(payload, _status=404)
+    if status != 200: raise OperatorError("negotiation failed: HTTP " + str(status))
+    return payload
 
 
 def systemone(body, timeout=30):

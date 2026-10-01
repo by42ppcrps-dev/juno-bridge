@@ -105,6 +105,62 @@ class OperatorTests(unittest.TestCase):
         self.thread = None
         self.stop_flag = None
 
+    def test_versioned_negotiation_reuses_only_static_contract_and_expires(self):
+        client = FakeClient(lambda *_: (200, b'{"capabilities":["idempotency"],"run_protocol":"juno-run-v1","devices":[{"id":"a1b2c3d4"}],"default":"a1b2c3d4"}'))
+        cache = {}
+        msg = {"op": "negotiate_relay_v1", "relay_context": "https://relay.example", "device": "a1b2c3d4"}
+        with mock.patch.object(self.op.time, "monotonic", return_value=100):
+            first = self.op.handle_message(msg, client, negotiation_cache=cache)
+            second = self.op.handle_message(msg, client, negotiation_cache=cache)
+        self.assertEqual(len(client.calls), 1)
+        self.assertTrue(second["payload"]["negotiation_cache_hit"])
+        self.assertNotIn("devices", second["payload"])
+        self.assertNotIn("default", second["payload"])
+        with mock.patch.object(self.op.time, "monotonic", return_value=131):
+            self.op.handle_message(msg, client, negotiation_cache=cache)
+        self.assertEqual(len(client.calls), 2)
+        self.assertNotIn(PSK, repr(cache))
+
+    def test_legacy_negotiation_is_never_cached_and_context_change_fails_closed(self):
+        client = FakeClient(lambda *_: (200, b'{"capabilities":["idempotency"]}'))
+        cache = {}
+        msg = {"op": "negotiate_relay_v1", "relay_context": "https://relay.example", "device": "a1b2c3d4"}
+        for _ in range(2): self.op.handle_message(msg, client, negotiation_cache=cache)
+        self.assertEqual(len(client.calls), 2)
+        for device in ("default", "named browser", "ABCDEF01"):
+            self.assertFalse(self.op.handle_message(dict(msg, device=device), client, negotiation_cache=cache)["ok"])
+        self.assertFalse(self.op.handle_message(dict(msg, relay_context="https://other.example"), client, negotiation_cache=cache)["ok"])
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(cache, {})
+
+    def test_authentication_change_and_failed_post_invalidate_contract(self):
+        client = FakeClient(lambda *_: (200, b'{"capabilities":["idempotency"],"run_protocol":"juno-run-v1"}'))
+        cache = {}
+        msg = {"op": "negotiate_relay_v1", "relay_context": "https://relay.example", "device": "a1b2c3d4"}
+        self.op.handle_message(msg, client, negotiation_cache=cache)
+        with mock.patch.object(self.op, "admin_psk", return_value="another-synthetic-passphrase"):
+            self.op.handle_message(msg, client, negotiation_cache=cache)
+        self.assertEqual(len(client.calls), 2)
+        failed = FakeClient(lambda *_: (403, b'{"error":"unknown_device"}'))
+        self.op.handle_message({"op":"relay_request_v1", "method":"POST", "route":"/admin/run/v1",
+            "relay_context":"https://relay.example", "data":{"request_id":"req_revoked1"}}, failed, negotiation_cache=cache)
+        self.assertEqual(cache, {})
+        self.assertEqual(len(failed.calls), 1)
+
+    def test_versioned_lost_reply_retries_identical_body_and_wrong_origin_sends_nothing(self):
+        def respond(*_):
+            if len(client.calls) == 1: raise TimeoutError("lost reply")
+            return 200, b'{"pending":false,"result":{"ok":true}}'
+        client = FakeClient(respond)
+        msg = {"op":"relay_request_v1", "method":"POST", "route":"/admin/run/v1",
+            "relay_context":"https://relay.example", "retry_safe":True, "timeout":5,
+            "data":{"request_id":"req_lost_v1", "action":"click"}}
+        self.assertTrue(self.op.handle_message(msg, client)["ok"])
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[0][3], client.calls[1][3])
+        self.assertFalse(self.op.handle_message(dict(msg, relay_context="https://wrong.example"), client)["ok"])
+        self.assertEqual(len(client.calls), 2)
+
     def tearDown(self):
         if self.stop_flag is not None:
             self.stop_flag.set()

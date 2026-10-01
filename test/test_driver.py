@@ -35,6 +35,30 @@ class DriverTests(unittest.TestCase):
         with open(cfg, "w", encoding="utf-8") as f:
             json.dump({"relay_url": "https://relay.example"}, f)
 
+    def test_versioned_run_never_downgrades_into_second_enqueue(self):
+        calls = []
+        def request(method, path, *args, **kwargs):
+            calls.append(path)
+            if method == "GET": return {"capabilities":["idempotency"], "run_protocol":"juno-run-v1"}
+            return {"_status":404}
+        with mock.patch.object(jb, "relay_request", side_effect=request), mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(SystemExit): jb.run_action("click", {}, "a1b2c3d4")
+        self.assertEqual(calls, ["/admin/devices", "/admin/run/v1"])
+
+    def test_explicit_device_uses_negotiation_but_default_is_always_fresh(self):
+        module = mock.Mock()
+        module.negotiate_explicit_device.return_value = {"capabilities":["idempotency"], "run_protocol":"juno-run-v1"}
+        calls = []
+        def request(method, path, *args, **kwargs):
+            calls.append(path)
+            if method == "GET": return {"default":"a1b2c3d4", "devices":[{"id":"a1b2c3d4"}], "capabilities":["idempotency"]}
+            return {"pending":False, "result":{"ok":True}}
+        with mock.patch.object(jb, "operator_enabled", return_value=True), mock.patch.object(jb, "operator_mod", return_value=module), mock.patch.object(jb, "relay_request", side_effect=request):
+            jb.run_action("ping", {}, "a1b2c3d4")
+            jb.run_action("ping", {}, "default")
+        module.negotiate_explicit_device.assert_called_once_with("https://relay.example", "a1b2c3d4")
+        self.assertEqual(calls, ["/admin/run/v1", "/admin/devices", "/admin/run"])
+
     def tearDown(self):
         if self._env is None:
             os.environ.pop("JUNO_BRIDGE_PSK", None)

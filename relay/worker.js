@@ -109,6 +109,9 @@ const TOKEN_RE = /^[0-9a-f]{64}$/;
 const CMD_ID_RE = /^cmd_[0-9a-f]{16}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const CAPABILITIES = ["idempotency", "workflow"];
+// This route's contract cannot silently become an unversioned enqueue: a
+// valid request id is mandatory and every replay uses the durable receipt.
+const RUN_PROTOCOL = "juno-run-v1";
 
 async function sha256hex(s) {
   const d = await crypto.subtle.digest("SHA-256", enc.encode(s));
@@ -1005,10 +1008,14 @@ export class BridgeHub {
     }
 
     // ---- admin: enqueue a command (and optionally wait for its result) ----
-    const isRun = path === "/admin/run";
+    const versionedRun = path === "/admin/run/v1";
+    const isRun = path === "/admin/run" || versionedRun;
     if ((path === "/admin/cmd" || isRun) && req.method === "POST") {
       const err = await requireAdmin();
       if (err) return err;
+      if (versionedRun && (typeof body.request_id !== "string" || !REQUEST_ID_RE.test(body.request_id))) {
+        return json({ error: "bad_request_id" }, 400);
+      }
       const action = body.action;
       if (!action || typeof action !== "string") return json({ error: "missing_action" }, 400);
       const dev = this.resolveDevice(body.device);
@@ -1069,7 +1076,7 @@ export class BridgeHub {
           pending: this.pending(t).length,
         };
       });
-      return json({ ok: true, devices, default: this.order.length ? this.order[this.order.length - 1].slice(0, 8) : null, capabilities: CAPABILITIES });
+      return json({ ok: true, devices, default: this.order.length ? this.order[this.order.length - 1].slice(0, 8) : null, capabilities: CAPABILITIES, run_protocol: RUN_PROTOCOL });
     }
 
     // ---- admin: revoke a device (lost laptop, stale pairing) ----
