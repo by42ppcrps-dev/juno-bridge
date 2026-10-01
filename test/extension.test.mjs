@@ -3508,6 +3508,133 @@ describe("extension audit regressions", { concurrency: 1 }, () => {
     } finally { if (release) release(); }
   });
 
+  for (const phase of ["initial", "periodic refresh"]) {
+    test(`a failed ${phase} polling-status write still delivers a benign command once`, async () => {
+      const env = boot();
+      if (phase === "periodic refresh") {
+        env.fetchControl.fn = () => ({ ok: true, status: 204 });
+        await env.juno.pollOnce();
+        env.setClock(env.now() + 11000);
+      }
+      const priorStatus = env.store.relayStatus;
+      const set = env.chrome.storage.local.set;
+      let failures = 0;
+      env.chrome.storage.local.set = (changes) => {
+        if (changes.relayStatus) {
+          failures++;
+          return Promise.reject(new Error("synthetic UI-only storage failure"));
+        }
+        return set(changes);
+      };
+      const cmd = command({ issued_at: env.now() });
+      const ping = env.juno.HANDLERS.ping;
+      let calls = 0;
+      env.juno.HANDLERS.ping = (...args) => { calls++; return ping(...args); };
+      env.fetchControl.fn = (url) => url.endsWith("/poll")
+        ? { ok: true, status: 200, json: async () => ({ cmd, now: env.now() }) }
+        : { ok: true, status: 200, json: async () => ({ ok: true }) };
+      assert.equal(await env.juno.pollOnce(), true);
+      assert.equal(await env.juno.pollOnce(), true);
+      assert.equal(calls, 1);
+      assert.equal(failures, 2);
+      assert.equal(env.cursor(), cmd.seq);
+      assert.equal(resultFor(env, cmd.id).ok, true);
+      assert.equal(resultFor(env, cmd.id).data.version, "1.3.0");
+      assert.equal(env.store.relayStatus, priorStatus);
+    });
+  }
+
+  for (const delay of ["failed status write", "response body"]) {
+    test(`a command expiring during the polling ${delay} is reported without execution`, async () => {
+      const env = boot();
+      const relayNow = env.now();
+      const cmd = command({ issued_at: relayNow - 119900 });
+      let calls = 0;
+      env.juno.HANDLERS.ping = () => { calls++; return {}; };
+      const set = env.chrome.storage.local.set;
+      env.chrome.storage.local.set = async (changes) => {
+        if (delay === "failed status write" && changes.relayStatus) {
+          env.setClock(env.now() + 200);
+          throw new Error("synthetic UI-only storage failure");
+        }
+        return set(changes);
+      };
+      env.fetchControl.fn = (url) => url.endsWith("/poll")
+        ? { ok: true, status: 200, json: async () => {
+          if (delay === "response body") env.setClock(env.now() + 200);
+          return { cmd, now: relayNow };
+        } }
+        : { ok: true, status: 200, json: async () => ({ ok: true }) };
+      assert.equal(await env.juno.pollOnce(), true);
+      assert.equal(calls, 0);
+      assert.equal(env.cursor(), cmd.seq);
+      assert.equal(resultFor(env, cmd.id).ok, false);
+      assert.match(resultFor(env, cmd.id).error, /expired: .* old at execution, not run/);
+    });
+  }
+
+  test("UI-only status failures cannot admit a rejected HTTP response", async () => {
+    for (const status of [401, 403, 500]) {
+      const env = boot();
+      const cmd = command({ issued_at: env.now() });
+      let calls = 0;
+      env.juno.HANDLERS.ping = () => { calls++; return {}; };
+      const set = env.chrome.storage.local.set;
+      env.chrome.storage.local.set = (changes) => changes.relayStatus
+        ? Promise.reject(new Error("synthetic UI-only storage failure")) : set(changes);
+      env.fetchControl.fn = () => ({ ok: false, status,
+        json: async () => ({ cmd, now: env.now() }) });
+      await assert.rejects(() => env.juno.pollOnce(), /synthetic UI-only storage failure/);
+      assert.equal(calls, 0);
+      assert.equal(env.cursor(), 0);
+      assert.equal(resultFor(env, cmd.id), undefined);
+    }
+  });
+
+  test("policy changes during a failed polling-status write invalidate received commands", async () => {
+    for (const change of [{ enabled: false }, { deviceToken: "ef".repeat(32) },
+      { allowlist: ["other.example"] }, { allowEval: true }]) {
+      const env = boot();
+      const cmd = command({ issued_at: env.now() });
+      const epoch = env.juno.epoch();
+      let calls = 0;
+      env.juno.HANDLERS.ping = () => { calls++; return {}; };
+      const set = env.chrome.storage.local.set;
+      env.chrome.storage.local.set = async (changes) => {
+        if (!changes.relayStatus) return set(changes);
+        await set(change);
+        throw new Error("synthetic UI-only storage failure");
+      };
+      env.fetchControl.fn = () => ({ ok: true, status: 200,
+        json: async () => ({ cmd, now: env.now() }) });
+      assert.equal(await env.juno.pollOnce(), false);
+      assert.ok(env.juno.epoch() > epoch);
+      assert.equal(calls, 0);
+      assert.equal(env.cursor(), 0);
+      assert.equal(resultFor(env, cmd.id), undefined);
+    }
+  });
+
+  test("a failed polling-status write does not bypass mandatory cursor persistence", async () => {
+    const env = boot();
+    const cmd = command({ issued_at: env.now() });
+    const key = env.juno.cursorKey(env.store.deviceToken);
+    let calls = 0;
+    env.juno.HANDLERS.ping = () => { calls++; return {}; };
+    const set = env.chrome.storage.local.set;
+    env.chrome.storage.local.set = (changes) => changes.relayStatus
+      ? Promise.reject(new Error("synthetic UI-only storage failure"))
+      : Object.hasOwn(changes, key)
+        ? Promise.reject(new Error("synthetic mandatory cursor failure")) : set(changes);
+    env.fetchControl.fn = () => ({ ok: true, status: 200,
+      json: async () => ({ cmd, now: env.now() }) });
+    await assert.rejects(() => env.juno.pollOnce(), /synthetic mandatory cursor failure/);
+    await env.juno.drain();
+    assert.equal(calls, 0);
+    assert.equal(env.cursor(), 0);
+    assert.equal(resultFor(env, cmd.id), undefined);
+  });
+
   test("a failed connecting-status write does not stop authenticated delivery", async () => {
     const env = boot({ constants: { POLL_MS: 1 } });
     const set = env.chrome.storage.local.set;

@@ -1734,8 +1734,8 @@ function sendAck(seq, deviceToken, originSocket) {
 // longer matches, and takeAndRun returns without running it.
 let work = Promise.resolve();
 
-function schedule(cmd, relayNow, originToken = null, scheduledEpoch = controlEpoch, originSocket = null) {
-  const receivedAt = Date.now();
+function schedule(cmd, relayNow, originToken = null, scheduledEpoch = controlEpoch, originSocket = null,
+  receivedAt = Date.now()) {
   const run = work.then(() => takeAndRun(cmd, relayNow, receivedAt, scheduledEpoch, originToken, originSocket));
   work = run.catch((err) => {
     console.error("juno-bridge: command queue error", err && err.stack ? err.stack : err);
@@ -1926,7 +1926,8 @@ async function pollOnce() {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ token: state.deviceToken, after: state.cursor }), signal,
       });
-      return { res, payload: res.ok && res.status !== 204 ? await res.json() : null };
+      const receivedAt = Date.now();
+      return { res, receivedAt, payload: res.ok && res.status !== 204 ? await res.json() : null };
     });
   } catch (e) {
     if (!await deliveryCurrent(state.deviceToken, deliveryEpoch, state) || deliveryEpoch !== controlEpoch) return false;
@@ -1936,7 +1937,7 @@ async function pollOnce() {
   // An old request has no authority over the new pairing's status, cursor,
   // queue, or acknowledgements. Check before the first state write.
   if (!await deliveryCurrent(state.deviceToken, deliveryEpoch, state) || deliveryEpoch !== controlEpoch) return false;
-  const { res, payload } = response;
+  const { res, payload, receivedAt } = response;
   if (res.status === 401 || res.status === 403) {
     await setRelayState("rejected");
     throw new Error("relay rejected device token");
@@ -1945,11 +1946,13 @@ async function pollOnce() {
     await setRelayState("error");
     throw new Error("relay error " + res.status);
   }
-  await setRelayState("ok", "polling");
+  // UI evidence is best-effort. Recheck delivery authority after this await
+  // even if storage failed or a policy change landed while it was pending.
+  await setRelayState("ok", "polling").catch(() => {});
   const cmd = payload && payload.cmd;
   if (!cmd || typeof cmd.id !== "string") return false;
   if (!await deliveryCurrent(state.deviceToken, deliveryEpoch, state)) return false;
-  await schedule(cmd, payload.now, state.deviceToken, deliveryEpoch);
+  await schedule(cmd, payload.now, state.deviceToken, deliveryEpoch, null, receivedAt);
   return true;
 }
 

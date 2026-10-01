@@ -8,7 +8,18 @@ attach to the browser profile you use every day.
 The operator sends commands (navigate, snapshot, click, type, …). The relay
 pushes them to the extension over a WebSocket, and the extension runs them
 with `chrome.debugger`. Commands and results pass through the relay. This
-tree is extension v1.4.8.
+tree is extension v1.4.9.
+
+## Fixes in 1.4.9
+
+A failed write of the panel's polling connection status no longer prevents a
+received command from being delivered. Pairing, permission and pause checks
+still run after that write attempt, and command progress must still be saved
+before execution. This is an extension-only hardening change; the relay is
+unchanged.
+
+Polling carries the local HTTP receipt time through body parsing and status
+updates, so those waits count toward the command's two-minute execution limit.
 
 ## Fixes in 1.4.8
 
