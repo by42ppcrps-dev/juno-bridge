@@ -53,6 +53,7 @@ const SOCKET_SILENCE_MS = 50000; // nothing heard (not even a pong) → treat th
 const WS_MAX_MSG = 900 * 1024; // larger results go over HTTP
 const HTTP_FALLBACK_MS = 60000; // after a socket fails to open, poll over HTTP this long before retrying
 const POLL_MS = 2500;
+const RELAY_STATUS_REFRESH_MS = 10000;
 const MAX_BACKOFF_MS = 60000;
 const CMD_TIMEOUT_MS = 30000;
 const CMD_MAX_AGE_MS = 120000; // relay age at delivery + local wait, checked at execution
@@ -229,13 +230,17 @@ async function logActivity(entry) {
 /* ---------- relay status (shown in the side panel) ---------- */
 
 let lastRelayState = null;
+let lastRelayWriteAt = 0;
 
 // via: "live" (WebSocket push) or "polling" (HTTP fallback).
 async function setRelayState(state, via = null) {
   const key = state + "/" + via;
-  if (key === lastRelayState) return; // only write on change
+  const now = Date.now();
+  if (key === lastRelayState && now >= lastRelayWriteAt &&
+      now - lastRelayWriteAt < RELAY_STATUS_REFRESH_MS) return;
+  await chrome.storage.local.set({ relayStatus: { state, via, at: now } });
   lastRelayState = key;
-  await chrome.storage.local.set({ relayStatus: { state, via, at: Date.now() } });
+  lastRelayWriteAt = now;
 }
 
 /* ---------- debugger helpers ---------- */
@@ -1853,7 +1858,11 @@ async function runSocket(token, after) {
     ws.onmessage = (ev) => {
       if (finished || sessionEpoch !== controlEpoch || !acceptingCommands) return;
       lastHeard = Date.now();
-      if (ev.data === "pong" || typeof ev.data !== "string") return;
+      if (ev.data === "pong") {
+        if (identity.welcomed) setRelayState("ok", "live").catch(() => {});
+        return;
+      }
+      if (typeof ev.data !== "string") return;
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
       if (!msg || typeof msg !== "object") return;
@@ -2002,12 +2011,10 @@ async function loop() {
       if (!state.enabled || !state.deviceToken) break; // go dormant; restarted on toggle/register
 
       if (Date.now() >= pollUntil) {
+        await setRelayState("connecting").catch(() => {}); // UI evidence cannot stop delivery
+        if (loopEpoch !== controlEpoch) continue;
         const s = await runSocket(state.deviceToken, state.cursor);
         if (loopEpoch !== controlEpoch) continue;
-        if (s.welcomed) {
-          await retryAfter(500, loopEpoch); // closed after a good session: reconnect promptly
-          continue;
-        }
         if (s.rejected) {
           // Token revoked or relay wiped: keep backing off until the user re-pairs.
           await setRelayState("rejected");
@@ -2015,12 +2022,14 @@ async function loop() {
           await retryAfter(pollDelayMs(), loopEpoch);
           continue;
         }
-        if (s.opened) {
-          failStreak++; // connected but never welcomed: relay trouble
-          await retryAfter(pollDelayMs(), loopEpoch);
+        if (s.welcomed) {
+          await retryAfter(500, loopEpoch); // closed after a good session: reconnect promptly
           continue;
         }
-        pollUntil = Date.now() + HTTP_FALLBACK_MS; // socket unavailable: poll for a while
+        // A TCP/WebSocket connection without a welcome has no command
+        // authority. It must not prevent authenticated HTTP delivery while
+        // the next fresh-ticket socket attempt waits for its bounded window.
+        pollUntil = Date.now() + HTTP_FALLBACK_MS;
       }
 
       let worked = false;

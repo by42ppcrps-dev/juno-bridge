@@ -503,6 +503,63 @@ describe("relay", { concurrency: 1 }, () => {
     assert.equal(posted.data.ok, true);
   });
 
+  test("transport diagnostics distinguish delivery, cursor acknowledgement and result without secrets", async () => {
+    const { hub } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const { token } = await pairAndRegister(hub, "A");
+    const original = console.info;
+    const logs = [];
+    console.info = (...args) => { logs.push(args); };
+    const privateText = "synthetic-private-page-content";
+    try {
+      const enq = await read(await hub.fetch(admin("/admin/cmd", { method: "POST",
+        body: { action: "ping", device: token, params: { privateText } } })));
+      const delivered = await read(await hub.fetch(post("/poll", { token, after: 0 })));
+      await hub.fetch(post("/poll", { token, after: delivered.data.cmd.seq }));
+      await hub.fetch(post("/result", { token, id: enq.data.id, ok: true, data: { privateText } }));
+      const events = logs.filter(([prefix]) => prefix === "juno-bridge: transport").map(([, data]) => JSON.parse(data));
+      assert.equal(events.find((e) => e.phase === "command_admitted").id, enq.data.id);
+      assert.equal(events.find((e) => e.phase === "http_poll").returned_id, enq.data.id);
+      assert.equal(events.find((e) => e.phase === "queue_acknowledged").first_seq, delivered.data.cmd.seq);
+      assert.equal(events.find((e) => e.phase === "result_committed").id, enq.data.id);
+      const encoded = JSON.stringify(logs);
+      for (const secret of [token, PASSPHRASE, privateText]) assert.equal(encoded.includes(secret), false);
+      assert.ok(events.every((e) => e.device === token.slice(0, 8) && Number.isSafeInteger(e.at)));
+    } finally { console.info = original; }
+  });
+
+  test("an ahead cursor and invalid socket handshake produce bounded nonsecret diagnostics", async () => {
+    const { hub } = await bootHub({ ADMIN_PSK_SHA256: await sha256(PASSPHRASE) });
+    const { token } = await pairAndRegister(hub, "A");
+    const original = console.info;
+    const logs = [];
+    console.info = (...args) => { logs.push(args); };
+    try {
+      const enq = await read(await hub.fetch(admin("/admin/cmd", { method: "POST",
+        body: { action: "ping", device: token, params: {} } })));
+      const admitted = JSON.parse(logs.find(([prefix]) => prefix === "juno-bridge: transport")[1]);
+      const poll = await hub.fetch(post("/poll", { token, after: admitted.seq + 1 }));
+      assert.equal(poll.status, 204);
+      const ws = await read(await hub.fetch(new Request("https://relay.test/ws?token=" + token, {
+        headers: { Upgrade: "websocket", Origin: "chrome-extension://" + "a".repeat(32) },
+      })));
+      assert.equal(ws.status, 403);
+      assert.equal(ws.data.error, "bad_or_expired_ticket");
+      const events = logs.map(([, data]) => JSON.parse(data));
+      const acknowledged = events.find((e) => e.phase === "queue_acknowledged");
+      assert.equal(acknowledged.first_id, enq.data.id);
+      assert.ok(acknowledged.after > acknowledged.first_seq);
+      const empty = events.find((e) => e.phase === "http_poll");
+      assert.equal(empty.first_pending_id, enq.data.id);
+      assert.equal(empty.returned_id, null);
+      assert.equal(events.some((e) => e.phase === "result_committed"), false);
+      const rejected = events.find((e) => e.phase === "ws_rejected");
+      assert.equal(rejected.reason, "invalid_handshake");
+      assert.equal(rejected.origin, "chrome-extension://" + "a".repeat(32));
+      assert.equal(rejected.query_present, true);
+      assert.equal(JSON.stringify(logs).includes(token), false);
+    } finally { console.info = original; }
+  });
+
   test("ownership survives acknowledgement and a hub reload", async () => {
     const env = { ADMIN_PSK_SHA256: await sha256(PASSPHRASE) };
     const storage = new MemoryStorage();

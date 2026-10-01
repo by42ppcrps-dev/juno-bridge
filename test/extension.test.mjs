@@ -3356,4 +3356,183 @@ describe("extension audit regressions", { concurrency: 1 }, () => {
     assert.equal(result.welcomed, false);
     assert.equal(ws.readyState, MockWebSocket.CLOSED);
   });
+
+  test("an opened socket without a welcome falls back to polling and delivers a fresh command", async () => {
+    const env = boot({ timeouts: { SOCKET_WELCOME_TIMEOUT_MS: 10 },
+      constants: { POLL_MS: 1, HTTP_FALLBACK_MS: 1000 } });
+    const cmd = command({ issued_at: env.now() });
+    let calls = 0;
+    let polls = 0;
+    env.juno.HANDLERS.ping = () => { calls++; return { delivered: true }; };
+    env.fetchControl.fn = (url) => {
+      if (url.endsWith("/ws-ticket")) return { ok: true, status: 200,
+        json: async () => ({ ticket: "cd".repeat(32) }) };
+      if (url.endsWith("/poll")) {
+        polls++;
+        if (polls > 1) return { ok: true, status: 204 };
+        return { ok: true, status: 200, json: async () => ({ cmd, now: env.now() }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    };
+    const pending = env.juno.loop();
+    try {
+      await until(() => calls === 1);
+      assert.ok(polls >= 1);
+      assert.equal(resultFor(env, cmd.id).ok, true);
+    } finally {
+      await env.chrome.storage.local.set({ enabled: false });
+      env.juno.kick();
+      await pending;
+    }
+  });
+
+  test("a failed welcome after a previous HTTP window does not strand polling", async () => {
+    const env = boot({ timeouts: { SOCKET_WELCOME_TIMEOUT_MS: 10 },
+      constants: { POLL_MS: 1, HTTP_FALLBACK_MS: 100 } });
+    let tickets = 0;
+    let polls = 0;
+    env.fetchControl.fn = (url) => {
+      if (url.endsWith("/ws-ticket")) {
+        tickets++;
+        return tickets === 1 ? { ok: false, status: 404 } : { ok: true, status: 200,
+          json: async () => ({ ticket: "cd".repeat(32) }) };
+      }
+      assert.ok(url.endsWith("/poll"));
+      polls++;
+      return { ok: true, status: 204 };
+    };
+    const pending = env.juno.loop();
+    try {
+      await until(() => polls >= 1);
+      env.setClock(env.now() + 100);
+      await until(() => tickets === 2);
+      const before = polls;
+      await until(() => polls > before);
+      assert.equal(tickets, 2, "retry remains bounded by a new HTTP window");
+      assert.equal(env.store.relayStatus.via, "polling");
+    } finally {
+      await env.chrome.storage.local.set({ enabled: false });
+      env.juno.kick();
+      await pending;
+    }
+  });
+
+  for (const rejection of ["ticket", "unknown_device", "closed4003"]) {
+    test(`${rejection} rejection never falls back to polling`, async () => {
+      const env = boot({ constants: { POLL_MS: 60000 } });
+      let polls = 0;
+      let tickets = 0;
+      env.fetchControl.fn = (url) => {
+        if (url.endsWith("/poll")) { polls++; return { ok: true, status: 204 }; }
+        tickets++;
+        return rejection === "ticket" ? { ok: false, status: 403 } :
+          { ok: true, status: 200, json: async () => ({ ticket: "cd".repeat(32) }) };
+      };
+      const previous = MockWebSocket.latest;
+      const pending = env.juno.loop();
+      try {
+        if (rejection !== "ticket") {
+          await until(() => MockWebSocket.latest !== previous);
+          const ws = MockWebSocket.latest;
+          await tick();
+          ws.onmessage({ data: JSON.stringify({ type: "welcome" }) });
+          if (rejection === "unknown_device") ws.onmessage({ data: JSON.stringify({ type: "error", error: "unknown_device" }) });
+          else ws.close(4003, "rejected");
+        }
+        await until(() => env.store.relayStatus?.state === "rejected");
+        assert.equal(tickets, 1);
+        assert.equal(polls, 0);
+      } finally {
+        await env.chrome.storage.local.set({ enabled: false });
+        env.juno.kick();
+        await pending;
+      }
+    });
+  }
+
+  test("empty successful polls refresh connection evidence without writing every tick", async () => {
+    const env = boot();
+    env.fetchControl.fn = () => ({ ok: true, status: 204 });
+    await env.juno.pollOnce();
+    const first = env.store.relayStatus;
+    env.setClock(env.now() + 1000);
+    await env.juno.pollOnce();
+    assert.equal(env.store.relayStatus, first);
+    env.setClock(env.now() + 11000);
+    await env.juno.pollOnce();
+    assert.equal(env.store.relayStatus.at, env.now());
+    assert.equal(env.store.relayStatus.via, "polling");
+  });
+
+  test("only a current welcomed socket's heartbeat refreshes live connection evidence", async () => {
+    const env = boot();
+    const previous = MockWebSocket.latest;
+    const pending = env.juno.runSocket(env.store.deviceToken, 0);
+    await until(() => MockWebSocket.latest !== previous);
+    const ws = MockWebSocket.latest;
+    try {
+      await tick();
+      ws.onmessage({ data: "pong" });
+      assert.equal(env.store.relayStatus, undefined);
+      ws.onmessage({ data: JSON.stringify({ type: "welcome" }) });
+      await tick();
+      const first = env.store.relayStatus;
+      env.setClock(env.now() + 11000);
+      ws.onmessage({ data: "pong" });
+      await tick();
+      assert.equal(env.store.relayStatus.at, env.now());
+      assert.equal(env.store.relayStatus.via, "live");
+      assert.notEqual(env.store.relayStatus, first);
+      await env.chrome.storage.local.set({ deviceToken: "ef".repeat(32), relayStatus: { state: "new pairing" } });
+      ws.onmessage({ data: "pong" });
+      await tick();
+      assert.equal(env.store.relayStatus.state, "new pairing");
+    } finally { ws.close(); await pending; }
+  });
+
+  test("a policy change during connecting status does not mint an old-session ticket", async () => {
+    const env = boot();
+    const set = env.chrome.storage.local.set;
+    let release;
+    env.chrome.storage.local.set = (changes) => {
+      if (changes.relayStatus?.state === "connecting") return new Promise((resolve) => { release = resolve; });
+      return set(changes);
+    };
+    const pending = env.juno.loop();
+    try {
+      await until(() => !!release);
+      await env.chrome.storage.local.set({ enabled: false });
+      release();
+      await pending;
+      assert.equal(env.fetches.length, 0);
+    } finally { if (release) release(); }
+  });
+
+  test("a failed connecting-status write does not stop authenticated delivery", async () => {
+    const env = boot({ constants: { POLL_MS: 1 } });
+    const set = env.chrome.storage.local.set;
+    env.chrome.storage.local.set = (changes) => changes.relayStatus?.state === "connecting"
+      ? Promise.reject(new Error("synthetic metadata write failure")) : set(changes);
+    const cmd = command({ issued_at: env.now() });
+    let calls = 0;
+    let polls = 0;
+    env.juno.HANDLERS.ping = () => { calls++; return {}; };
+    env.fetchControl.fn = (url) => {
+      if (url.endsWith("/ws-ticket")) return { ok: false, status: 404 };
+      if (url.endsWith("/poll")) return ++polls === 1
+        ? { ok: true, status: 200, json: async () => ({ cmd, now: env.now() }) }
+        : { ok: true, status: 204 };
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    };
+    const pending = env.juno.loop();
+    try {
+      await until(() => calls === 1);
+      assert.ok(env.fetches.some((entry) => entry.url.endsWith("/ws-ticket")));
+      assert.equal(resultFor(env, cmd.id).ok, true);
+    } finally {
+      await env.chrome.storage.local.set({ enabled: false });
+      env.juno.kick();
+      await pending;
+    }
+  });
 });

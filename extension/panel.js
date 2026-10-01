@@ -7,6 +7,7 @@ const optionsBtn = document.getElementById("optionsBtn");
 const meta = document.getElementById("meta");
 const logList = document.getElementById("log");
 const emptyLog = document.getElementById("emptyLog");
+const RELAY_STATUS_MAX_AGE_MS = 60000;
 
 function fmtTime(t) {
   return new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -15,7 +16,7 @@ function fmtTime(t) {
 // What the background worker last heard from the relay.
 const RELAY_STATES = {
   ok: ["dot", "Active — connected, listening for Juno's commands."],
-  "ok/live": ["dot", "Active — live connection, commands arrive instantly."],
+  "ok/live": ["dot", "Active — live connection, listening for Juno's commands."],
   "ok/polling": ["dot", "Active — connected by polling (live connection unavailable)."],
   unreachable: ["dot warn", "Active, but the relay is unreachable — retrying."],
   error: ["dot warn", "Active, but the relay is returning errors — retrying."],
@@ -39,8 +40,12 @@ async function refresh() {
     toggleBtn.className = "primary";
   } else {
     const rs = s.relayStatus || {};
-    const [cls, text] = RELAY_STATES[rs.state + "/" + rs.via] || RELAY_STATES[rs.state] ||
-      ["dot warn", "Active — connecting to the relay…"];
+    const age = Date.now() - rs.at;
+    const stale = rs.state === "ok" && (!Number.isFinite(rs.at) || age < 0 || age > RELAY_STATUS_MAX_AGE_MS);
+    const [cls, text] = stale
+      ? ["dot warn", "Active — connection has not been confirmed recently."]
+      : RELAY_STATES[rs.state + "/" + rs.via] || RELAY_STATES[rs.state] ||
+        ["dot warn", "Active — connecting to the relay…"];
     dot.className = cls;
     statusText.textContent = text;
     toggleBtn.hidden = false;
@@ -93,3 +98,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local") refresh();
 });
 refresh();
+// A killed worker cannot produce a storage change to invalidate its last
+// successful connection. Age that evidence while this panel remains open.
+setInterval(refresh, 10000);

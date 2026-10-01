@@ -245,6 +245,17 @@ function waitSeconds(raw, fallback) {
   return Number.isFinite(n) ? Math.min(Math.max(n, 0), WAIT_MAX_S) : fallback;
 }
 
+// Control-plane evidence only: no tokens, tickets, request headers, command
+// parameters, page content or result payloads. Logging cannot block delivery.
+function transportLog(phase, fields) {
+  try { console.info("juno-bridge: transport", JSON.stringify({ phase, at: Date.now(), ...fields })); }
+  catch { /* diagnostics are best-effort */ }
+}
+
+function publicExtensionOrigin(origin) {
+  return /^chrome-extension:\/\/[a-p]{32}$/.test(origin || "") ? origin : origin ? "other" : null;
+}
+
 /* ---------- entry point: thin front door, everything else in the hub ---------- */
 
 export default {
@@ -534,6 +545,7 @@ export class BridgeHub {
       await this.commit(writes);
       this.queues.set(token, next); this.owners.set(cmd.id, owner);
       if (key) { this.idem.set(key, entry); this.idemByCmd.set(cmd.id, key); }
+      transportLog("command_admitted", { device: token.slice(0, 8), id: cmd.id, seq: cmd.seq });
       this.push(token, [cmd]);
       return { cmd, duplicate: false, idemKey: key };
     });
@@ -547,9 +559,12 @@ export class BridgeHub {
       if (!q) return;
       const items = q.items.filter((c) => c.seq > seq);
       if (items.length === q.items.length) return;
+      const removed = q.items.filter((c) => c.seq <= seq);
       const next = { last: q.last, items };
       await this.commit({ ["queue:" + token]: next });
       this.queues.set(token, next);
+      transportLog("queue_acknowledged", { device: token.slice(0, 8), after: seq,
+        removed_count: removed.length, first_id: removed[0].id, first_seq: removed[0].seq });
     });
   }
 
@@ -619,6 +634,7 @@ export class BridgeHub {
       // Visibility, done receipts, waiters and socket acknowledgements follow commit.
       this.payloads.set(id, meta); this.results.set(id, primary); this.owners.set(id, completed);
       if (replay) this.idem.set(key, replay);
+      transportLog("result_committed", { device: token.slice(0, 8), id, ok: parsed.ok });
       this.wake(this.waiters, id); if (key) this.wake(this.idemWaiters, key);
       return { ok: true };
     });
@@ -884,24 +900,31 @@ export class BridgeHub {
 
     // ---- device: live WebSocket (the fast path) ----
     if (path === "/ws") {
-      if ((req.headers.get("upgrade") || "").toLowerCase() !== "websocket") {
-        return json({ error: "expected_websocket" }, 426);
-      }
-      // Browsers always send Origin on WebSockets; only extensions may connect.
-      if (origin && !origin.startsWith("chrome-extension://")) return json({ error: "forbidden_origin" }, 403);
       const protocols = (req.headers.get("sec-websocket-protocol") || "").split(",").map((v) => v.trim());
       const offered = protocols.filter((v) => /^juno-ticket\.[0-9a-f]{64}$/.test(v));
-      if (url.search || !protocols.includes("juno-bridge-v1") || offered.length !== 1) return json({ error: "bad_or_expired_ticket" }, 403);
+      const rejectSocket = (error, reason, status = 403) => {
+        transportLog("ws_rejected", { error, reason, origin: publicExtensionOrigin(origin),
+          juno_protocol_offered: protocols.includes("juno-bridge-v1"),
+          valid_ticket_protocol_count: offered.length, query_present: !!url.search });
+        return json({ error }, status);
+      };
+      if ((req.headers.get("upgrade") || "").toLowerCase() !== "websocket") {
+        return rejectSocket("expected_websocket", "missing_upgrade", 426);
+      }
+      // Browsers always send Origin on WebSockets; only extensions may connect.
+      if (origin && !origin.startsWith("chrome-extension://")) return rejectSocket("forbidden_origin", "non_extension_origin");
+      if (url.search || !protocols.includes("juno-bridge-v1") || offered.length !== 1) return rejectSocket("bad_or_expired_ticket", "invalid_handshake");
       return this.mutate(async () => {
         await this.purgeExpired();
         const key = offered[0].slice("juno-ticket.".length), ticket = this.tickets.get(key);
-        if (!ticket || ticket.expires <= Date.now() || !this.devices.has(ticket.token) || (ticket.origin && ticket.origin !== origin)) return json({ error: "bad_or_expired_ticket" }, 403);
+        if (!ticket || ticket.expires <= Date.now() || !this.devices.has(ticket.token)) return rejectSocket("bad_or_expired_ticket", "missing_or_expired_ticket");
+        if (ticket.origin && ticket.origin !== origin) return rejectSocket("bad_or_expired_ticket", "origin_mismatch");
         const own = this.socketsFor(ticket.token);
         const active = this.ctx.getWebSockets().filter((ws) => {
           const a = ws.deserializeAttachment();
           return a?.token && this.devices.has(a.token) && (ws.readyState === undefined ? !ws.closed : ws.readyState === 1);
         });
-        if (active.length - own.length >= MAX_SOCKETS) return json({ error: "too_many_sockets" }, 503);
+        if (active.length - own.length >= MAX_SOCKETS) return rejectSocket("too_many_sockets", "socket_capacity", 503);
         // Single use is durable BEFORE WebSocketPair construction or acceptance.
         await this.commit({}, ["ticket:" + key]); this.tickets.delete(key);
         for (const other of own) try { other.close(4000, "replaced"); } catch { /* closing */ }
@@ -961,6 +984,7 @@ export class BridgeHub {
         await this.commit({ ["ticket:" + ticket]: entry }, prior.map((k) => "ticket:" + k));
         for (const k of prior) this.tickets.delete(k);
         this.tickets.set(ticket, entry);
+        transportLog("ws_ticket_issued", { device: d.token.slice(0, 8), origin: publicExtensionOrigin(origin) });
         return json({ ticket, expires_in: TICKET_TTL_MS / 1000 });
       });
     }
@@ -1091,15 +1115,23 @@ export class BridgeHub {
     if (path === "/poll" && req.method === "POST") {
       const d = requireDevice();
       if (d.err) return d.err;
+      const before = this.pending(d.token)[0];
       if (typeof body.after === "number") {
         // Cursor mode: `after` doubles as the acknowledgement.
         await this.ack(d.token, body.after);
         const cmd = this.pending(d.token)[0];
+        transportLog("http_poll", { device: d.token.slice(0, 8),
+          after: Number.isSafeInteger(body.after) && body.after >= 0 ? body.after : null,
+          first_pending_id: before?.id || null, first_pending_seq: before?.seq ?? null,
+          returned_id: cmd?.id || null, returned_seq: cmd?.seq ?? null, status: cmd ? 200 : 204 });
         if (!cmd) return new Response(null, { status: 204, headers: cors });
         return json({ cmd, now: Date.now() });
       }
       // Legacy destructive dequeue for extensions that don't send `after`.
       const cmd = await this.legacyPoll(d.token);
+      transportLog("http_poll", { device: d.token.slice(0, 8), after: null,
+        first_pending_id: before?.id || null, first_pending_seq: before?.seq ?? null,
+        returned_id: cmd?.id || null, returned_seq: cmd?.seq ?? null, status: cmd ? 200 : 204 });
       if (!cmd) return new Response(null, { status: 204, headers: cors });
       return json({ cmd, now: Date.now() });
     }

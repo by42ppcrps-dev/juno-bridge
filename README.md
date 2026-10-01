@@ -8,7 +8,25 @@ attach to the browser profile you use every day.
 The operator sends commands (navigate, snapshot, click, type, …). The relay
 pushes them to the extension over a WebSocket, and the extension runs them
 with `chrome.debugger`. Commands and results pass through the relay. This
-tree is extension v1.4.7.
+tree is extension v1.4.8.
+
+## Fixes in 1.4.8
+
+An opened WebSocket that never receives its authenticated welcome now uses
+HTTP polling for a bounded minute before trying a fresh ticket. Explicit
+device rejection still stops delivery. This fixes a reproduced recovery gap;
+it does not establish why a particular live browser failed to respond.
+
+The panel's connection message now ages out after a minute without recent
+relay confirmation. Successful empty polls and welcomed socket heartbeats
+refresh that evidence without writing storage on every poll. Reconnecting
+clears the previous success message.
+
+Relay transport diagnostics record public device prefixes, command IDs,
+numeric queue cursors, receipt times and fixed handshake error codes. They
+exclude credentials, tickets, command parameters, page content and result
+payloads. A queue acknowledgment confirms progress in delivery, not that an
+action executed; a committed result supplies that separate evidence.
 
 ## What the safeguards actually do
 
