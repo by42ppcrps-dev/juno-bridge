@@ -588,12 +588,22 @@ function snapshotSource(mode, snapshotId) {
     if (type) item.inputType = type;
     if (secret) item.redacted = true;
     if (el.disabled) item.disabled = true;
+    const states = {};
+    for (const state of ['expanded', 'pressed', 'checked', 'selected']) {
+      const value = el.getAttribute('aria-' + state);
+      if (value === 'true' || value === 'false') states[state] = value === 'true';
+    }
+    if ((type === 'checkbox' || type === 'radio') && states.checked === undefined) states.checked = el.checked === true;
+    if (Object.keys(states).length) item.states = states;
     els.push(item);
     if (storing && hold) hold.nodes.push(el);
   }
   const result = { title: document.title, url: location.href,
     viewport: { w: vw, h: vh }, scroll: { x: Math.round(scrollX), y: Math.round(scrollY) },
-    elements: els };
+    elements: els, diagnostics: {
+      visibility: document.visibilityState === 'visible' ? 'visible' : document.visibilityState === 'hidden' ? 'hidden' : 'unknown',
+      focused: typeof document.hasFocus === 'function' ? document.hasFocus() === true : null,
+    } };
   if (hold && hold.snapshot) result.snapshot = hold.snapshot;
   if (hold && hold.key) result.doc = hold.key;
   return result;
@@ -631,7 +641,10 @@ function pageTextExpression() {
   // part of innerText; secrets rendered as text still are.
   return `(() => { const t = document.body ? document.body.innerText : '';
         return { title: document.title, url: location.href, length: t.length,
-          text: t.slice(0, ${TEXT_CAP}), truncated: t.length > ${TEXT_CAP} }; })()`;
+          text: t.slice(0, ${TEXT_CAP}), truncated: t.length > ${TEXT_CAP}, diagnostics: {
+            visibility: document.visibilityState === 'visible' ? 'visible' : document.visibilityState === 'hidden' ? 'hidden' : 'unknown',
+            focused: typeof document.hasFocus === 'function' ? document.hasFocus() === true : null,
+          } }; })()`;
 }
 
 function refuseDrifted(verb, auth, pageUrl) {
@@ -865,7 +878,11 @@ function readyExpression(ready, inheritedSnapshot) {
     const needle = JSON.stringify(ready.text);
     return `(() => { const t = document.body ? document.body.innerText : ""; return t.includes(${needle}); })()`;
   }
-  if (ready.type === "element_visible" || ready.type === "element_enabled") {
+  if (ready.type === "element_visible" || ready.type === "element_enabled" || ready.type === "element_state") {
+    if (ready.type === "element_state" &&
+        (!["expanded", "pressed", "checked", "selected"].includes(ready.state) || typeof ready.value !== "boolean")) {
+      throw new Error("ready: element_state requires a supported state and boolean value");
+    }
     if (typeof ready.ref !== "string" || !REF_RE.test(ready.ref)) throw new Error("ready: ref required");
     const snapshotId = readySnapshotId(ready, inheritedSnapshot);
     if (typeof snapshotId !== "string" || !SNAPSHOT_ID_RE.test(snapshotId)) {
@@ -877,6 +894,12 @@ function readyExpression(ready, inheritedSnapshot) {
     const refJson = JSON.stringify(ready.ref);
     const snapJson = JSON.stringify(snapshotId);
     const enabled = ready.type === "element_enabled" ? "if (el.disabled) return false;" : "";
+    const stateCheck = ready.type === "element_state" ? `
+      const raw = el.getAttribute('aria-' + ${JSON.stringify(ready.state)});
+      let state = raw === 'true' ? true : raw === 'false' ? false : null;
+      if (state === null && ${JSON.stringify(ready.state)} === 'checked' &&
+          ['checkbox', 'radio'].includes((el.getAttribute('type') || '').toLowerCase())) state = el.checked === true;
+      return state === ${ready.value};` : "";
     return `(() => {
       const hold = globalThis.__junoHold;
       if (!hold || hold.snapshot !== ${snapJson} || !Array.isArray(hold.nodes)) return false;
@@ -884,6 +907,7 @@ function readyExpression(ready, inheritedSnapshot) {
       if (!m) return false;
       const el = hold.nodes[Number(m[1]) - 1];
       if (!el || el.isConnected === false) return false;
+      ${stateCheck}
       const r = el.getBoundingClientRect();
       const inView = r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
       if (!inView) return false;
@@ -912,12 +936,13 @@ function validateAfter(after, inheritedSnapshot) {
     throw new Error("after: observe must be snapshot or text");
   }
   if (after.ready !== undefined) validateReady(after.ready, inheritedSnapshot);
+  if (after.effect !== undefined) validateReady(after.effect, inheritedSnapshot);
 }
 
 function elementReadySnapshot(after) {
-  const ready = after && after.ready;
-  if (!ready || (ready.type !== "element_visible" && ready.type !== "element_enabled")) return null;
-  return ready.snapshot || null;
+  const conditions = after ? [after.ready, after.effect] : [];
+  const ready = conditions.find(condition => condition && condition.type.startsWith("element_"));
+  return ready && ready.snapshot || null;
 }
 
 function installHoldSource(snapshotId, docKey, url) {
@@ -1021,13 +1046,25 @@ async function bindSnapshot(auth, snapshotId) {
 // Element readiness names a ref. Confirm that node is still the captured one
 // before any input. Visibility after the action stays in waitReady.
 async function requireReadyTarget(auth, after) {
-  const snapshotId = elementReadySnapshot(after);
-  if (!snapshotId) return;
-  await bindSnapshot(auth, snapshotId);
-  const ref = after.ready.ref;
-  const found = await evaluate(auth, resolveRefExpression(ref, snapshotId));
-  if (found && found.stale) throw new Error(`${auth.verb}: snapshot is stale`);
-  if (!found || found.ok !== true) throw new Error(`${auth.verb}: element ${ref} is gone`);
+  for (const condition of after ? [after.ready, after.effect] : []) {
+    if (!condition || !condition.type.startsWith("element_")) continue;
+    const snapshotId = readySnapshotId(condition, auth.snapshot);
+    await bindSnapshot(auth, snapshotId);
+    const found = await evaluate(auth, resolveRefExpression(condition.ref, snapshotId));
+    if (found && found.stale) throw new Error(`${auth.verb}: snapshot is stale`);
+    if (!found || found.ok !== true) throw new Error(`${auth.verb}: element ${condition.ref} is gone`);
+  }
+}
+
+async function captureEffectBefore(auth, after) {
+  auth.effectBefore = null;
+  if (!after || !after.effect) return;
+  if (after.effect.type.startsWith("element_")) {
+    const found = await evaluate(auth, resolveRefExpression(after.effect.ref, readySnapshotId(after.effect, auth.snapshot)));
+    if (found && found.stale) throw new Error(`${auth.verb}: snapshot is stale`);
+    if (!found || found.ok !== true) throw new Error(`${auth.verb}: effect target is gone`);
+  }
+  auth.effectBefore = (await evaluate(auth, readyExpression(after.effect, auth.snapshot))) === true;
 }
 
 async function waitReady(auth, ready, inheritedSnapshot) {
@@ -1082,6 +1119,21 @@ function observationNeedsCapture(observation) {
 async function collectAfter(auth, after, retainSnapshotNow) {
   validateAfter(after, auth.snapshot);
   if (after.ready) await waitReady(auth, after.ready, auth.snapshot);
+  let effect;
+  if (after.effect) {
+    try {
+      await waitReady(auth, after.effect, auth.snapshot);
+      effect = { before: auth.effectBefore, satisfied: true,
+        transitionObserved: auth.effectBefore === false,
+        status: auth.effectBefore === false ? "observed_transition" : "already_satisfied" };
+    } catch (error) {
+      if (error.report && error.report.status === "unobserved") {
+        error.report.effect = { before: auth.effectBefore, satisfied: false, transitionObserved: false, status: "unobserved" };
+      }
+      throw error;
+    }
+  }
+  const evidence = effect ? { effect } : {};
   const href = await readDocumentUrl(auth);
   if (href !== auth.url) {
     throw new Error(`${auth.verb}: tab navigated away from the authorized page`);
@@ -1089,16 +1141,16 @@ async function collectAfter(auth, after, retainSnapshotNow) {
   if (after.observe === "snapshot") {
     // Retaining replaces every other id for this document. A later step that
     // still names the snapshot this workflow started with must run first.
-    if (retainSnapshotNow) return retainObservedSnapshot(auth);
+    if (retainSnapshotNow) return { ...await retainObservedSnapshot(auth), ...evidence };
     const snap = await evaluate(auth, snapshotSource("ephemeral"));
     refuseDrifted(auth.verb, auth, snap && snap.url);
     if (!snap || typeof snap !== "object") throw new Error(`${auth.verb}: snapshot failed`);
-    return { observe: "snapshot", observed: true, ...snap, redaction: "heuristic" };
+    return { observe: "snapshot", observed: true, ...snap, redaction: "heuristic", ...evidence };
   }
   const page = await evaluate(auth, pageTextExpression());
   refuseDrifted(auth.verb, auth, page && page.url);
   if (!page || typeof page !== "object") throw new Error(`${auth.verb}: text failed`);
-  return { observe: "text", observed: true, ...page, redaction: "none" };
+  return { observe: "text", observed: true, ...page, redaction: "none", ...evidence };
 }
 
 async function clickAt(auth, x, y, beforePress) {
@@ -1165,6 +1217,7 @@ async function cmdClick(params, state, ctx, epoch) {
   // deliver the press and release. An event already sent cannot be undone.
   return await withDebugger(auth, async () => {
     await requireReadyTarget(auth, params && params.after);
+    await captureEffectBefore(auth, params && params.after);
     await clickAt(auth, x, y);
     if (!params || !params.after) return { tabId: auth.tabId, x, y };
     const observation = await collectAfter(auth, params.after, true);
@@ -1179,6 +1232,7 @@ async function cmdType(params, state, ctx, epoch) {
   if (typeof text !== "string" || !text) throw new Error("type: missing text");
   return await withDebugger(auth, async () => {
     await requireReadyTarget(auth, params && params.after);
+    await captureEffectBefore(auth, params && params.after);
     await cdp(auth, "Input.insertText", { text }, { dispatch: true });
     if (!params || !params.after) return { tabId: auth.tabId, chars: text.length };
     const observation = await collectAfter(auth, params.after, true);
@@ -1199,6 +1253,7 @@ async function cmdKey(params, state, ctx, epoch) {
   };
   return await withDebugger(auth, async () => {
     await requireReadyTarget(auth, params && params.after);
+    await captureEffectBefore(auth, params && params.after);
     await cdp(auth, "Input.dispatchKeyEvent", def.text
       ? { ...base, type: "keyDown", text: def.text, unmodifiedText: def.text }
       : { ...base, type: "rawKeyDown" }, { dispatch: true });
@@ -1222,6 +1277,7 @@ async function cmdScroll(params, state, ctx, epoch) {
   const atPoint = Number.isFinite(params.x) && Number.isFinite(params.y);
   return await withDebugger(auth, async () => {
     await requireReadyTarget(auth, params && params.after);
+    await captureEffectBefore(auth, params && params.after);
     if (atPoint) {
       await cdp(auth, "Input.dispatchMouseEvent", {
         type: "mouseWheel", x: params.x, y: params.y, deltaX: dx, deltaY: dy,
@@ -1242,8 +1298,8 @@ const STEP_OPS = new Set(["click", "type", "key", "scroll", "snapshot", "text", 
 function stepNeedsSnapshot(step) {
   if (!step || typeof step !== "object") return false;
   if (step.op === "click") return true;
-  const ready = step.op === "wait" ? step.ready : step.after && step.after.ready;
-  return !!ready && (ready.type === "element_visible" || ready.type === "element_enabled");
+  const conditions = step.op === "wait" ? [step.ready] : step.after ? [step.after.ready, step.after.effect] : [];
+  return conditions.some(ready => ready && ready.type.startsWith("element_"));
 }
 
 function validateStep(step, inheritedSnapshot) {
@@ -1276,7 +1332,12 @@ function validateStep(step, inheritedSnapshot) {
     }
   }
   if (step.op === "wait") validateReady(step.ready, inheritedSnapshot);
-  if (step.after !== undefined) validateAfter(step.after, inheritedSnapshot);
+  if (step.after !== undefined) {
+    validateAfter(step.after, inheritedSnapshot);
+    if (step.after && step.after.effect && !["click", "type", "key", "scroll"].includes(step.op)) {
+      throw new Error("workflow: effect requires an input step");
+    }
+  }
 }
 
 function validateWorkflow(params) {
@@ -1332,6 +1393,7 @@ async function assertSameDocument(auth) {
 }
 
 async function runStep(auth, step, ctx, retainSnapshotNow) {
+  await captureEffectBefore(auth, step.after);
   if (step.op === "click") {
     const found = await evaluate(auth, resolveRefExpression(step.ref, auth.snapshot));
     if (found && found.stale) throw new Error("workflow: snapshot is stale");
@@ -1473,6 +1535,7 @@ async function cmdWorkflow(params, state, ctx, epoch) {
           if (out && out.observation) {
             bag.observation = out.observation;
             bag.observed = true;
+            if (out.observation.effect) bag.steps[i].effect = out.observation.effect;
           }
         } catch (e) {
           const dispatchedNow = !!(control && control.dispatched);
@@ -1485,6 +1548,7 @@ async function cmdWorkflow(params, state, ctx, epoch) {
           else status = "failed";
           bag.steps[i].status = status === "unobserved" ? "failed" : status;
           bag.steps[i].error = errMsg(e).slice(0, 300);
+          if (e && e.report && e.report.effect) bag.steps[i].effect = e.report.effect;
           markUnstarted(bag.steps, i + 1);
           if (e && e.report && e.report.status === "unobserved") {
             throw workflowError(errMsg(e), workflowReport(bag, "unobserved", control));
@@ -1495,7 +1559,9 @@ async function cmdWorkflow(params, state, ctx, epoch) {
       // The steps that needed the starting snapshot have finished. The view
       // this workflow returns is a new capture, not that id stamped onto new elements.
       if (observationNeedsCapture(bag.observation)) {
+        const effect = bag.observation.effect;
         bag.observation = await retainObservedSnapshot(auth);
+        if (effect) bag.observation.effect = effect;
         bag.observed = true;
       }
       return {

@@ -8,7 +8,52 @@ attach to the browser profile you use every day.
 The operator sends commands (navigate, snapshot, click, type, …). The relay
 pushes them to the extension over a WebSocket, and the extension runs them
 with `chrome.debugger`. Commands and results pass through the relay. This
-tree is extension v1.4.9.
+tree is extension v1.4.10.
+
+## Performance and effect evidence in 1.4.10
+
+Every authorization guard still reads current policy from storage. Those reads
+no longer repeat cursor migration checks; mandatory command cursor migration
+and persistence still happen before execution. Node identity binding and
+restoration overlap at most four read-only CDP calls. Each retains its existing
+policy, tab and document guards; mutations remain sequential.
+
+The operator may reuse the static `juno-run-v1` route contract for an explicit
+hexadecimal device selector for 30 seconds, with at most 32 entries. Default
+selection always uses a fresh device list. No permissions, pairing validity,
+connection state, or default choice are cached. `/admin/run/v1` requires a
+valid `request_id` and uses the durable idempotency receipt. An unavailable
+versioned route stops the call without a fallback enqueue. Legacy relays keep
+the previous negotiation path. Update an already running operator with
+`python3 driver/jb.py operator stop` before using the new local cache.
+
+Snapshot and text observations include `diagnostics.visibility` (`visible`,
+`hidden`, or `unknown`) and `diagnostics.focused` (boolean or null). Snapshot
+elements may include boolean `states.expanded`, `pressed`, `checked`, or
+`selected`; arbitrary attribute values are excluded. Diagnostics never activate
+a tab or focus a window.
+
+An input's optional `after.effect` uses the same typed conditions as `ready`,
+including `element_state` with a captured `ref`, one of those four state names,
+and a boolean `value`. Single input commands include the captured `snapshot`
+in element conditions; workflow conditions inherit the starting snapshot.
+The executor reads the predicate before the requested input, dispatches that
+input once, then waits within its bounded budget. Evidence in
+`observation.effect` and workflow step `effect` distinguishes
+`observed_transition` (false before, true at the subsequent check) from
+`already_satisfied` (true before). This is observed state evidence, not proof
+that the input caused a change or that the state persists. An explicit request
+is still dispatched once even when the predicate was already true. Choose a
+specific effect such as a new counter value rather than generic existing text.
+
+A missing effect produces `unobserved` and stops later workflow steps. A
+missing/stale effect target before input refuses dispatch. No failed effect,
+focus diagnostic, or uncertain input automatically causes another click.
+Existing `after.ready` behavior is preserved.
+
+```json
+{"tabId":123456,"snapshot":"snap_0123456789abcdef0123456789abcdef","steps":[{"op":"click","ref":"e1","after":{"observe":"snapshot","effect":{"type":"element_state","ref":"e1","state":"expanded","value":true,"timeoutMs":1000}}}]}
+```
 
 ## Fixes in 1.4.9
 

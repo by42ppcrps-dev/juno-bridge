@@ -833,6 +833,98 @@ describe("bounded node identity reads", { concurrency: 1 }, () => {
   }
 });
 
+describe("optional effect evidence", { concurrency: 1 }, () => {
+  function after(effect) { return { observe: "snapshot", effect: { ...effect, timeoutMs: 0 } }; }
+  test("a new expanded state is observed with bounded focus diagnostics", async () => {
+    const env = bootPage({ onCommand({ method, params }, page) {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mouseReleased") {
+        page.button.setAttribute("aria-expanded", "true");
+      }
+    } });
+    env.page.button.setAttribute("aria-expanded", "false");
+    env.page.realm.document.visibilityState = "hidden";
+    env.page.realm.document.hasFocus = () => false;
+    const snapshot = await takeSnapshot(env);
+    const cmd = await runWorkflow(env, [{ op: "click", ref: "e1", after: after({ type:"element_state", ref:"e1", state:"expanded", value:true }) }], snapshot);
+    const result = resultFor(env, cmd.id);
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.data.steps[0].effect.before, false);
+    assert.equal(result.data.steps[0].effect.transitionObserved, true);
+    assert.equal(result.data.observation.effect.status, "observed_transition");
+    assert.equal(result.data.observation.elements[0].states.expanded, true);
+    assert.equal(result.data.observation.diagnostics.visibility, "hidden");
+    assert.equal(result.data.observation.diagnostics.focused, false);
+    assert.equal(env.created.length, 0);
+    assert.equal(env.tabs.get(7).active, false);
+  });
+  test("already true is explicitly reported and never claimed as a transition", async () => {
+    const env = bootPage({ bodyText: "Invoice ready" });
+    const snapshot = await takeSnapshot(env);
+    const cmd = await runWorkflow(env, [{op:"click", ref:"e1", after:after({type:"text", text:"Invoice ready"})}], snapshot);
+    const result = resultFor(env, cmd.id);
+    assert.equal(result.ok, true);
+    assert.equal(result.data.observation.effect.status, "already_satisfied");
+    assert.equal(result.data.observation.effect.transitionObserved, false);
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+  });
+  test("a no-op click produces unobserved effect and stops later input without replay", async () => {
+    const env = bootPage();
+    const snapshot = await takeSnapshot(env);
+    const cmd = await runWorkflow(env, [
+      {op:"click", ref:"e1", after:after({type:"text", text:"Menu opened"})},
+      {op:"type", text:"must not be sent"},
+    ], snapshot);
+    const result = resultFor(env, cmd.id);
+    assert.equal(result.ok, false);
+    assert.equal(result.data.status, "unobserved");
+    assert.equal(result.data.dispatched, true);
+    assert.equal(result.data.steps[0].effect.status, "unobserved");
+    assert.equal(result.data.steps[1].status, "unstarted");
+    assert.equal(methodCalls(env, "Input.insertText").length, 0);
+    assert.deepEqual(mouseTypes(env), ["mouseMoved", "mousePressed", "mouseReleased"]);
+  });
+  for (const fault of ["same URL reload", "pause", "replaced target"]) {
+    test(fault + " after dispatch cannot verify an effect or continue", async () => {
+      const env = bootPage({ async onCommand({method, params, chrome}, page) {
+        if (method !== "Input.dispatchMouseEvent" || params.type !== "mouseReleased") return;
+        if (fault === "same URL reload") page.realm.performance.timeOrigin += 2000;
+        else if (fault === "pause") await chrome.storage.local.set({enabled:false});
+        else {
+          page.button.isConnected = false;
+          const replacement = pageButton([FILTER_RECT]);
+          replacement.setAttribute("aria-expanded", "true");
+          page.setNodes([replacement]);
+        }
+      } });
+      env.page.button.setAttribute("aria-expanded", "false");
+      const snapshot = await takeSnapshot(env);
+      const cmd = await runWorkflow(env, [
+        {op:"click", ref:"e1", after:after({type:"element_state", ref:"e1", state:"expanded", value:true})},
+        {op:"type", text:"must not be sent"},
+      ], snapshot);
+      const result = resultFor(env, cmd.id);
+      assert.equal(result.ok, false);
+      assert.equal(result.data.steps[1].status, "unstarted");
+      assert.equal(methodCalls(env, "Input.insertText").length, 0);
+      assert.equal(methodCalls(env, "Input.dispatchMouseEvent").length, 3);
+    });
+  }
+  test("missing effect ref refuses dispatch; diagnostics never copy arbitrary values", async () => {
+    const env = bootPage();
+    env.page.realm.document.visibilityState = "synthetic private marker";
+    env.page.realm.document.hasFocus = () => ({private:"marker"});
+    env.page.button.setAttribute("aria-expanded", "synthetic private marker");
+    const snapshot = await takeSnapshot(env);
+    const first = env.fetches.filter(item => item.body && item.body.ok).at(-1).body.data;
+    assert.equal(first.diagnostics.visibility, "unknown");
+    assert.equal(first.diagnostics.focused, false);
+    assert.equal(first.elements[0].states, undefined);
+    const cmd = await runWorkflow(env, [{op:"click", ref:"e1", after:after({type:"element_state", ref:"e2", state:"expanded", value:true})}], snapshot);
+    assert.equal(resultFor(env, cmd.id).ok, false);
+    assert.deepEqual(mouseTypes(env), []);
+  });
+});
+
 describe("extension", { concurrency: 1 }, () => {
   test("pause during a click cancels the press and release", async () => {
     const env = boot({
