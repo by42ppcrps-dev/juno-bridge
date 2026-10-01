@@ -161,6 +161,24 @@ class OperatorTests(unittest.TestCase):
         self.assertFalse(self.op.handle_message(dict(msg, relay_context="https://wrong.example"), client)["ok"])
         self.assertEqual(len(client.calls), 2)
 
+    def test_context_validation_and_request_use_one_origin_read(self):
+        msg = {"op":"relay_request_v1", "method":"POST", "route":"/admin/run/v1",
+            "relay_context":"https://relay.example", "data":{"request_id":"req_origin_v1"}}
+        client = FakeClient()
+        with mock.patch.object(self.op, "relay_base", side_effect=["https://relay.example", "https://other.example"]) as base:
+            self.assertTrue(self.op.handle_message(msg, client)["ok"])
+            self.assertEqual(base.call_count, 1)
+        self.assertEqual(client.calls[0][1], "https://relay.example/admin/run/v1")
+        with mock.patch.object(self.op, "relay_base", side_effect=["https://old.example", "https://relay.example"]) as base:
+            self.assertFalse(self.op.handle_message(msg, client)["ok"])
+            self.assertEqual(base.call_count, 1)
+        self.assertEqual(len(client.calls), 1)
+        cache = {}
+        negotiation = {"op":"negotiate_relay_v1", "relay_context":"https://relay.example", "device":"a1b2c3d4"}
+        with mock.patch.object(self.op, "relay_base", side_effect=["https://relay.example", "https://changed.example"]):
+            self.assertFalse(self.op.handle_message(negotiation, client, negotiation_cache=cache)["ok"])
+        self.assertEqual(len(client.calls), 1)
+
     def tearDown(self):
         if self.stop_flag is not None:
             self.stop_flag.set()

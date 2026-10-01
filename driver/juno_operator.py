@@ -73,7 +73,8 @@ def _negotiate_explicit(msg, client, cache):
         return {"ok": True, "status": 200, "payload": {
             "capabilities": ["idempotency"], "run_protocol": RUN_PROTOCOL,
             "negotiation_cache_hit": True}}
-    result = handle_message({"op": "relay_request_v1", "method": "GET", "route": "/admin/devices"}, client)
+    result = handle_message({"op": "relay_request_v1", "method": "GET", "route": "/admin/devices",
+                             "relay_context": base}, client)
     payload = result.get("payload")
     if (result.get("ok") is True and result.get("status") == 200
             and isinstance(payload, dict) and payload.get("run_protocol") == RUN_PROTOCOL
@@ -503,11 +504,13 @@ def handle_message(msg, client, typesafe_getter=None, admission=None, negotiatio
         return {"ok": False, "error": "bad path"}
     method = msg.get("method") if isinstance(msg.get("method"), str) else "GET"
     try:
-        url = relay_base() + path
-        if path.split("?", 1)[0] == "/admin/run/v1" and msg.get("relay_context") != relay_base():
+        base = relay_base()
+        route = path.split("?", 1)[0]
+        if (route == "/admin/run/v1" or "relay_context" in msg) and msg.get("relay_context") != base:
             if negotiation_cache is not None:
                 negotiation_cache.clear()
             return {"ok": False, "error": "relay configuration changed; no request was made"}
+        url = base + path
         headers = [f"Authorization: Bearer {admin_psk()}"]
         body = None
         if msg.get("data") is not None:
