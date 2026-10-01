@@ -200,11 +200,19 @@ function permissionKey(state) {
   return JSON.stringify([state.deviceToken, state.allowlist, !!state.allowEval]);
 }
 
+// ISOLATED REVIEW EXPERIMENT ONLY: fresh policy, no cached authorization.
+async function getPolicyState() {
+  const state = await chrome.storage.local.get({
+    deviceToken: null, enabled: true, allowlist: [], allowEval: false,
+  });
+  return { ...state, allowlist: Array.isArray(state.allowlist) ? state.allowlist.slice() : [] };
+}
+
 // Read storage as well as the epoch: Chrome can deliver a storage notification
 // after the promise for a browser operation has already resolved.
 async function assertPermissions(state, control) {
   assertActive(control);
-  const current = await getState();
+  const current = await getPolicyState();
   assertActive(control);
   if (!current.enabled || !current.deviceToken || permissionKey(current) !== permissionKey(state)) {
     throw cancelled();
