@@ -498,9 +498,12 @@ def handle_message(msg, client, typesafe_getter=None, admission=None, negotiatio
         return _handle_systemone(msg, typesafe_getter, admission)
     if msg.get("op") == "negotiate_relay_v1":
         return _negotiate_explicit(msg, client, negotiation_cache if negotiation_cache is not None else {})
-    relay_v1 = msg.get("op") == "relay_request_v1"
-    path = msg.get("route") if relay_v1 else msg.get("path")
+    relay_v2 = msg.get("op") == "relay_request_v2"
+    relay_rpc = msg.get("op") in ("relay_request_v1", "relay_request_v2")
+    path = msg.get("route") if relay_rpc else msg.get("path")
     if not isinstance(path, str) or not path.startswith("/") or "://" in path or "\n" in path:
+        return {"ok": False, "error": "bad path"}
+    if relay_v2 and path.split("?", 1)[0] != "/admin/run/v1":
         return {"ok": False, "error": "bad path"}
     method = msg.get("method") if isinstance(msg.get("method"), str) else "GET"
     try:
@@ -519,7 +522,7 @@ def handle_message(msg, client, typesafe_getter=None, admission=None, negotiatio
         timeout = int(msg.get("timeout") or 30)
         route = path.split("?", 1)[0]
         retry = (method.upper() == "GET" and route != "/admin/result") or (
-            relay_v1 and msg.get("retry_safe") is True
+            relay_rpc and msg.get("retry_safe") is True
             and method.upper() == "POST" and route in ("/admin/run", "/admin/run/v1")
             and isinstance(msg.get("data"), dict)
             and isinstance(msg["data"].get("request_id"), str)
@@ -914,9 +917,12 @@ def call(method, path, data, timeout, retry_safe=False):
     token = read_private(token_path())
     # An older daemon sees no `path` and rejects this versioned RPC before
     # sending any relay request with its former unconditional retry policy.
-    message = {"token": token, "op": "relay_request_v1", "method": method,
+    versioned_run = path.split("?", 1)[0] == "/admin/run/v1"
+    # Old daemons understand v1 but ignore its new context field. A distinct
+    # path-less RPC makes them reject the versioned route before any HTTP call.
+    message = {"token": token, "op": "relay_request_v2" if versioned_run else "relay_request_v1", "method": method,
                "route": path, "timeout": int(timeout), "retry_safe": retry_safe}
-    if path.split("?", 1)[0] == "/admin/run/v1":
+    if versioned_run:
         message["relay_context"] = relay_base()
     if data is not None:
         message["data"] = data

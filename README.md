@@ -24,8 +24,12 @@ selection always uses a fresh device list. No permissions, pairing validity,
 connection state, or default choice are cached. `/admin/run/v1` requires a
 valid `request_id` and uses the durable idempotency receipt. An unavailable
 versioned route stops the call without a fallback enqueue. Legacy relays keep
-the previous negotiation path. Update an already running operator with
-`python3 driver/jb.py operator stop` before using the new local cache.
+the previous negotiation path. The versioned POST uses a distinct local RPC;
+an older daemon refuses it locally before a relay request. Update an already
+running operator with `python3 driver/jb.py operator stop` before using the
+new versioned route or local cache. Basic actions remain compatible with old
+extensions; optional effect predicates and diagnostics require extension
+1.4.10, verified by a fresh device-targeted ping before using those features.
 
 Snapshot and text observations include `diagnostics.visibility` (`visible`,
 `hidden`, or `unknown`) and `diagnostics.focused` (boolean or null). Snapshot

@@ -179,6 +179,26 @@ class OperatorTests(unittest.TestCase):
             self.assertFalse(self.op.handle_message(negotiation, client, negotiation_cache=cache)["ok"])
         self.assertEqual(len(client.calls), 1)
 
+    def test_versioned_run_rpc_refuses_wrong_context_and_other_routes(self):
+        client = FakeClient()
+        msg = {"op":"relay_request_v2", "method":"POST", "route":"/admin/run/v1",
+               "relay_context":"https://relay.example", "data":{"request_id":"req_rpc_v2_01"}}
+        self.assertTrue(self.op.handle_message(msg, client)["ok"])
+        self.assertFalse(self.op.handle_message(dict(msg, relay_context="https://other.example"), client)["ok"])
+        self.assertFalse(self.op.handle_message(dict(msg, route="/admin/cmd"), client)["ok"])
+        self.assertEqual(len(client.calls), 1)
+
+    def test_client_uses_distinct_pathless_rpc_and_old_daemon_refuses_locally(self):
+        def old_daemon(message, **_kwargs):
+            self.assertEqual(message["op"], "relay_request_v2")
+            self.assertNotIn("path", message)
+            self.assertEqual(message["route"], "/admin/run/v1")
+            self.assertEqual(message["relay_context"], "https://relay.example")
+            return {"ok":False, "error":"bad path"}
+        with mock.patch.object(self.op, "ensure"), mock.patch.object(self.op, "read_private", return_value="synthetic-local-session"), mock.patch.object(self.op, "transact", side_effect=old_daemon):
+            with self.assertRaisesRegex(self.op.OperatorError, "outdated.*No relay request"):
+                self.op.call("POST", "/admin/run/v1", {"request_id":"req_old_rpc_v2"}, 30, retry_safe=True)
+
     def tearDown(self):
         if self.stop_flag is not None:
             self.stop_flag.set()
